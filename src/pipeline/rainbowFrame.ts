@@ -15,7 +15,25 @@ const DMT_SENS = {
 } as const;
 
 export type SurfaceRegion = "surfaces" | "edges" | "both";
-export type WallpaperGroup = "off" | "p2" | "p4" | "p6" | "pmm" | "p4m";
+export type WallpaperGroup =
+  | "off"
+  | "p1"
+  | "p2"
+  | "pm"
+  | "pg"
+  | "cm"
+  | "pmm"
+  | "pmg"
+  | "pgg"
+  | "cmm"
+  | "p4"
+  | "p4m"
+  | "p4g"
+  | "p3"
+  | "p3m1"
+  | "p31m"
+  | "p6"
+  | "p6m";
 export type DisplayMode =
   | "color"
   | "grayBaseColorRims"
@@ -136,12 +154,17 @@ const sanitizeComposerConfig = (config: ComposerConfig | undefined): ComposerCon
   return result;
 };
 
+type OpBase = {
+  tx?: number;
+  ty?: number;
+};
+
 export type Op =
-  | { kind: "rot"; angle: number }
-  | { kind: "mirrorX" }
-  | { kind: "mirrorY" }
-  | { kind: "diag1" }
-  | { kind: "diag2" };
+  | (OpBase & { kind: "rot"; angle: number })
+  | (OpBase & { kind: "mirrorX" })
+  | (OpBase & { kind: "mirrorY" })
+  | (OpBase & { kind: "diag1" })
+  | (OpBase & { kind: "diag2" });
 
 export type TextureChannelStats = {
   wallpapericity: number;
@@ -485,83 +508,160 @@ export const kEff = (k: KernelSpec, d: number): KernelSpec => ({
 });
 
 export const groupOps = (kind: WallpaperGroup): Op[] => {
+  const HALF = 0.5;
+  const THIRD = 1 / 3;
+  const rot = (angle: number, tx = 0, ty = 0): Op => ({
+    kind: "rot",
+    angle,
+    tx,
+    ty
+  });
+  const id = (tx = 0, ty = 0): Op => rot(0, tx, ty);
+  const mirrorX = (tx = 0, ty = 0): Op => ({ kind: "mirrorX", tx, ty });
+  const mirrorY = (tx = 0, ty = 0): Op => ({ kind: "mirrorY", tx, ty });
+  const diag1 = (tx = 0, ty = 0): Op => ({ kind: "diag1", tx, ty });
+  const diag2 = (tx = 0, ty = 0): Op => ({ kind: "diag2", tx, ty });
+
   switch (kind) {
+    case "p1":
+      return [id(), id(HALF, 0), id(0, HALF), id(HALF, HALF)];
     case "p2":
-      return [
-        { kind: "rot", angle: 0 },
-        { kind: "rot", angle: Math.PI }
-      ];
-    case "p4":
-      return [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2].map((angle) => ({
-        kind: "rot",
-        angle
-      }));
-    case "p6":
-      return Array.from({ length: 6 }, (_, j) => ({
-        kind: "rot",
-        angle: (j * Math.PI) / 3
-      }));
+      return [rot(0), rot(Math.PI), rot(0, HALF, HALF), rot(Math.PI, HALF, HALF)];
+    case "pm":
+      return [id(), mirrorX(), id(HALF, 0), mirrorX(HALF, 0)];
+    case "pg":
+      return [id(), mirrorX(HALF, 0), id(0, HALF), mirrorX(HALF, HALF)];
+    case "cm":
+      return [id(), mirrorY(0, HALF), mirrorX(HALF, 0), mirrorY(HALF, HALF)];
     case "pmm":
-      return [
-        { kind: "rot", angle: 0 },
-        { kind: "rot", angle: Math.PI },
-        { kind: "mirrorX" },
-        { kind: "mirrorY" }
-      ];
+      return [rot(0), rot(Math.PI), mirrorX(), mirrorY()];
+    case "pmg":
+      return [rot(0), mirrorX(), mirrorY(HALF, 0), rot(Math.PI, HALF, 0)];
+    case "pgg":
+      return [rot(0), rot(Math.PI), mirrorX(HALF, 0), mirrorY(0, HALF)];
+    case "cmm":
+      return [rot(0), mirrorX(), mirrorY(), diag1(), diag2(), rot(Math.PI, HALF, HALF)];
+    case "p4":
+      return [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2].map((angle) => rot(angle));
     case "p4m":
       return [
-        { kind: "rot", angle: 0 },
-        { kind: "rot", angle: Math.PI / 2 },
-        { kind: "rot", angle: Math.PI },
-        { kind: "rot", angle: (3 * Math.PI) / 2 },
-        { kind: "mirrorX" },
-        { kind: "mirrorY" },
-        { kind: "diag1" },
-        { kind: "diag2" }
+        rot(0),
+        rot(Math.PI / 2),
+        rot(Math.PI),
+        rot((3 * Math.PI) / 2),
+        mirrorX(),
+        mirrorY(),
+        diag1(),
+        diag2()
+      ];
+    case "p4g":
+      return [
+        rot(0),
+        rot(Math.PI / 2),
+        rot(Math.PI),
+        rot((3 * Math.PI) / 2),
+        mirrorX(HALF, 0),
+        mirrorY(0, HALF),
+        diag1(HALF, 0),
+        diag2(0, HALF)
+      ];
+    case "p3":
+      return [0, (2 * Math.PI) / 3, (4 * Math.PI) / 3].map((angle) => rot(angle));
+    case "p3m1":
+      return [
+        rot(0),
+        rot((2 * Math.PI) / 3),
+        rot((4 * Math.PI) / 3),
+        mirrorX(),
+        diag1(THIRD, 0),
+        diag2(0, THIRD)
+      ];
+    case "p31m":
+      return [
+        rot(0),
+        rot((2 * Math.PI) / 3),
+        rot((4 * Math.PI) / 3),
+        mirrorY(),
+        diag1(2 * THIRD, THIRD),
+        diag2(THIRD, 2 * THIRD)
+      ];
+    case "p6":
+      return Array.from({ length: 6 }, (_, j) => rot((j * Math.PI) / 3));
+    case "p6m":
+      return [
+        ...Array.from({ length: 6 }, (_, j) => rot((j * Math.PI) / 3)),
+        mirrorX(),
+        mirrorY()
       ];
     default:
-      return [{ kind: "rot", angle: 0 }];
+      return [rot(0)];
   }
 };
 
-export const toGpuOps = (ops: Op[]): { kind: number; angle: number }[] =>
+export type GpuWallpaperOp = {
+  kind: number;
+  angle: number;
+  tx: number;
+  ty: number;
+};
+
+export const toGpuOps = (ops: Op[]): GpuWallpaperOp[] =>
   ops.map((op) => {
+    const tx = op.tx ?? 0;
+    const ty = op.ty ?? 0;
     switch (op.kind) {
       case "rot":
-        return { kind: 0, angle: op.angle };
+        return { kind: 0, angle: op.angle, tx, ty };
       case "mirrorX":
-        return { kind: 1, angle: 0 };
+        return { kind: 1, angle: 0, tx, ty };
       case "mirrorY":
-        return { kind: 2, angle: 0 };
+        return { kind: 2, angle: 0, tx, ty };
       case "diag1":
-        return { kind: 3, angle: 0 };
+        return { kind: 3, angle: 0, tx, ty };
       case "diag2":
-        return { kind: 4, angle: 0 };
+        return { kind: 4, angle: 0, tx, ty };
       default:
-        return { kind: 0, angle: 0 };
+        return { kind: 0, angle: 0, tx, ty };
     }
   });
 
 export const applyOp = (op: Op, x: number, y: number, cx: number, cy: number) => {
   const dx = x - cx;
   const dy = y - cy;
+  let px = dx;
+  let py = dy;
   switch (op.kind) {
     case "rot": {
       const c = Math.cos(op.angle);
       const s = Math.sin(op.angle);
-      return { x: cx + c * dx - s * dy, y: cy + s * dx + c * dy };
+      px = c * dx - s * dy;
+      py = s * dx + c * dy;
+      break;
     }
     case "mirrorX":
-      return { x: 2 * cx - x, y };
+      px = -dx;
+      py = dy;
+      break;
     case "mirrorY":
-      return { x, y: 2 * cy - y };
+      px = dx;
+      py = -dy;
+      break;
     case "diag1":
-      return { x: cx + dy, y: cy + dx };
+      px = dy;
+      py = dx;
+      break;
     case "diag2":
-      return { x: cx - dy, y: cy - dx };
+      px = -dy;
+      py = -dx;
+      break;
     default:
-      return { x, y };
+      break;
   }
+  const width = cx * 2;
+  const height = cy * 2;
+  const tx = (op.tx ?? 0) * width;
+  const ty = (op.ty ?? 0) * height;
+  return { x: cx + px + tx, y: cy + py + ty };
 };
 
 export const sampleScalar = (

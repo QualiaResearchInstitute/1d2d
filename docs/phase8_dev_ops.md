@@ -84,6 +84,26 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
   - For offline batches, call `computeTextureDiagnostics(surface, { orientations, includeMaps: true })` and render `wallpapericityMap` / `beatEnvelopeMap` in Python or Observable.
   - Flag regression when histogram peak shifts >0.12 (normalized amplitude) or when `resonanceRate` ±0.05 from baseline.
   - Log findings in `docs/ops/histogram-log/<date>.md` (create as needed) to keep longitudinal context.
+  - Reference all 17 wallpaper symmetry groups when classifying texture tiles (cheat sheet below).
+
+### Wallpaper Symmetry Group Reference
+- `p1` – translations only; no rotational or mirror symmetry.
+- `p2` – translations with 2-fold (180°) rotations.
+- `pm` – translations and parallel mirror lines.
+- `pg` – translations and glide reflections; no pure mirrors.
+- `cm` – translations with mirrored stripes offset on a centered lattice.
+- `pmm` – translations plus perpendicular mirror grids.
+- `pmg` – translations, one set of mirror lines, and a perpendicular glide reflection.
+- `pgg` – translations with perpendicular glide reflections and 2-fold rotations.
+- `cmm` – centered lattice with mirrors along both axes and diagonals.
+- `p4` – translations with 4-fold (90°) rotations.
+- `p4m` – translations, 4-fold rotations, and mirrors along axes and diagonals.
+- `p4g` – translations, 4-fold rotations, and diagonal mirrors with perpendicular glides.
+- `p3` – translations with 3-fold (120°) rotations.
+- `p3m1` – translations, 3-fold rotations, and mirrors forming 60° spokes.
+- `p31m` – translations, 3-fold rotations, and mirrors arranged around triangular cells.
+- `p6` – translations with 6-fold (60°) rotations.
+- `p6m` – translations, 6-fold rotations, and mirrors in hexagonal symmetry.
 
 ---
 

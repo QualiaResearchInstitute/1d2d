@@ -4087,11 +4087,23 @@ export default function App() {
               onChange={(v) => setWallGroup(v as WallpaperGroup)}
               options={[
                 { value: "off", label: "Off" },
+                { value: "p1", label: "p1" },
                 { value: "p2", label: "p2" },
-                { value: "p4", label: "p4" },
-                { value: "p6", label: "p6" },
+                { value: "pm", label: "pm" },
+                { value: "pg", label: "pg" },
+                { value: "cm", label: "cm" },
                 { value: "pmm", label: "pmm" },
-                { value: "p4m", label: "p4m" }
+                { value: "pmg", label: "pmg" },
+                { value: "pgg", label: "pgg" },
+                { value: "cmm", label: "cmm" },
+                { value: "p4", label: "p4" },
+                { value: "p4g", label: "p4g" },
+                { value: "p4m", label: "p4m" },
+                { value: "p3", label: "p3" },
+                { value: "p31m", label: "p31m" },
+                { value: "p3m1", label: "p3m1" },
+                { value: "p6", label: "p6" },
+                { value: "p6m", label: "p6m" }
               ]}
             />
             <SelectControl

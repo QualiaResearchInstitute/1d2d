@@ -214,7 +214,8 @@ vec2 applyOp(vec4 op, vec2 point) {
   } else if (kind == 4) {
     p = vec2(-p.y, -p.x);
   }
-  return p + uCanvasCenter;
+  vec2 translation = vec2(op.z * uResolution.x, op.w * uResolution.y);
+  return p + uCanvasCenter + translation;
 }
 
 vec2 wallpaperAt(vec2 relPt) {
@@ -683,6 +684,8 @@ export type OrientationUniforms = {
 export type WallpaperOp = {
   kind: number;
   angle: number;
+  tx: number;
+  ty: number;
 };
 
 export type KernelUniform = {
@@ -1007,14 +1010,17 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       for (let i = 0; i < 8; i++) {
         const base = i * 4;
         if (i < ops.length) {
-          opsUniform[base + 0] = ops[i].kind;
-          opsUniform[base + 1] = ops[i].angle;
+          const op = ops[i];
+          opsUniform[base + 0] = op.kind;
+          opsUniform[base + 1] = op.angle;
+          opsUniform[base + 2] = op.tx;
+          opsUniform[base + 3] = op.ty;
         } else {
           opsUniform[base + 0] = 0;
           opsUniform[base + 1] = 0;
+          opsUniform[base + 2] = 0;
+          opsUniform[base + 3] = 0;
         }
-        opsUniform[base + 2] = 0;
-        opsUniform[base + 3] = 0;
       }
       gl.uniform4fv(uniforms.ops, opsUniform);
 

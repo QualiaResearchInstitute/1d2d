@@ -54,7 +54,7 @@ Everything composes on a single canvas with proper **gauge/phase pinning** so th
 
 * A **plane-wave lattice** (or the Kuramoto (\nabla\theta)) supplies a **warp field** ((g_x, g_y)).
 * The app samples the base image at a **small offset along this field**, then mixes the warped sample back by **surface blend**.
-* You can enforce real wallpaper symmetry groups (**p2 / p4 / p6 / pmm / p4m**) by averaging across group transforms about the image center for authentic wallpaper behavior.
+* You can enforce real wallpaper symmetry groups (**p1 / p2 / pm / pg / cm / pmm / pmg / pgg / cmm / p3 / p31m / p3m1 / p4 / p4g / p4m / p6 / p6m**) by averaging across group transforms about the image center for authentic wallpaper behavior.
 * **Anisotropy** adds a global directional bias.
 
 ## 5) Edge↔Surface coupling (gauge-safe mediators)
@@ -105,7 +105,7 @@ Everything composes on a single canvas with proper **gauge/phase pinning** so th
 
 * **Enable surface morph**
 * **Orientations** (2..8): number of plane-wave directions.
-* **Wallpaper group**: p2/p4/p6/pmm/p4m for proper crystallography.
+* **Wallpaper group**: choose from the full crystallographic set (p1, p2, pm, pg, cm, pmm, pmg, pgg, cmm, p3, p31m, p3m1, p4, p4g, p4m, p6, p6m).
 * **Region**: Surfaces (non-edges), Edges, Both.
 * **Surface blend**: warp mix amount.
 * **Warp amplitude**: warp step (px).

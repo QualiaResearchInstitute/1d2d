@@ -58,9 +58,19 @@ const PRESETS: Preset[] = [
 
 type SurfaceRegion = 'surfaces' | 'edges' | 'both';
 
-type WallpaperGroup = 'off' | 'p2' | 'p4' | 'p6' | 'pmm' | 'p4m';
+type WallpaperGroup =
+  | 'off' | 'p1' | 'p2' | 'pm' | 'pg' | 'cm'
+  | 'pmm' | 'pmg' | 'pgg' | 'cmm'
+  | 'p4' | 'p4g' | 'p4m'
+  | 'p3' | 'p31m' | 'p3m1'
+  | 'p6' | 'p6m';
 
-type Op = { kind: 'rot'|'mirrorX'|'mirrorY'|'diag1'|'diag2'; angle?: number };
+type Op = {
+  kind: 'rot'|'mirrorX'|'mirrorY'|'diag1'|'diag2';
+  angle?: number;
+  tx?: number;
+  ty?: number;
+};
 
 export default function RainbowPerimeterKernelDemo() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);

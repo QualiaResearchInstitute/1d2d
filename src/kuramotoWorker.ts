@@ -8,9 +8,14 @@ import {
   deriveKuramotoFields,
   initKuramotoState,
   stepKuramotoState,
+  createKuramotoInstrumentationSnapshot,
   type KuramotoParams,
-  type KuramotoState
+  type KuramotoState,
+  type KuramotoInstrumentationSnapshot
 } from "./kuramotoCore";
+import { assertPhaseField } from "./fields/contracts.js";
+import { clampKernelSpec, KERNEL_SPEC_DEFAULT, type KernelSpec } from "./kernel/kernelSpec";
+import type { OpticalFieldMetadata } from "./fields/opticalField.js";
 
 type InitMessage = {
   kind: "init";
@@ -32,6 +37,12 @@ type TickMessage = {
 type UpdateParamsMessage = {
   kind: "updateParams";
   params: KuramotoParams;
+};
+
+type KernelSpecMessage = {
+  kind: "kernelSpec";
+  spec: KernelSpec;
+  version: number;
 };
 
 type ResetMessage = {
@@ -60,6 +71,7 @@ type IncomingMessage =
   | InitMessage
   | TickMessage
   | UpdateParamsMessage
+  | KernelSpecMessage
   | ResetMessage
   | ReturnBufferMessage
   | SimulateMessage;
@@ -70,6 +82,9 @@ type FrameMessage = {
   timestamp: number;
   frameId: number;
   queueDepth: number;
+  meta: OpticalFieldMetadata;
+  kernelVersion: number;
+  instrumentation: KuramotoInstrumentationSnapshot;
 };
 
 type ReadyMessage = { kind: "ready"; width: number; height: number };
@@ -90,6 +105,8 @@ let randn = createNormalGenerator();
 let bufferPool: ArrayBuffer[] = [];
 let width = 0;
 let height = 0;
+let kernelSpec: KernelSpec | null = null;
+let kernelSpecVersion = 0;
 
 const post = (message: FrameMessage | ReadyMessage | LogMessage | SimulateResultMessage, transfer?: Transferable[]) => {
   if (transfer) {
@@ -125,16 +142,28 @@ const handleTick = (msg: TickMessage) => {
     });
     return;
   }
-  stepKuramotoState(state, params, msg.dt, randn);
+  const activeKernel = kernelSpec ?? KERNEL_SPEC_DEFAULT;
+  stepKuramotoState(state, params, msg.dt, randn, msg.timestamp, {
+    kernel: activeKernel,
+    telemetry: { kernelVersion: kernelSpecVersion }
+  });
+  const meta = state.field.getMeta();
   const derived = createDerivedViews(buffer, state.width, state.height);
-  deriveKuramotoFields(state, derived);
+  assertPhaseField(derived, "worker:tick");
+  deriveKuramotoFields(state, derived, {
+    kernel: activeKernel
+  });
+  const instrumentation = createKuramotoInstrumentationSnapshot(state);
   post(
     {
       kind: "frame",
       buffer,
       timestamp: msg.timestamp,
-      frameId: msg.frameId,
-      queueDepth: bufferPool.length
+      frameId: meta.frameId,
+      queueDepth: bufferPool.length,
+      kernelVersion: kernelSpecVersion,
+      meta,
+      instrumentation
     },
     [buffer]
   );
@@ -143,7 +172,7 @@ const handleTick = (msg: TickMessage) => {
 const handleInit = (msg: InitMessage) => {
   width = msg.width;
   height = msg.height;
-  params = { ...msg.params };
+  params = { fluxX: 0, fluxY: 0, ...msg.params };
   ensureState(width, height);
   ensureRand(msg.seed);
   bufferPool = [...msg.buffers];
@@ -160,16 +189,22 @@ const handleReset = (msg: ResetMessage) => {
 
 const handleSimulate = (msg: SimulateMessage) => {
   const simState = createKuramotoState(msg.width, msg.height);
-  const simParams = { ...msg.params };
+  const simParams = { fluxX: 0, fluxY: 0, ...msg.params };
   const simRand = createNormalGenerator(msg.seed);
   initKuramotoState(simState, msg.qInit);
   const size = derivedBufferSize(msg.width, msg.height);
   const buffers: ArrayBuffer[] = [];
+  const activeKernel = kernelSpec ?? KERNEL_SPEC_DEFAULT;
   for (let frame = 0; frame < msg.frameCount; frame++) {
-    stepKuramotoState(simState, simParams, msg.dt, simRand);
+    stepKuramotoState(simState, simParams, msg.dt, simRand, msg.dt * (frame + 1), {
+      kernel: activeKernel
+    });
     const out = new ArrayBuffer(size);
     const derived = createDerivedViews(out, msg.width, msg.height);
-    deriveKuramotoFields(simState, derived);
+    assertPhaseField(derived, "worker:simulate");
+    deriveKuramotoFields(simState, derived, {
+      kernel: activeKernel
+    });
     buffers.push(out);
   }
   post(
@@ -194,7 +229,11 @@ ctx.onmessage = (event: MessageEvent<IncomingMessage>) => {
       handleTick(msg);
       break;
     case "updateParams":
-      params = { ...msg.params };
+      params = { fluxX: 0, fluxY: 0, ...msg.params };
+      break;
+    case "kernelSpec":
+      kernelSpec = clampKernelSpec(msg.spec);
+      kernelSpecVersion = msg.version;
       break;
     case "reset":
       handleReset(msg);

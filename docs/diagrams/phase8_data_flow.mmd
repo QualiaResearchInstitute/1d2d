@@ -1,0 +1,34 @@
+flowchart LR
+  subgraph Client
+    UI["Canvas + Controls"]
+    Upload["Image Upload"]
+    Controls["DMT / Arousal Controls"]
+  end
+
+  subgraph Pipeline
+    Edge["Edge Detection (Sobel + gating)"]
+    Kur["Kuramoto Field Solver"]
+    Thin["Thin-Element Operators<br/>(Flux / Amplitude / Phase)"]
+    Composer["Composer & Coupling"]
+  end
+
+  subgraph Telemetry
+    TelemetryBus["Telemetry Snapshot\n(Kuramoto + Composer)"]
+    Hist["Histogram / Diagnostics Maps"]
+  end
+
+  subgraph Ops
+    Baseline["Baseline Harness\nscripts/runBaseline.ts"]
+    CrossTier["Cross-tier Validator\nscripts/runCrossTierValidation.ts"]
+    Rollback["Rollback Recipes\n(docs)"]
+  end
+
+  UI --> Upload --> Edge --> Kur --> Thin --> Composer
+  Controls --> Kur
+  Controls --> Thin
+  Composer --> TelemetryBus
+  Thin --> TelemetryBus
+  TelemetryBus --> Hist
+  TelemetryBus --> Baseline
+  TelemetryBus --> CrossTier
+  Hist --> Rollback

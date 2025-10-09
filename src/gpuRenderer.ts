@@ -1,4 +1,15 @@
 /* eslint-disable @typescript-eslint/no-use-before-define */
+import {
+  FIELD_STRUCTS_GLSL,
+  assertPhaseField,
+  assertRimField,
+  assertVolumeField,
+  type PhaseField,
+  type RimField,
+  type VolumeField
+} from "./fields/contracts";
+import type { CouplingConfig } from "./pipeline/rainbowFrame";
+
 const VERTEX_SRC = `#version 300 es
 precision highp float;
 
@@ -15,12 +26,16 @@ void main() {
 const FRAGMENT_SRC = `#version 300 es
 precision highp float;
 
+${FIELD_STRUCTS_GLSL}
+
 in vec2 vUv;
 out vec4 fragColor;
 
 uniform sampler2D uBaseTex;
 uniform sampler2D uEdgeTex;
 uniform sampler2D uKurTex;
+uniform sampler2D uKurAmpTex;
+uniform sampler2D uVolumeTex;
 
 uniform vec2 uResolution;
 uniform float uTime;
@@ -30,7 +45,6 @@ uniform float uEffectiveBlend;
 uniform int uDisplayMode;
 uniform vec3 uBaseOffsets;
 uniform float uSigma;
-uniform float uSigmaMin;
 uniform float uJitter;
 uniform float uJitterPhase;
 uniform float uBreath;
@@ -40,21 +54,16 @@ uniform int uMicrosaccade;
 uniform int uPolBins;
 uniform int uThetaMode;
 uniform float uThetaGlobal;
-uniform int uCoupleS2E;
-uniform float uAlphaPol;
-uniform float uGammaOff;
-uniform float uKSigma;
-uniform float uGammaSigma;
 uniform float uContrast;
 uniform float uFrameGain;
+uniform int uRimEnabled;
 uniform float uRimAlpha;
 uniform float uWarpAmp;
 uniform float uSurfaceBlend;
 uniform int uSurfaceRegion;
 uniform int uSurfEnabled;
-uniform int uCoupleE2S;
-uniform float uEtaAmp;
 uniform int uKurEnabled;
+uniform int uVolumeEnabled;
 uniform int uUseWallpaper;
 uniform int uOpsCount;
 uniform vec4 uOps[8];
@@ -68,6 +77,27 @@ uniform float uKernelQ;
 uniform float uKernelAniso;
 uniform float uKernelChirality;
 uniform float uAlive;
+uniform float uBeta2;
+uniform float uCouplingRimSurfaceBlend;
+uniform float uCouplingRimSurfaceAlign;
+uniform float uCouplingSurfaceRimOffset;
+uniform float uCouplingSurfaceRimSigma;
+uniform float uCouplingSurfaceRimHue;
+uniform float uCouplingKurTransparency;
+uniform float uCouplingKurOrientation;
+uniform float uCouplingKurChirality;
+uniform float uCouplingScale;
+uniform float uCouplingVolumePhaseHue;
+uniform float uCouplingVolumeDepthWarp;
+uniform float uComposerExposure[4];
+uniform float uComposerGamma[4];
+uniform float uComposerWeight[4];
+uniform vec2 uComposerBlendGain;
+
+#define COMPOSER_FIELD_SURFACE 0
+#define COMPOSER_FIELD_RIM 1
+#define COMPOSER_FIELD_KUR 2
+#define COMPOSER_FIELD_VOLUME 3
 
 const float TAU = 6.283185307179586;
 
@@ -77,6 +107,22 @@ float clamp01(float v) {
 
 float hash2(float x, float y) {
   return fract(sin(x * 127.1 + y * 311.7) * 43758.5453);
+}
+
+float applyComposerScalar(float value, int fieldIndex) {
+  float exposure = uComposerExposure[fieldIndex];
+  float gamma = uComposerGamma[fieldIndex];
+  float scaled = clamp(value * exposure, 0.0, 1.0);
+  float adjusted = pow(scaled, gamma);
+  return clamp(adjusted, 0.0, 1.0);
+}
+
+vec3 applyComposerVec3(vec3 rgb, int fieldIndex) {
+  return vec3(
+    applyComposerScalar(rgb.r, fieldIndex),
+    applyComposerScalar(rgb.g, fieldIndex),
+    applyComposerScalar(rgb.b, fieldIndex)
+  );
 }
 
 vec4 fetchEdge(ivec2 coord) {
@@ -134,6 +180,23 @@ ivec2 i11 = ivec2(x1, y1);
   return mix(a, b, frac.y);
 }
 
+vec2 computeLatticeFlow(vec2 coord) {
+  if (uOrientCount <= 0) {
+    return vec2(0.0);
+  }
+  float freq = 0.015 + 0.004 * float(uOrientCount);
+  float timeShift = uTime * 0.6;
+  vec2 flow = vec2(0.0);
+  for (int k = 0; k < 8; ++k) {
+    if (k >= uOrientCount) break;
+    float proj = (coord.x - uCanvasCenter.x) * uOrientCos[k] + (coord.y - uCanvasCenter.y) * uOrientSin[k];
+    float phaseVal = proj * freq + timeShift + float(k) * 0.35;
+    float magnitude = 0.5 + 0.5 * sin(phaseVal + uBeta2 * 0.25);
+    flow += vec2(uOrientCos[k], uOrientSin[k]) * magnitude;
+  }
+  return flow / max(float(uOrientCount), 1.0);
+}
+
 vec2 applyOp(vec4 op, vec2 point) {
   int kind = int(op.x + 0.5);
   vec2 p = point - uCanvasCenter;
@@ -184,28 +247,73 @@ float luma01(vec3 c) {
   return clamp01(dot(c, vec3(0.2126, 0.7152, 0.0722)));
 }
 
+vec3 clamp01(vec3 v) {
+  return clamp(v, vec3(0.0), vec3(1.0));
+}
+
+float wrapPi(float theta) {
+  float twoPi = TAU;
+  return theta - floor((theta + 3.141592653589793) / twoPi) * twoPi - 3.141592653589793;
+}
+
+float responseSoft(float value, float shaping) {
+  float v = clamp(value, 0.0, 1.0);
+  float expVal = mix(1.2, 3.5, clamp(shaping, 0.0, 1.0));
+  return 1.0 - pow(max(0.0, 1.0 - v), expVal);
+}
+
+float responsePow(float value, float shaping) {
+  float v = clamp(value, 0.0, 1.0);
+  float expVal = mix(1.65, 0.55, clamp(shaping, 0.0, 1.0));
+  return pow(v, expVal);
+}
+
 void main() {
   vec2 fragCoord = vec2(vUv.x * uResolution.x, vUv.y * uResolution.y);
   vec2 fragClamped = clamp(fragCoord, vec2(0.0), uResolution - vec2(1.0));
   int xPix = int(fragClamped.x);
   int yPix = int(fragClamped.y);
   ivec2 icoord = ivec2(xPix, yPix);
+  int width = int(uResolution.x);
+  int height = int(uResolution.y);
+
+  vec4 edgeSample = fetchEdge(icoord);
   vec3 baseRgb = texelFetch(uBaseTex, icoord, 0).rgb;
-  float magVal = fetchEdge(icoord).b;
+  float magVal = edgeSample.b;
+
+  vec3 volumeSample = vec3(0.0);
+  float volumePhaseVal = 0.0;
+  float volumeDepthVal = 0.0;
+  float volumeIntensityVal = 0.0;
+  float volumeDepthGrad = 0.0;
+  if (uVolumeEnabled == 1) {
+    volumeSample = texelFetch(uVolumeTex, icoord, 0).rgb;
+    volumePhaseVal = volumeSample.r;
+    volumeDepthVal = volumeSample.g;
+    volumeIntensityVal = volumeSample.b;
+    int leftX = max(xPix - 1, 0);
+    int rightX = min(xPix + 1, width - 1);
+    int upY = max(yPix - 1, 0);
+    int downY = min(yPix + 1, height - 1);
+    float depthLeft = texelFetch(uVolumeTex, ivec2(leftX, yPix), 0).g;
+    float depthRight = texelFetch(uVolumeTex, ivec2(rightX, yPix), 0).g;
+    float depthUp = texelFetch(uVolumeTex, ivec2(xPix, upY), 0).g;
+    float depthDown = texelFetch(uVolumeTex, ivec2(xPix, downY), 0).g;
+    float depthDx = (depthRight - depthLeft) * 0.5;
+    float depthDy = (depthDown - depthUp) * 0.5;
+    volumeDepthGrad = length(vec2(depthDx, depthDy));
+  }
 
   if (uDisplayMode == 1 || uDisplayMode == 2) {
     float yb = clamp01(dot(baseRgb, vec3(0.2126, 0.7152, 0.0722)));
     baseRgb = vec3(yb);
   }
 
-  vec2 flow = vec2(0.0);
-  if (uKurEnabled == 1) {
-    vec4 kur = fetchKur(icoord);
-    flow = kur.xy;
-  } else if (uUseWallpaper == 1) {
+  vec2 warpFlow = computeLatticeFlow(fragCoord);
+  if (uUseWallpaper == 1 && uOrientCount == 0) {
     vec2 accum = vec2(0.0);
     if (uOpsCount == 0) {
-      accum = wallpaperAt((fragCoord - uCanvasCenter));
+      accum = wallpaperAt(fragCoord - uCanvasCenter);
     } else {
       for (int k = 0; k < 8; ++k) {
         if (k >= uOpsCount) break;
@@ -214,20 +322,52 @@ void main() {
       }
       accum /= float(uOpsCount);
     }
-    flow = accum;
+    warpFlow += accum;
   }
 
-  vec2 gradEdge = fetchEdge(icoord).rg;
+  if (uVolumeEnabled == 1 && uCouplingVolumeDepthWarp > 0.0) {
+    float gradNorm = min(volumeDepthGrad / (0.18 + 0.12 * uKernelK0 + 1e-6), 1.0);
+    float gradResponse = responseSoft(gradNorm, uCouplingVolumeDepthWarp);
+    float gradSignal = applyComposerScalar(gradResponse, COMPOSER_FIELD_VOLUME);
+    float boost =
+      1.0 +
+      uCouplingScale *
+        uCouplingVolumeDepthWarp *
+        gradSignal *
+        uComposerWeight[COMPOSER_FIELD_VOLUME];
+    warpFlow *= boost;
+  }
+
+  vec2 kurGrad = vec2(0.0);
+  float vortVal = 0.0;
+  float cohVal = 0.0;
+  float ampVal = 0.0;
+  if (uKurEnabled == 1) {
+    vec4 kurSample = fetchKur(icoord);
+    kurGrad = kurSample.xy;
+    vortVal = kurSample.z;
+    cohVal = clamp(kurSample.w, 0.0, 1.0);
+    ampVal = clamp(texelFetch(uKurAmpTex, icoord, 0).r, 0.0, 1.0);
+  }
+
+  vec2 combinedFlow = warpFlow + kurGrad;
+  vec2 gradEdge = edgeSample.rg;
 
   vec3 resultRgb = baseRgb;
   float rimEnergy = 0.0;
 
-  if (magVal >= uEdgeThreshold) {
-    vec2 normal = gradEdge;
-    float nlen = length(normal) + 1e-8;
-    normal /= nlen;
-    vec2 tangent = vec2(-normal.y, normal.x);
+  float couplingScale = uCouplingScale;
+  float sigmaFloorBase = max(0.25, uSigma * 0.25);
 
+  vec2 normal = vec2(0.0);
+  vec2 tangent = vec2(0.0);
+  float edgeLen = length(gradEdge);
+  if (edgeLen > 1e-8) {
+    normal = gradEdge / edgeLen;
+    tangent = vec2(-normal.y, normal.x);
+  }
+
+  if (uRimEnabled == 1 && magVal >= uEdgeThreshold) {
     float thetaRaw = atan(normal.y, normal.x);
     float thetaEdge = thetaRaw;
     if (uThetaMode == 1) {
@@ -237,18 +377,20 @@ void main() {
       thetaEdge = round((thetaRaw / TAU) * steps) * (TAU / steps);
     }
 
-    float gradNorm0 = length(flow);
     float thetaUse = thetaEdge;
-    if (uCoupleS2E == 1 && gradNorm0 > 1e-6) {
-      vec2 edgeDir = vec2(cos(thetaEdge), sin(thetaEdge));
-      vec2 surfDir = flow / gradNorm0;
-      vec2 blended = (1.0 - uAlphaPol) * edgeDir + uAlphaPol * surfDir;
-      float tBlend = atan(blended.y, blended.x);
-      if (uPolBins > 0) {
-        float steps = float(uPolBins);
-        tBlend = round((tBlend / TAU) * steps) * (TAU / steps);
+    if (uCouplingKurOrientation > 0.0) {
+      float kurNorm = length(kurGrad);
+      if (kurNorm > 1e-6) {
+        vec2 edgeDir = vec2(cos(thetaUse), sin(thetaUse));
+        vec2 kurDir = kurGrad / kurNorm;
+        float mixW = clamp(uCouplingKurOrientation * couplingScale * uComposerWeight[COMPOSER_FIELD_KUR], 0.0, 1.0);
+        vec2 blended = mix(edgeDir, kurDir, mixW);
+        thetaUse = atan(blended.y, blended.x);
+        if (uPolBins > 0) {
+          float steps = float(uPolBins);
+          thetaUse = round((thetaUse / TAU) * steps) * (TAU / steps);
+        }
       }
-      thetaUse = tBlend;
     }
 
     float delta = uKernelAniso * 0.9;
@@ -260,26 +402,96 @@ void main() {
 
     float jitterSeed = hash2(floor(fragCoord.x + 0.5), floor(fragCoord.y + 0.5));
     float rawJ = sin(uJitterPhase + jitterSeed * TAU);
-    float localJ = uJitter * float(uMicrosaccade) * (float(uPhasePin) == 1.0 ? (rawJ - uMuJ) : rawJ);
-
-    float gradNorm = length(flow);
-    float bias = 0.0;
-    if (uCoupleS2E == 1 && gradNorm > 1e-6) {
-      bias = uGammaOff * dot(flow, normal) / gradNorm;
-    }
-
-    float Esurf = 0.0;
-    float sigmaEff = uSigma;
-    if (uCoupleS2E == 1) {
-      Esurf = clamp01(gradNorm * uKSigma);
-      sigmaEff = max(uSigmaMin, uSigma * (1.0 - uGammaSigma * Esurf));
-    }
-
+    float jitterFactor = uJitter * float(uMicrosaccade);
+    float localJ = jitterFactor * (float(uPhasePin) == 1.0 ? (rawJ - uMuJ) : rawJ);
     float breath = uBreath;
+
+    float warpNorm = length(warpFlow);
+    float bias = 0.0;
+    if (uCouplingSurfaceRimOffset > 0.0 && warpNorm > 1e-6) {
+      float proj = dot(warpFlow, normal) / (warpNorm + 1e-6);
+      float magnitude = responseSoft(
+        warpNorm / (1.05 + 0.55 * uKernelK0),
+        uCouplingSurfaceRimOffset
+      );
+      float magnitudeAdjusted = applyComposerScalar(clamp(magnitude, 0.0, 1.0), COMPOSER_FIELD_SURFACE);
+      float signedVal = clamp(proj, -1.0, 1.0) * magnitudeAdjusted;
+      bias = clamp(
+        0.65 *
+          couplingScale *
+          uCouplingSurfaceRimOffset *
+          uComposerWeight[COMPOSER_FIELD_SURFACE] *
+          signedVal,
+        -0.9,
+        0.9
+      );
+    }
+
+    float sigmaEff = uSigma;
+    if (uCouplingSurfaceRimSigma > 0.0 && warpNorm > 1e-6) {
+      float sharpness = responsePow(
+        warpNorm / (1.15 + 0.6 * uKernelK0),
+        uCouplingSurfaceRimSigma
+      );
+      float sharpnessAdjusted = applyComposerScalar(clamp(sharpness, 0.0, 1.0), COMPOSER_FIELD_SURFACE);
+      float drop = clamp(
+        0.75 *
+          couplingScale *
+          uCouplingSurfaceRimSigma *
+          uComposerWeight[COMPOSER_FIELD_SURFACE] *
+          sharpnessAdjusted,
+        0.0,
+        1.0
+      );
+      float sigmaFloor = clamp(sigmaFloorBase, 0.0, uSigma);
+      sigmaEff = clamp(uSigma * (1.0 - drop), sigmaFloor, uSigma);
+    }
 
     float offL = uBaseOffsets.x + localJ * 0.35 + bias;
     float offM = uBaseOffsets.y + localJ * 0.5 + bias;
     float offS = uBaseOffsets.z + localJ * 0.8 + bias;
+
+    float hueShift = 0.0;
+    if (uVolumeEnabled == 1 && uCouplingVolumePhaseHue > 0.0) {
+      float phaseNorm = clamp(volumePhaseVal / 3.141592653589793, -1.0, 1.0);
+      float phaseMag = applyComposerScalar(abs(phaseNorm), COMPOSER_FIELD_VOLUME);
+      float signedPhase = phaseNorm < 0.0 ? -phaseMag : phaseMag;
+      float volHue = clamp(
+        uCouplingScale *
+          uCouplingVolumePhaseHue *
+          uComposerWeight[COMPOSER_FIELD_VOLUME] *
+          signedPhase *
+          0.6,
+        -1.5,
+        1.5
+      );
+      hueShift += volHue;
+    }
+    if (uCouplingSurfaceRimHue > 0.0 && warpNorm > 1e-6) {
+      float latticeAngle = atan(warpFlow.y, warpFlow.x);
+      float tangentAngle = atan(tangent.y, tangent.x);
+      float deltaAngle = wrapPi(latticeAngle - tangentAngle);
+      float hueAmplitude = responseSoft(
+        min(abs(deltaAngle) / 3.141592653589793, 1.0),
+        uCouplingSurfaceRimHue
+      );
+      float warpWeight = responsePow(
+        warpNorm / (1.1 + 0.6 * uKernelK0),
+        uCouplingSurfaceRimHue
+      );
+      float hueSignal = applyComposerScalar(clamp(hueAmplitude * warpWeight, 0.0, 1.0), COMPOSER_FIELD_SURFACE);
+      float signedMag =
+        (deltaAngle == 0.0 ? 0.0 : sign(deltaAngle)) * hueSignal;
+      hueShift = clamp(
+        couplingScale *
+          uCouplingSurfaceRimHue *
+          uComposerWeight[COMPOSER_FIELD_SURFACE] *
+          signedMag *
+          0.9,
+        -1.4,
+        1.4
+      );
+    }
 
     vec2 pos = fragCoord;
     vec2 samplePosL = pos + (offL + breath) * normal;
@@ -299,10 +511,12 @@ void main() {
     float modM = pow(0.5 * (1.0 + cos(TAU * uKernelK0 * offM)), QQ);
     float modS = pow(0.5 * (1.0 + cos(TAU * uKernelK0 * offS)), QQ);
 
-    float chiPhase = TAU * uKernelK0 * dot(vec2(pos.x, pos.y), tangent) * 0.002;
+    float chiPhase = TAU * uKernelK0 * dot(pos, tangent) * 0.002 + hueShift;
     float chBase = uKernelChirality;
-    if (uKurEnabled == 1) {
-      chBase += clamp(fetchKur(icoord).z * 0.5, -1.0, 1.0);
+    if (uKurEnabled == 1 && uCouplingKurChirality > 0.0) {
+      float vortClamped = clamp(vortVal, -1.0, 1.0);
+      float vortScaled = 0.5 * couplingScale * uCouplingKurChirality * uComposerWeight[COMPOSER_FIELD_KUR] * vortClamped;
+      chBase = clamp(chBase + vortScaled, -3.0, 3.0);
     }
 
     float chiL = 0.5 + 0.5 * sin(chiPhase) * chBase;
@@ -327,43 +541,132 @@ void main() {
       rimRgb = vec3(yr);
     }
 
+    if (uDisplayMode == 4) {
+      float rimSum = rimRgb.r + rimRgb.g + rimRgb.b;
+      float baseSum = baseRgb.r + baseRgb.g + baseRgb.b;
+      vec3 weights = vec3(1.0 / 3.0);
+      if (baseSum > 1e-6) {
+        weights = baseRgb / baseSum;
+      }
+      vec3 natural = clamp01(rimSum * weights);
+      float hueBlend = 0.7;
+      float baseBlend = 0.25;
+      rimRgb = mix(rimRgb, natural, hueBlend);
+      rimRgb = mix(rimRgb, baseRgb, baseBlend);
+    }
+
     rimRgb *= uRimAlpha;
-    resultRgb = mix(resultRgb, rimRgb, clamp01(uEffectiveBlend));
+    rimRgb = applyComposerVec3(rimRgb, COMPOSER_FIELD_RIM);
+
+    float pixelBlend = clamp(uEffectiveBlend * uComposerBlendGain.x, 0.0, 1.0);
+    if (uKurEnabled == 1 && uCouplingKurTransparency > 0.0) {
+      float kurMeasure = applyComposerScalar(0.5 * (cohVal + ampVal), COMPOSER_FIELD_KUR);
+      float boost = clamp(
+        1.0 +
+          couplingScale *
+            uCouplingKurTransparency *
+            uComposerWeight[COMPOSER_FIELD_KUR] *
+            (kurMeasure - 0.5) *
+            1.5,
+        0.1,
+        2.5
+      );
+      pixelBlend = clamp(pixelBlend * boost, 0.0, 1.0);
+    }
+    pixelBlend = clamp(pixelBlend * uComposerWeight[COMPOSER_FIELD_RIM], 0.0, 1.0);
+
+    resultRgb = mix(resultRgb, rimRgb, pixelBlend);
   }
 
   if (uSurfEnabled == 1) {
     float mask = 1.0;
     if (uSurfaceRegion == 0) {
-      mask = clamp01((uEdgeThreshold - magVal) / max(1e-6, uEdgeThreshold));
+      mask = clamp01(
+        (uEdgeThreshold - magVal) / max(1e-6, uEdgeThreshold)
+      );
     } else if (uSurfaceRegion == 1) {
-      mask = clamp01((magVal - uEdgeThreshold) / max(1e-6, 1.0 - uEdgeThreshold));
+      mask = clamp01(
+        (magVal - uEdgeThreshold) / max(1e-6, 1.0 - uEdgeThreshold)
+      );
     }
     if (mask > 1e-3) {
-      vec2 surfFlow = flow;
-      if (uCoupleE2S == 1 && magVal >= uEdgeThreshold) {
-        vec2 tangent = normalize(vec2(-gradEdge.y, gradEdge.x));
-        vec2 flowNorm = normalize(surfFlow);
-        float dotVal = dot(flowNorm, tangent);
-        dotVal /= (length(surfFlow) * length(tangent) + 1e-6);
-        float align = pow(clamp01((dotVal + 1.0) * 0.5), uAlphaPol);
-        surfFlow = (1.0 - align) * surfFlow + align * tangent;
+      vec2 surfFlow = combinedFlow;
+      if (uCouplingRimSurfaceAlign > 0.0 && magVal >= uEdgeThreshold && edgeLen > 1e-8) {
+        vec2 tangentN = tangent;
+        float surfLen = length(surfFlow);
+        if (surfLen > 1e-6) {
+          float dotVal = dot(surfFlow, tangentN) / (surfLen + 1e-9);
+          float alignment = responsePow(
+            (dotVal + 1.0) * 0.5,
+            uCouplingRimSurfaceAlign
+          );
+          float alignWeight =
+            clamp(
+              uCouplingRimSurfaceAlign *
+                couplingScale *
+                uComposerWeight[COMPOSER_FIELD_SURFACE] *
+                alignment,
+              0.0,
+              1.0
+            );
+          vec2 target = tangentN * surfLen;
+          surfFlow = mix(surfFlow, target, alignWeight);
+        }
+      }
+      if (uKurEnabled == 1 && uCouplingKurOrientation > 0.0) {
+        float kurNorm = length(kurGrad);
+        float surfLen = length(surfFlow);
+        if (kurNorm > 1e-6 && surfLen > 1e-6) {
+          vec2 target = (kurGrad / kurNorm) * surfLen;
+          float weight =
+            clamp(uCouplingKurOrientation * couplingScale * uComposerWeight[COMPOSER_FIELD_KUR] * 0.75, 0.0, 1.0);
+          surfFlow = mix(surfFlow, target, weight);
+        }
       }
       float dirNorm = length(surfFlow) + 1e-6;
-      float dirW = 1.0 + 0.5 * uKernelAniso * cos(2.0 * atan(surfFlow.y, surfFlow.x));
-      vec2 warp = uWarpAmp * (surfFlow / dirNorm) * dirW;
-      vec3 warped = sampleRgbTexture(uBaseTex, fragCoord + warp);
+      float dirAngle = atan(surfFlow.y, surfFlow.x);
+      float dirW = 1.0 + 0.5 * uKernelAniso * cos(2.0 * dirAngle);
+      float amplitude = clamp(uWarpAmp * dirNorm * dirW, 0.0, 1.0);
+      float phaseShift = dirAngle + uTime * 0.45;
+      vec3 warped = vec3(
+        clamp01(0.5 + 0.5 * sin(phaseShift)),
+        clamp01(0.5 + 0.5 * sin(phaseShift + 2.094395102f)),
+        clamp01(0.5 + 0.5 * sin(phaseShift + 4.188790204f))
+      );
+      warped *= amplitude;
       if (uDisplayMode == 2) {
         float yy = luma01(warped);
         warped = vec3(yy);
       }
-      float sb = uSurfaceBlend * mask;
-      if (uCoupleE2S == 1) {
-        sb *= 1.0 + uEtaAmp * clamp01(rimEnergy);
+      warped = applyComposerVec3(warped, COMPOSER_FIELD_SURFACE);
+      float sb = uSurfaceBlend * mask * uComposerBlendGain.y;
+      if (uCouplingRimSurfaceBlend > 0.0) {
+        float energy = responseSoft(
+          rimEnergy / (0.75 + 0.25 * uKernelGain),
+          uCouplingRimSurfaceBlend
+        );
+        float rimBoost = clamp(
+          1.0 + couplingScale * uCouplingRimSurfaceBlend * uComposerWeight[COMPOSER_FIELD_RIM] * energy,
+          0.2,
+          3.0
+        );
+        sb *= rimBoost;
       }
-      if (uKurEnabled == 1) {
-        sb *= 0.5 + 0.5 * fetchKur(icoord).w;
+      if (uKurEnabled == 1 && uCouplingKurTransparency > 0.0) {
+        float kurMeasure = applyComposerScalar(0.5 * (cohVal + ampVal), COMPOSER_FIELD_KUR);
+        float boost = clamp(
+          1.0 +
+            couplingScale *
+              uCouplingKurTransparency *
+              uComposerWeight[COMPOSER_FIELD_KUR] *
+              (kurMeasure - 0.5) *
+              1.5,
+          0.1,
+          3.0
+        );
+        sb *= boost;
       }
-      sb = clamp01(sb);
+      sb = clamp(sb * uComposerWeight[COMPOSER_FIELD_SURFACE], 0.0, 1.0);
       resultRgb = mix(resultRgb, warped, sb);
     }
   }
@@ -371,19 +674,6 @@ void main() {
   fragColor = vec4(resultRgb, 1.0);
 }
 `;
-
-export type EdgeTextures = {
-  gx: Float32Array;
-  gy: Float32Array;
-  mag: Float32Array;
-};
-
-export type KurFields = {
-  gradX: Float32Array | null;
-  gradY: Float32Array | null;
-  vort: Float32Array | null;
-  coh: Float32Array | null;
-};
 
 export type OrientationUniforms = {
   cos: Float32Array;
@@ -410,7 +700,6 @@ export type RenderUniforms = {
   displayMode: number;
   baseOffsets: [number, number, number];
   sigma: number;
-  sigmaMin: number;
   jitter: number;
   jitterPhase: number;
   breath: number;
@@ -420,24 +709,26 @@ export type RenderUniforms = {
   polBins: number;
   thetaMode: number;
   thetaGlobal: number;
-  coupleS2E: boolean;
-  alphaPol: number;
-  gammaOff: number;
-  kSigma: number;
-  gammaSigma: number;
   contrast: number;
   frameGain: number;
+  rimEnabled: boolean;
   rimAlpha: number;
   warpAmp: number;
   surfaceBlend: number;
   surfaceRegion: number;
   surfEnabled: boolean;
-  coupleE2S: boolean;
-  etaAmp: number;
   kurEnabled: boolean;
+  volumeEnabled: boolean;
   useWallpaper: boolean;
   kernel: KernelUniform;
   alive: boolean;
+  beta2: number;
+  coupling: CouplingConfig;
+  couplingScale: number;
+  composerExposure: Float32Array;
+  composerGamma: Float32Array;
+  composerWeight: Float32Array;
+  composerBlendGain: [number, number];
 };
 
 export type RenderInputs = {
@@ -451,8 +742,9 @@ export type RenderOptions = RenderUniforms & RenderInputs;
 export type GpuRenderer = {
   resize(width: number, height: number): void;
   uploadBase(image: ImageData): void;
-  uploadEdge(field: EdgeTextures): void;
-  uploadKur(fields: KurFields): void;
+  uploadRim(field: RimField | null): void;
+  uploadPhase(field: PhaseField | null): void;
+  uploadVolume(field: VolumeField | null): void;
   render(options: RenderOptions): void;
   readPixels(target: Uint8Array): void;
   dispose(): void;
@@ -502,6 +794,16 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     internalFormat: gl.RGBA32F,
     type: gl.FLOAT
   });
+  const ampTex = createTexture(gl, {
+    format: gl.RED,
+    internalFormat: gl.R32F,
+    type: gl.FLOAT
+  });
+  const volumeTex = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA32F,
+    type: gl.FLOAT
+  });
 
   const state = {
     width: 1,
@@ -511,7 +813,9 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     textures: {
       base: baseTex,
       edge: edgeTex,
-      kur: kurTex
+      kur: kurTex,
+      amp: ampTex,
+      volume: volumeTex
     },
     gl
   };
@@ -520,7 +824,11 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
   const orientCosBuffer = new Float32Array(8);
   const orientSinBuffer = new Float32Array(8);
   let edgeBuffer: Float32Array | null = null;
-  let kurBuffer: Float32Array | null = null;
+  let phaseBuffer: Float32Array | null = null;
+  let ampBuffer: Float32Array | null = null;
+  let phaseFillState: "empty" | "zeros" | "data" = "empty";
+  let volumeBuffer: Float32Array | null = null;
+  let volumeFillState: "empty" | "zeros" | "data" = "empty";
 
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.CULL_FACE);
@@ -532,38 +840,107 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       state.width = width;
       state.height = height;
       gl.viewport(0, 0, width, height);
+      edgeBuffer = null;
+      phaseBuffer = null;
+      ampBuffer = null;
+      phaseFillState = "empty";
+      volumeBuffer = null;
+      volumeFillState = "empty";
     },
     uploadBase(image) {
       uploadImageData(gl, state.textures.base.texture, image);
     },
-    uploadEdge(field) {
+    uploadRim(field) {
       const total = state.width * state.height;
       const needed = total * 4;
       if (!edgeBuffer || edgeBuffer.length !== needed) {
         edgeBuffer = new Float32Array(needed);
       }
-      for (let i = 0; i < total; i++) {
-        edgeBuffer[i * 4 + 0] = field.gx[i];
-        edgeBuffer[i * 4 + 1] = field.gy[i];
-        edgeBuffer[i * 4 + 2] = field.mag[i];
-        edgeBuffer[i * 4 + 3] = 0;
+      if (!field) {
+        edgeBuffer.fill(0);
+      } else {
+        assertRimField(field, "gpu:rim");
+        if (field.resolution.width !== state.width || field.resolution.height !== state.height) {
+          throw new Error(
+            `[gpuRenderer] rim field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`
+          );
+        }
+        for (let i = 0; i < total; i++) {
+          edgeBuffer[i * 4 + 0] = field.gx[i];
+          edgeBuffer[i * 4 + 1] = field.gy[i];
+          edgeBuffer[i * 4 + 2] = field.mag[i];
+          edgeBuffer[i * 4 + 3] = 0;
+        }
       }
       uploadFloatTexture(gl, state.textures.edge.texture, edgeBuffer, state.width, state.height);
     },
-    uploadKur(fields) {
-      if (!fields.gradX || !fields.gradY || !fields.vort || !fields.coh) return;
+    uploadPhase(field) {
       const total = state.width * state.height;
       const needed = total * 4;
-      if (!kurBuffer || kurBuffer.length !== needed) {
-        kurBuffer = new Float32Array(needed);
+      if (!phaseBuffer || phaseBuffer.length !== needed) {
+        phaseBuffer = new Float32Array(needed);
+        phaseFillState = "empty";
+      }
+      if (!ampBuffer || ampBuffer.length !== total) {
+        ampBuffer = new Float32Array(total);
+        phaseFillState = "empty";
+      }
+      if (!field) {
+        if (phaseFillState !== "zeros") {
+          phaseBuffer!.fill(0);
+          ampBuffer!.fill(0);
+          uploadFloatTexture(gl, state.textures.kur.texture, phaseBuffer!, state.width, state.height);
+          uploadScalarTexture(gl, state.textures.amp.texture, ampBuffer!, state.width, state.height);
+          phaseFillState = "zeros";
+        }
+        return;
+      }
+      assertPhaseField(field, "gpu:phase");
+      if (field.resolution.width !== state.width || field.resolution.height !== state.height) {
+        throw new Error(
+          `[gpuRenderer] phase field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`
+        );
       }
       for (let i = 0; i < total; i++) {
-        kurBuffer[i * 4 + 0] = fields.gradX[i];
-        kurBuffer[i * 4 + 1] = fields.gradY[i];
-        kurBuffer[i * 4 + 2] = fields.vort[i];
-        kurBuffer[i * 4 + 3] = fields.coh[i];
+        phaseBuffer![i * 4 + 0] = field.gradX[i];
+        phaseBuffer![i * 4 + 1] = field.gradY[i];
+        phaseBuffer![i * 4 + 2] = field.vort[i];
+        phaseBuffer![i * 4 + 3] = field.coh[i];
+        ampBuffer![i] = field.amp[i];
       }
-      uploadFloatTexture(gl, state.textures.kur.texture, kurBuffer, state.width, state.height);
+      uploadFloatTexture(gl, state.textures.kur.texture, phaseBuffer!, state.width, state.height);
+      uploadScalarTexture(gl, state.textures.amp.texture, ampBuffer!, state.width, state.height);
+      phaseFillState = "data";
+    },
+    uploadVolume(field) {
+      const total = state.width * state.height;
+      const needed = total * 4;
+      if (!volumeBuffer || volumeBuffer.length !== needed) {
+        volumeBuffer = new Float32Array(needed);
+        volumeFillState = "empty";
+      }
+      if (!field) {
+        if (volumeFillState !== "zeros") {
+          volumeBuffer!.fill(0);
+          uploadFloatTexture(gl, state.textures.volume.texture, volumeBuffer!, state.width, state.height);
+          volumeFillState = "zeros";
+        }
+        return;
+      }
+      assertVolumeField(field, "gpu:volume");
+      if (field.resolution.width !== state.width || field.resolution.height !== state.height) {
+        throw new Error(
+          `[gpuRenderer] volume field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`
+        );
+      }
+      for (let i = 0; i < total; i++) {
+        volumeBuffer![i * 4 + 0] = field.phase[i];
+        volumeBuffer![i * 4 + 1] = field.depth[i];
+        volumeBuffer![i * 4 + 2] = field.intensity[i];
+        volumeBuffer![i * 4 + 3] = 0;
+      }
+      uploadFloatTexture(gl, state.textures.volume.texture, volumeBuffer!, state.width, state.height);
+      volumeFillState = "data";
     },
     render(options) {
       gl.useProgram(program);
@@ -571,6 +948,8 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       bindTexture(gl, state.textures.base.texture, 0, uniforms.baseTex);
       bindTexture(gl, state.textures.edge.texture, 1, uniforms.edgeTex);
       bindTexture(gl, state.textures.kur.texture, 2, uniforms.kurTex);
+      bindTexture(gl, state.textures.amp.texture, 3, uniforms.kurAmpTex);
+      bindTexture(gl, state.textures.volume.texture, 4, uniforms.volumeTex);
 
       gl.uniform2f(uniforms.resolution, state.width, state.height);
       gl.uniform1f(uniforms.time, options.time);
@@ -579,7 +958,6 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.uniform1i(uniforms.displayMode, options.displayMode);
       gl.uniform3f(uniforms.baseOffsets, options.baseOffsets[0], options.baseOffsets[1], options.baseOffsets[2]);
       gl.uniform1f(uniforms.sigma, options.sigma);
-      gl.uniform1f(uniforms.sigmaMin, options.sigmaMin);
       gl.uniform1f(uniforms.jitter, options.jitter);
       gl.uniform1f(uniforms.jitterPhase, options.jitterPhase);
       gl.uniform1f(uniforms.breath, options.breath);
@@ -589,21 +967,16 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.uniform1i(uniforms.polBins, options.polBins);
       gl.uniform1i(uniforms.thetaMode, options.thetaMode);
       gl.uniform1f(uniforms.thetaGlobal, options.thetaGlobal);
-      gl.uniform1i(uniforms.coupleS2E, options.coupleS2E ? 1 : 0);
-      gl.uniform1f(uniforms.alphaPol, options.alphaPol);
-      gl.uniform1f(uniforms.gammaOff, options.gammaOff);
-      gl.uniform1f(uniforms.kSigma, options.kSigma);
-      gl.uniform1f(uniforms.gammaSigma, options.gammaSigma);
       gl.uniform1f(uniforms.contrast, options.contrast);
       gl.uniform1f(uniforms.frameGain, options.frameGain);
+      gl.uniform1i(uniforms.rimEnabled, options.rimEnabled ? 1 : 0);
       gl.uniform1f(uniforms.rimAlpha, options.rimAlpha);
       gl.uniform1f(uniforms.warpAmp, options.warpAmp);
       gl.uniform1f(uniforms.surfaceBlend, options.surfaceBlend);
       gl.uniform1i(uniforms.surfaceRegion, options.surfaceRegion);
       gl.uniform1i(uniforms.surfEnabled, options.surfEnabled ? 1 : 0);
-      gl.uniform1i(uniforms.coupleE2S, options.coupleE2S ? 1 : 0);
-      gl.uniform1f(uniforms.etaAmp, options.etaAmp);
       gl.uniform1i(uniforms.kurEnabled, options.kurEnabled ? 1 : 0);
+      gl.uniform1i(uniforms.volumeEnabled, options.volumeEnabled ? 1 : 0);
       gl.uniform1i(uniforms.useWallpaper, options.useWallpaper ? 1 : 0);
       gl.uniform2f(uniforms.canvasCenter, options.center[0], options.center[1]);
       gl.uniform1f(uniforms.kernelGain, options.kernel.gain);
@@ -612,6 +985,22 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.uniform1f(uniforms.kernelAniso, options.kernel.anisotropy);
       gl.uniform1f(uniforms.kernelChirality, options.kernel.chirality);
       gl.uniform1f(uniforms.alive, options.alive ? 1 : 0);
+      gl.uniform1f(uniforms.beta2, options.beta2);
+      gl.uniform1f(uniforms.couplingRimSurfaceBlend, options.coupling.rimToSurfaceBlend);
+      gl.uniform1f(uniforms.couplingRimSurfaceAlign, options.coupling.rimToSurfaceAlign);
+      gl.uniform1f(uniforms.couplingSurfaceRimOffset, options.coupling.surfaceToRimOffset);
+      gl.uniform1f(uniforms.couplingSurfaceRimSigma, options.coupling.surfaceToRimSigma);
+      gl.uniform1f(uniforms.couplingSurfaceRimHue, options.coupling.surfaceToRimHue);
+      gl.uniform1f(uniforms.couplingKurTransparency, options.coupling.kurToTransparency);
+      gl.uniform1f(uniforms.couplingKurOrientation, options.coupling.kurToOrientation);
+      gl.uniform1f(uniforms.couplingKurChirality, options.coupling.kurToChirality);
+      gl.uniform1f(uniforms.couplingScale, options.couplingScale);
+      gl.uniform1f(uniforms.couplingVolumePhaseHue, options.coupling.volumePhaseToHue);
+      gl.uniform1f(uniforms.couplingVolumeDepthWarp, options.coupling.volumeDepthToWarp);
+      gl.uniform1fv(uniforms.composerExposure, options.composerExposure);
+      gl.uniform1fv(uniforms.composerGamma, options.composerGamma);
+      gl.uniform1fv(uniforms.composerWeight, options.composerWeight);
+      gl.uniform2f(uniforms.composerBlendGain, options.composerBlendGain[0], options.composerBlendGain[1]);
 
       const ops = options.ops;
       gl.uniform1i(uniforms.opsCount, ops.length);
@@ -655,6 +1044,8 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.deleteTexture(state.textures.base.texture);
       gl.deleteTexture(state.textures.edge.texture);
       gl.deleteTexture(state.textures.kur.texture);
+      gl.deleteTexture(state.textures.amp.texture);
+      gl.deleteTexture(state.textures.volume.texture);
     }
   };
 
@@ -741,6 +1132,19 @@ function uploadFloatTexture(
   gl.bindTexture(gl.TEXTURE_2D, null);
 }
 
+function uploadScalarTexture(
+  gl: WebGL2RenderingContext,
+  texture: WebGLTexture,
+  data: Float32Array,
+  width: number,
+  height: number
+) {
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, data);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+}
+
 function bindTexture(
   gl: WebGL2RenderingContext,
   texture: WebGLTexture,
@@ -757,6 +1161,8 @@ function locateUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
     baseTex: getUniform(gl, program, "uBaseTex"),
     edgeTex: getUniform(gl, program, "uEdgeTex"),
     kurTex: getUniform(gl, program, "uKurTex"),
+    kurAmpTex: getUniform(gl, program, "uKurAmpTex"),
+    volumeTex: getUniform(gl, program, "uVolumeTex"),
     resolution: getUniform(gl, program, "uResolution"),
     time: getUniform(gl, program, "uTime"),
     edgeThreshold: getUniform(gl, program, "uEdgeThreshold"),
@@ -764,7 +1170,6 @@ function locateUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
     displayMode: getUniform(gl, program, "uDisplayMode"),
     baseOffsets: getUniform(gl, program, "uBaseOffsets"),
     sigma: getUniform(gl, program, "uSigma"),
-    sigmaMin: getUniform(gl, program, "uSigmaMin"),
     jitter: getUniform(gl, program, "uJitter"),
     jitterPhase: getUniform(gl, program, "uJitterPhase"),
     breath: getUniform(gl, program, "uBreath"),
@@ -774,21 +1179,16 @@ function locateUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
     polBins: getUniform(gl, program, "uPolBins"),
     thetaMode: getUniform(gl, program, "uThetaMode"),
     thetaGlobal: getUniform(gl, program, "uThetaGlobal"),
-    coupleS2E: getUniform(gl, program, "uCoupleS2E"),
-    alphaPol: getUniform(gl, program, "uAlphaPol"),
-    gammaOff: getUniform(gl, program, "uGammaOff"),
-    kSigma: getUniform(gl, program, "uKSigma"),
-    gammaSigma: getUniform(gl, program, "uGammaSigma"),
     contrast: getUniform(gl, program, "uContrast"),
     frameGain: getUniform(gl, program, "uFrameGain"),
+    rimEnabled: getUniform(gl, program, "uRimEnabled"),
     rimAlpha: getUniform(gl, program, "uRimAlpha"),
     warpAmp: getUniform(gl, program, "uWarpAmp"),
     surfaceBlend: getUniform(gl, program, "uSurfaceBlend"),
     surfaceRegion: getUniform(gl, program, "uSurfaceRegion"),
     surfEnabled: getUniform(gl, program, "uSurfEnabled"),
-    coupleE2S: getUniform(gl, program, "uCoupleE2S"),
-    etaAmp: getUniform(gl, program, "uEtaAmp"),
     kurEnabled: getUniform(gl, program, "uKurEnabled"),
+    volumeEnabled: getUniform(gl, program, "uVolumeEnabled"),
     useWallpaper: getUniform(gl, program, "uUseWallpaper"),
     opsCount: getUniform(gl, program, "uOpsCount"),
     ops: getUniform(gl, program, "uOps"),
@@ -801,7 +1201,23 @@ function locateUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
     kernelQ: getUniform(gl, program, "uKernelQ"),
     kernelAniso: getUniform(gl, program, "uKernelAniso"),
     kernelChirality: getUniform(gl, program, "uKernelChirality"),
-    alive: getUniform(gl, program, "uAlive")
+    alive: getUniform(gl, program, "uAlive"),
+    beta2: getUniform(gl, program, "uBeta2"),
+    couplingRimSurfaceBlend: getUniform(gl, program, "uCouplingRimSurfaceBlend"),
+    couplingRimSurfaceAlign: getUniform(gl, program, "uCouplingRimSurfaceAlign"),
+    couplingSurfaceRimOffset: getUniform(gl, program, "uCouplingSurfaceRimOffset"),
+    couplingSurfaceRimSigma: getUniform(gl, program, "uCouplingSurfaceRimSigma"),
+    couplingSurfaceRimHue: getUniform(gl, program, "uCouplingSurfaceRimHue"),
+    couplingKurTransparency: getUniform(gl, program, "uCouplingKurTransparency"),
+    couplingKurOrientation: getUniform(gl, program, "uCouplingKurOrientation"),
+    couplingKurChirality: getUniform(gl, program, "uCouplingKurChirality"),
+    couplingScale: getUniform(gl, program, "uCouplingScale"),
+    couplingVolumePhaseHue: getUniform(gl, program, "uCouplingVolumePhaseHue"),
+    couplingVolumeDepthWarp: getUniform(gl, program, "uCouplingVolumeDepthWarp"),
+    composerExposure: getUniform(gl, program, "uComposerExposure"),
+    composerGamma: getUniform(gl, program, "uComposerGamma"),
+    composerWeight: getUniform(gl, program, "uComposerWeight"),
+    composerBlendGain: getUniform(gl, program, "uComposerBlendGain")
   };
 }
 

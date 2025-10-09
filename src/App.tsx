@@ -14,24 +14,81 @@ import {
   deriveKuramotoFields as deriveKuramotoFieldsCore,
   initKuramotoState,
   stepKuramotoState,
-  type KuramotoDerived,
+  type PhaseField,
   type KuramotoParams,
-  type KuramotoState
+  type KuramotoState,
+  type KuramotoTelemetrySnapshot,
+  type IrradianceFrameBuffer,
+  type KuramotoInstrumentationSnapshot
 } from "./kuramotoCore";
 import {
   createGpuRenderer,
-  type EdgeTextures,
   type GpuRenderer
 } from "./gpuRenderer";
-
-type KernelSpec = {
-  gain: number;
-  k0: number;
-  Q: number;
-  anisotropy: number;
-  chirality: number;
-  transparency: number;
-};
+import {
+  applyOp,
+  clamp,
+  computeComposerBlendGain,
+  createDefaultComposerConfig,
+  groupOps,
+  hash2,
+  kEff,
+  renderRainbowFrame,
+  toGpuOps,
+  COMPOSER_FIELD_LIST,
+  type RainbowFrameMetrics,
+  type SurfaceRegion,
+  type WallpaperGroup,
+  type DisplayMode,
+  type CouplingConfig,
+  type ComposerConfig,
+  type ComposerFieldId,
+  type ComposerTelemetry,
+  type DmtRoutingMode,
+  type SolverRegime
+} from "./pipeline/rainbowFrame";
+import {
+  clampKernelSpec,
+  createKernelSpec,
+  getDefaultKernelSpec,
+  kernelSpecToJSON,
+  type KernelSpec
+} from "./kernel/kernelSpec";
+import { getKernelSpecHub } from "./kernel/kernelHub";
+import { computeEdgeField } from "./pipeline/edgeDetection";
+import {
+  FIELD_CONTRACTS,
+  FIELD_KINDS,
+  assertPhaseField,
+  assertRimField,
+  assertSurfaceField,
+  assertVolumeField,
+  describeImageData,
+  type FieldKind,
+  type FieldResolution,
+  type RimField,
+  type SurfaceField,
+  type VolumeField
+} from "./fields/contracts";
+import type { OpticalFieldMetadata } from "./fields/opticalField.js";
+import {
+  createInitialStatuses,
+  markFieldUnavailable as setFieldUnavailable,
+  markFieldUpdate as setFieldAvailable,
+  refreshFieldStaleness,
+  type FieldStatusMap
+} from "./fields/state";
+import {
+  createVolumeStubState,
+  snapshotVolumeStub,
+  stepVolumeStub,
+  type VolumeStubState
+} from "./volumeStub";
+import {
+  DEFAULT_SYNTHETIC_SIZE,
+  SYNTHETIC_CASES,
+  type SyntheticCaseId
+} from "./dev/syntheticDeck";
 
 type Preset = {
   name: string;
@@ -49,16 +106,46 @@ type Preset = {
     speed: number;
     contrast: number;
   };
+  coupling: CouplingConfig;
+  composer: ComposerConfig;
+  couplingToggles: CouplingToggleState;
 };
 
-const DMT_SENS = {
-  g1: 0.6,
-  k1: 0.35,
-  q1: 0.5,
-  a1: 0.7,
-  c1: 0.6,
-  t1: 0.5
-} as const;
+type CouplingToggleState = {
+  rimToSurface: boolean;
+  surfaceToRim: boolean;
+};
+
+type RenderFrameOptions = {
+  toggles?: CouplingToggleState;
+};
+
+const DEFAULT_COUPLING_TOGGLES: CouplingToggleState = {
+  rimToSurface: true,
+  surfaceToRim: true
+};
+
+const cloneCouplingToggles = (value: CouplingToggleState): CouplingToggleState => ({
+  rimToSurface: value.rimToSurface,
+  surfaceToRim: value.surfaceToRim
+});
+
+const applyCouplingToggles = (
+  config: CouplingConfig,
+  toggles: CouplingToggleState
+): CouplingConfig => {
+  const next = cloneCouplingConfig(config);
+  if (!toggles.rimToSurface) {
+    next.rimToSurfaceBlend = 0;
+    next.rimToSurfaceAlign = 0;
+  }
+  if (!toggles.surfaceToRim) {
+    next.surfaceToRimOffset = 0;
+    next.surfaceToRimSigma = 0;
+    next.surfaceToRimHue = 0;
+  }
+  return next;
+};
 
 const PRESETS: Preset[] = [
   {
@@ -66,14 +153,14 @@ const PRESETS: Preset[] = [
     params: {
       edgeThreshold: 0.08,
       blend: 0.39,
-      kernel: {
+      kernel: createKernelSpec({
         gain: 3.0,
         k0: 0.2,
         Q: 4.6,
         anisotropy: 0.95,
         chirality: 1.46,
         transparency: 0.28
-      },
+      }),
       dmt: 0.2,
       thetaMode: "gradient",
       thetaGlobal: 0,
@@ -83,29 +170,70 @@ const PRESETS: Preset[] = [
       microsaccade: true,
       speed: 1.32,
       contrast: 1.62
-    }
+    },
+    coupling: {
+      rimToSurfaceBlend: 0.45,
+      rimToSurfaceAlign: 0.55,
+      surfaceToRimOffset: 0.4,
+      surfaceToRimSigma: 0.6,
+      surfaceToRimHue: 0.5,
+      kurToTransparency: 0.35,
+      kurToOrientation: 0.35,
+      kurToChirality: 0.6,
+      volumePhaseToHue: 0.35,
+      volumeDepthToWarp: 0.3
+    },
+    composer: createDefaultComposerConfig(),
+    couplingToggles: DEFAULT_COUPLING_TOGGLES
   }
 ];
 
-type SurfaceRegion = "surfaces" | "edges" | "both";
-type WallpaperGroup = "off" | "p2" | "p4" | "p6" | "pmm" | "p4m";
-type DisplayMode =
-  | "color"
-  | "grayBaseColorRims"
-  | "grayBaseGrayRims"
-  | "colorBaseGrayRims";
+type KurRegime = "locked" | "highEnergy" | "chaotic" | "custom";
 
-type Op =
-  | { kind: "rot"; angle: number }
-  | { kind: "mirrorX" }
-  | { kind: "mirrorY" }
-  | { kind: "diag1" }
-  | { kind: "diag2" };
-
-type EdgeField = {
-  gx: Float32Array;
-  gy: Float32Array;
-  mag: Float32Array;
+const KUR_REGIME_PRESETS: Record<Exclude<KurRegime, "custom">, {
+  label: string;
+  description: string;
+  params: {
+    K0: number;
+    alphaKur: number;
+    gammaKur: number;
+    omega0: number;
+    epsKur: number;
+  };
+}> = {
+  locked: {
+    label: "Locked coherence",
+    description: "Low-noise lattice with stable phase alignment.",
+    params: {
+      K0: 0.85,
+      alphaKur: 0.18,
+      gammaKur: 0.16,
+      omega0: 0.0,
+      epsKur: 0.0025
+    }
+  },
+  highEnergy: {
+    label: "High-energy flux",
+    description: "Strong coupling and drive yielding intense wavefronts.",
+    params: {
+      K0: 1.35,
+      alphaKur: 0.12,
+      gammaKur: 0.1,
+      omega0: 0.55,
+      epsKur: 0.006
+    }
+  },
+  chaotic: {
+    label: "Chaotic drift",
+    description: "Loose locking with broadband oscillations and noise.",
+    params: {
+      K0: 1.1,
+      alphaKur: 0.28,
+      gammaKur: 0.12,
+      omega0: 0.35,
+      epsKur: 0.012
+    }
+  }
 };
 
 type FrameProfilerState = {
@@ -115,14 +243,99 @@ type FrameProfilerState = {
   label: string;
 };
 
+const RIM_HIST_BINS = 64;
+const SURFACE_HIST_BINS = 32;
+const PHASE_HIST_BINS = 64;
+const PHASE_HIST_SCALE = 2.5;
+
+const COMPOSER_FIELD_LABELS: Record<ComposerFieldId, string> = {
+  surface: "Surface",
+  rim: "Rim",
+  kur: "Kuramoto",
+  volume: "Volume"
+};
+
+const cloneCouplingConfig = (value: CouplingConfig): CouplingConfig => ({
+  rimToSurfaceBlend: value.rimToSurfaceBlend,
+  rimToSurfaceAlign: value.rimToSurfaceAlign,
+  surfaceToRimOffset: value.surfaceToRimOffset,
+  surfaceToRimSigma: value.surfaceToRimSigma,
+  surfaceToRimHue: value.surfaceToRimHue,
+  kurToTransparency: value.kurToTransparency,
+  kurToOrientation: value.kurToOrientation,
+  kurToChirality: value.kurToChirality,
+  volumePhaseToHue: value.volumePhaseToHue,
+  volumeDepthToWarp: value.volumeDepthToWarp
+});
+
+const sanitizeCouplingConfig = (
+  value: Partial<CouplingConfig> | null | undefined,
+  fallback: CouplingConfig
+): CouplingConfig => {
+  const source = value ?? {};
+  return {
+    rimToSurfaceBlend: typeof source.rimToSurfaceBlend === "number" ? source.rimToSurfaceBlend : fallback.rimToSurfaceBlend,
+    rimToSurfaceAlign: typeof source.rimToSurfaceAlign === "number" ? source.rimToSurfaceAlign : fallback.rimToSurfaceAlign,
+    surfaceToRimOffset: typeof source.surfaceToRimOffset === "number" ? source.surfaceToRimOffset : fallback.surfaceToRimOffset,
+    surfaceToRimSigma: typeof source.surfaceToRimSigma === "number" ? source.surfaceToRimSigma : fallback.surfaceToRimSigma,
+    surfaceToRimHue: typeof source.surfaceToRimHue === "number" ? source.surfaceToRimHue : fallback.surfaceToRimHue,
+    kurToTransparency: typeof source.kurToTransparency === "number" ? source.kurToTransparency : fallback.kurToTransparency,
+    kurToOrientation: typeof source.kurToOrientation === "number" ? source.kurToOrientation : fallback.kurToOrientation,
+    kurToChirality: typeof source.kurToChirality === "number" ? source.kurToChirality : fallback.kurToChirality,
+    volumePhaseToHue: typeof source.volumePhaseToHue === "number" ? source.volumePhaseToHue : fallback.volumePhaseToHue,
+    volumeDepthToWarp: typeof source.volumeDepthToWarp === "number" ? source.volumeDepthToWarp : fallback.volumeDepthToWarp
+  };
+};
+
+const cloneComposerConfig = (config: ComposerConfig): ComposerConfig => ({
+  fields: {
+    surface: { ...config.fields.surface },
+    rim: { ...config.fields.rim },
+    kur: { ...config.fields.kur },
+    volume: { ...config.fields.volume }
+  },
+  dmtRouting: config.dmtRouting,
+  solverRegime: config.solverRegime
+});
+
+const sanitizeComposerImport = (
+  value: Partial<ComposerConfig> | null | undefined
+): ComposerConfig => {
+  const defaults = createDefaultComposerConfig();
+  if (!value) return defaults;
+  const result = cloneComposerConfig(defaults);
+  result.dmtRouting = (value.dmtRouting as DmtRoutingMode) ?? defaults.dmtRouting;
+  result.solverRegime = (value.solverRegime as SolverRegime) ?? defaults.solverRegime;
+  COMPOSER_FIELD_LIST.forEach((field) => {
+    const incoming = value.fields?.[field];
+    if (incoming) {
+      result.fields[field] = {
+        exposure: typeof incoming.exposure === "number" ? incoming.exposure : defaults.fields[field].exposure,
+        gamma: typeof incoming.gamma === "number" ? incoming.gamma : defaults.fields[field].gamma,
+        weight: typeof incoming.weight === "number" ? incoming.weight : defaults.fields[field].weight
+      };
+    }
+  });
+  return result;
+};
+
+const formatCouplingKey = (key: keyof CouplingConfig) =>
+  key
+    .replace(/([A-Z])/g, " $1")
+    .replace(/^./, (ch) => ch.toUpperCase());
+
 type KurFrameView = {
   buffer: ArrayBuffer;
   gradX: Float32Array;
   gradY: Float32Array;
   vort: Float32Array;
   coh: Float32Array;
+  amp: Float32Array;
   timestamp: number;
   frameId: number;
+  kernelVersion: number;
+  meta: OpticalFieldMetadata;
+  instrumentation: KuramotoInstrumentationSnapshot;
 };
 
 type WorkerFrameMessage = {
@@ -131,6 +344,9 @@ type WorkerFrameMessage = {
   timestamp: number;
   frameId: number;
   queueDepth: number;
+  kernelVersion?: number;
+  meta: OpticalFieldMetadata;
+  instrumentation: KuramotoInstrumentationSnapshot;
 };
 
 type WorkerReadyMessage = { kind: "ready"; width: number; height: number };
@@ -162,6 +378,9 @@ type ParitySceneSummary = {
   mismatched: number;
   percent: number;
   maxDelta: number;
+  maxCoord: [number, number];
+  cpuColor: [number, number, number];
+  gpuColor: [number, number, number];
 };
 
 type ParitySummary = {
@@ -179,6 +398,16 @@ type PerformanceSnapshot = {
   throughputGain: number;
   timestamp: number;
 };
+
+type FrameMetricsEntry = {
+  backend: "cpu" | "gpu";
+  ts: number;
+  metrics: RainbowFrameMetrics;
+  kernelVersion: number;
+};
+
+const printRgb = (values: [number, number, number]) =>
+  `(${values.map((value) => Math.round(value)).join(", ")})`;
 
 declare global {
   interface Window {
@@ -198,8 +427,12 @@ declare global {
             mismatched: number;
             percent: number;
             maxDelta: number;
+            maxCoord: [number, number];
+            cpuColor: [number, number, number];
+            gpuColor: [number, number, number];
           }[];
           tolerancePercent: number;
+          timestamp: number;
         }
       | null
     >;
@@ -217,14 +450,10 @@ declare global {
       | null;
     __setTelemetryEnabled?: (enabled: boolean) => void;
     __getTelemetryHistory?: () => TelemetryRecord[];
+    __getFrameMetrics?: () => FrameMetricsEntry[];
   }
 }
 
-const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-const clamp01 = (v: number) => clamp(v, 0, 1);
-const gauss = (x: number, s: number) => Math.exp(-(x * x) / (2 * s * s + 1e-9));
-const luma01 = (r: number, g: number, b: number) =>
-  clamp01(0.2126 * r + 0.7152 * g + 0.0722 * b);
 const formatBytes = (bytes: number) => {
   if (bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
@@ -233,142 +462,7 @@ const formatBytes = (bytes: number) => {
   const precision = value >= 100 || idx === 0 ? 0 : value >= 10 ? 1 : 2;
   return `${value.toFixed(precision)} ${units[idx]}`;
 };
-
-const hash2 = (x: number, y: number) => {
-  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
-  return s - Math.floor(s);
-};
-
-const kEff = (k: KernelSpec, d: number): KernelSpec => ({
-  gain: k.gain * (1 + DMT_SENS.g1 * d),
-  k0: k.k0 * (1 + DMT_SENS.k1 * d),
-  Q: k.Q * (1 + DMT_SENS.q1 * d),
-  anisotropy: k.anisotropy + DMT_SENS.a1 * d,
-  chirality: k.chirality + DMT_SENS.c1 * d,
-  transparency: k.transparency + DMT_SENS.t1 * d
-});
-
-const groupOps = (kind: WallpaperGroup): Op[] => {
-  switch (kind) {
-    case "p2":
-      return [
-        { kind: "rot", angle: 0 },
-        { kind: "rot", angle: Math.PI }
-      ];
-    case "p4":
-      return [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2].map((angle) => ({
-        kind: "rot",
-        angle
-      }));
-    case "p6":
-      return Array.from({ length: 6 }, (_, k) => ({
-        kind: "rot",
-        angle: k * (Math.PI / 3)
-      }));
-    case "pmm":
-      return [
-        { kind: "rot", angle: 0 },
-        { kind: "rot", angle: Math.PI },
-        { kind: "mirrorX" },
-        { kind: "mirrorY" }
-      ];
-    case "p4m":
-      return [
-        { kind: "rot", angle: 0 },
-        { kind: "rot", angle: Math.PI / 2 },
-        { kind: "rot", angle: Math.PI },
-        { kind: "rot", angle: (3 * Math.PI) / 2 },
-        { kind: "mirrorX" },
-        { kind: "mirrorY" },
-        { kind: "diag1" },
-        { kind: "diag2" }
-      ];
-    default:
-      return [{ kind: "rot", angle: 0 }];
-  }
-};
-
-const applyOp = (op: Op, x: number, y: number, cx: number, cy: number) => {
-  const dx = x - cx;
-  const dy = y - cy;
-  switch (op.kind) {
-    case "rot": {
-      const c = Math.cos(op.angle);
-      const s = Math.sin(op.angle);
-      return { x: cx + c * dx - s * dy, y: cy + s * dx + c * dy };
-    }
-    case "mirrorX":
-      return { x: 2 * cx - x, y };
-    case "mirrorY":
-      return { x, y: 2 * cy - y };
-    case "diag1":
-      return { x: cx + dy, y: cy + dx };
-    case "diag2":
-      return { x: cx - dy, y: cy - dx };
-    default:
-      return { x, y };
-  }
-};
-
-const sampleScalar = (
-  arr: Float32Array,
-  x: number,
-  y: number,
-  W: number,
-  H: number
-) => {
-  const xx = clamp(x, 0, W - 1.001);
-  const yy = clamp(y, 0, H - 1.001);
-  const x0 = Math.floor(xx);
-  const y0 = Math.floor(yy);
-  const x1 = x0 + 1;
-  const y1 = y0 + 1;
-  const fx = xx - x0;
-  const fy = yy - y0;
-  const idx = (ix: number, iy: number) => iy * W + ix;
-  const v00 = arr[idx(x0, y0)];
-  const v10 = arr[idx(Math.min(x1, W - 1), y0)];
-  const v01 = arr[idx(x0, Math.min(y1, H - 1))];
-  const v11 = arr[idx(Math.min(x1, W - 1), Math.min(y1, H - 1))];
-  const v0 = v00 * (1 - fx) + v10 * fx;
-  const v1 = v01 * (1 - fx) + v11 * fx;
-  return v0 * (1 - fy) + v1 * fy;
-};
-
-const sampleRGB = (
-  data: Uint8ClampedArray,
-  x: number,
-  y: number,
-  W: number,
-  H: number
-) => {
-  const xx = clamp(x, 0, W - 1.001);
-  const yy = clamp(y, 0, H - 1.001);
-  const x0 = Math.floor(xx);
-  const y0 = Math.floor(yy);
-  const x1 = Math.min(x0 + 1, W - 1);
-  const y1 = Math.min(y0 + 1, H - 1);
-  const fx = xx - x0;
-  const fy = yy - y0;
-  const idx = (ix: number, iy: number) => (iy * W + ix) * 4;
-  const mix = (a: number, b: number, t: number) => a * (1 - t) + b * t;
-  const i00 = idx(x0, y0);
-  const i10 = idx(x1, y0);
-  const i01 = idx(x0, y1);
-  const i11 = idx(x1, y1);
-  const r0 = mix(data[i00], data[i10], fx);
-  const g0 = mix(data[i00 + 1], data[i10 + 1], fx);
-  const b0 = mix(data[i00 + 2], data[i10 + 2], fx);
-  const r1 = mix(data[i01], data[i11], fx);
-  const g1 = mix(data[i01 + 1], data[i11 + 1], fx);
-  const b1 = mix(data[i01 + 2], data[i11 + 2], fx);
-  return {
-    R: mix(r0, r1, fy),
-    G: mix(g0, g1, fy),
-    B: mix(b0, b1, fy)
-  };
-};
-
+const clamp01 = (v: number) => clamp(v, 0, 1);
 const useRandN = () => {
   const spareRef = useRef<number | null>(null);
   return useCallback(() => {
@@ -389,24 +483,6 @@ const useRandN = () => {
   }, []);
 };
 
-const toGpuOps = (ops: Op[]): { kind: number; angle: number }[] =>
-  ops.map((op) => {
-    switch (op.kind) {
-      case "rot":
-        return { kind: 0, angle: op.angle };
-      case "mirrorX":
-        return { kind: 1, angle: 0 };
-      case "mirrorY":
-        return { kind: 2, angle: 0 };
-      case "diag1":
-        return { kind: 3, angle: 0 };
-      case "diag2":
-        return { kind: 4, angle: 0 };
-      default:
-        return { kind: 0, angle: 0 };
-    }
-  });
-
 const displayModeToEnum = (mode: DisplayMode) => {
   switch (mode) {
     case "grayBaseColorRims":
@@ -415,10 +491,42 @@ const displayModeToEnum = (mode: DisplayMode) => {
       return 2;
     case "colorBaseGrayRims":
       return 3;
+    case "colorBaseBlendedRims":
+      return 4;
     default:
       return 0;
   }
 };
+
+const FIELD_STATUS_STYLES = {
+  ok: {
+    border: "rgba(34,197,94,0.35)",
+    background: "rgba(34,197,94,0.16)",
+    color: "#bbf7d0"
+  },
+  warn: {
+    border: "rgba(251,191,36,0.4)",
+    background: "rgba(251,191,36,0.18)",
+    color: "#fde68a"
+  },
+  stale: {
+    border: "rgba(248,113,113,0.45)",
+    background: "rgba(248,113,113,0.2)",
+    color: "#fecaca"
+  },
+  missing: {
+    border: "rgba(148,163,184,0.35)",
+    background: "rgba(148,163,184,0.16)",
+    color: "#e2e8f0"
+  }
+} as const;
+
+const FIELD_STATUS_LABELS = {
+  ok: "fresh",
+  warn: "lagging",
+  stale: "stale",
+  missing: "missing"
+} as const;
 
 const surfaceRegionToEnum = (region: SurfaceRegion) => {
   switch (region) {
@@ -433,6 +541,7 @@ const surfaceRegionToEnum = (region: SurfaceRegion) => {
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const presetFileInputRef = useRef<HTMLInputElement | null>(null);
   const gpuStateRef = useRef<{ gl: WebGL2RenderingContext; renderer: GpuRenderer } | null>(null);
   const pendingStaticUploadRef = useRef(true);
 
@@ -442,17 +551,27 @@ export default function App() {
   const recordedUrlRef = useRef<string | null>(null);
   const recordingMimeTypeRef = useRef<string | null>(null);
 
+  const kernelHub = useMemo(() => getKernelSpecHub(), []);
+  const kernelEventRef = useRef(kernelHub.getSnapshot());
+  const kurKernelVersionRef = useRef(kernelEventRef.current.version);
+  const kurAppliedKernelVersionRef = useRef(kurKernelVersionRef.current);
+
   const [width, setWidth] = useState(720);
   const [height, setHeight] = useState(480);
   const [renderBackend, setRenderBackend] = useState<"gpu" | "cpu">("gpu");
 
   const [imgBitmap, setImgBitmap] = useState<ImageBitmap | null>(null);
   const basePixelsRef = useRef<ImageData | null>(null);
-  const edgeDataRef = useRef<EdgeField | null>(null);
+  const surfaceFieldRef = useRef<SurfaceField | null>(null);
+  const rimFieldRef = useRef<RimField | null>(null);
 
   const [edgeThreshold, setEdgeThreshold] = useState(0.22);
   const [blend, setBlend] = useState(0.65);
   const [rimAlpha, setRimAlpha] = useState(1.0);
+  const [rimEnabled, setRimEnabled] = useState(true);
+  const [showRimDebug, setShowRimDebug] = useState(false);
+  const [showSurfaceDebug, setShowSurfaceDebug] = useState(false);
+  const [showPhaseDebug, setShowPhaseDebug] = useState(false);
 
   const [beta2, setBeta2] = useState(1.1);
   const [jitter, setJitter] = useState(0.5);
@@ -461,14 +580,28 @@ export default function App() {
   const [speed, setSpeed] = useState(1.0);
   const [contrast, setContrast] = useState(1.0);
 
-  const [kernel, setKernel] = useState<KernelSpec>({
-    gain: 1.0,
-    k0: 0.08,
-    Q: 2.2,
-    anisotropy: 0.6,
-    chirality: 0.4,
-    transparency: 0.2
-  });
+  const [kernel, setKernel] = useState<KernelSpec>(() => getDefaultKernelSpec());
+  const updateKernel = useCallback(
+    (patch: Partial<KernelSpec>) =>
+      setKernel((prev) => clampKernelSpec({ ...prev, ...patch })),
+    []
+  );
+  useEffect(() => {
+    return kernelHub.subscribe((event) => {
+      kernelEventRef.current = event;
+      kurKernelVersionRef.current = event.version;
+      if (!kurSyncRef.current && workerRef.current && workerReadyRef.current) {
+        workerRef.current.postMessage({
+          kind: "kernelSpec",
+          spec: event.spec,
+          version: event.version
+        });
+      }
+    });
+  }, [kernelHub]);
+  useEffect(() => {
+    kernelHub.replace(kernel, { source: "ui", force: true });
+  }, [kernel, kernelHub]);
   const [dmt, setDmt] = useState(0.0);
 
   const [thetaMode, setThetaMode] = useState<"gradient" | "global">("gradient");
@@ -480,6 +613,7 @@ export default function App() {
   const [alive, setAlive] = useState(false);
   const [polBins, setPolBins] = useState(16);
   const [normPin, setNormPin] = useState(true);
+  const [kurRegime, setKurRegime] = useState<KurRegime>("locked");
 
   const [surfEnabled, setSurfEnabled] = useState(false);
   const [wallGroup, setWallGroup] = useState<WallpaperGroup>("p4");
@@ -489,15 +623,80 @@ export default function App() {
   const [surfaceRegion, setSurfaceRegion] =
     useState<SurfaceRegion>("surfaces");
 
-  const [coupleE2S, setCoupleE2S] = useState(true);
-  const [etaAmp, setEtaAmp] = useState(0.6);
+  const [coupling, setCoupling] = useState<CouplingConfig>({
+    rimToSurfaceBlend: 0.45,
+    rimToSurfaceAlign: 0.55,
+    surfaceToRimOffset: 0.4,
+    surfaceToRimSigma: 0.6,
+    surfaceToRimHue: 0.5,
+    kurToTransparency: 0.35,
+    kurToOrientation: 0.35,
+    kurToChirality: 0.6,
+    volumePhaseToHue: 0.35,
+    volumeDepthToWarp: 0.3
+  });
+  const setCouplingValue = useCallback(
+    (key: keyof CouplingConfig) => (value: number) =>
+      setCoupling((prev) => ({ ...prev, [key]: value })),
+    []
+  );
+  const [couplingToggles, setCouplingToggles] = useState<CouplingToggleState>(
+    DEFAULT_COUPLING_TOGGLES
+  );
+  const setCouplingToggle = useCallback(
+    (key: keyof CouplingToggleState) => (value: boolean) =>
+      setCouplingToggles((prev) => ({ ...prev, [key]: value })),
+    []
+  );
+  const computeCouplingPair = useCallback(
+    (override?: CouplingToggleState) => {
+      const toggles = override ?? couplingToggles;
+      return {
+        base: cloneCouplingConfig(coupling),
+        effective: applyCouplingToggles(coupling, toggles)
+      };
+    },
+    [coupling, couplingToggles]
+  );
 
-  const [coupleS2E, setCoupleS2E] = useState(true);
-  const [gammaOff, setGammaOff] = useState(0.2);
-  const [gammaSigma, setGammaSigma] = useState(0.35);
-  const [alphaPol, setAlphaPol] = useState(0.25);
-  const [kSigma, setKSigma] = useState(0.8);
+  const [composer, setComposer] = useState<ComposerConfig>(() => createDefaultComposerConfig());
+  const setComposerFieldValue = useCallback(
+    (field: ComposerFieldId, key: "exposure" | "gamma" | "weight") =>
+      (value: number) =>
+        setComposer((prev) => ({
+          ...prev,
+          fields: {
+            ...prev.fields,
+            [field]: {
+              ...prev.fields[field],
+              [key]: value
+            }
+          }
+        })),
+    []
+  );
+  const handleComposerRouting = useCallback((routing: DmtRoutingMode) => {
+    setComposer((prev) => ({ ...prev, dmtRouting: routing }));
+  }, []);
+  const handleComposerSolver = useCallback((solver: SolverRegime) => {
+    setComposer((prev) => ({ ...prev, solverRegime: solver }));
+  }, []);
 
+  const composerUniforms = useMemo(() => {
+    const exposure = new Float32Array(COMPOSER_FIELD_LIST.length);
+    const gamma = new Float32Array(COMPOSER_FIELD_LIST.length);
+    const weight = new Float32Array(COMPOSER_FIELD_LIST.length);
+    COMPOSER_FIELD_LIST.forEach((field, idx) => {
+      const cfg = composer.fields[field];
+      exposure[idx] = cfg.exposure;
+      gamma[idx] = cfg.gamma;
+      weight[idx] = cfg.weight;
+    });
+    const blendGain = computeComposerBlendGain(composer);
+    return { exposure, gamma, weight, blendGain };
+  }, [composer]);
+
+  const [volumeEnabled, setVolumeEnabled] = useState(false);
   const [kurEnabled, setKurEnabled] = useState(false);
   const [kurSync, setKurSync] = useState(false);
   const [K0, setK0] = useState(0.6);
@@ -505,9 +704,13 @@ export default function App() {
   const [gammaKur, setGammaKur] = useState(0.15);
   const [omega0, setOmega0] = useState(0.0);
   const [epsKur, setEpsKur] = useState(0.002);
+  const [fluxX, setFluxX] = useState(0);
+  const [fluxY, setFluxY] = useState(0);
   const [qInit, setQInit] = useState(1);
   const [presetIndex, setPresetIndex] = useState(0);
-  const [telemetryEnabled, setTelemetryEnabled] = useState(true);
+  const [telemetryEnabled, setTelemetryEnabled] = useState(false);
+  const [telemetrySnapshot, setTelemetrySnapshot] = useState<TelemetrySnapshot | null>(null);
+  const [frameLoggingEnabled, setFrameLoggingEnabled] = useState(true);
   const [lastParityResult, setLastParityResult] = useState<ParitySummary | null>(null);
   const [lastPerfResult, setLastPerfResult] = useState<PerformanceSnapshot | null>(null);
   const [recordingStatus, setRecordingStatus] = useState<"idle" | "recording" | "finalizing">("idle");
@@ -522,6 +725,45 @@ export default function App() {
     checked: boolean;
     best: { mimeType: string; container: "mp4" | "webm" } | null;
   }>({ checked: false, best: null });
+  const [fieldStatuses, setFieldStatuses] = useState<FieldStatusMap>(() => createInitialStatuses());
+  const [rimDebugSnapshot, setRimDebugSnapshot] = useState<RimDebugSnapshot | null>(null);
+  const [surfaceDebugSnapshot, setSurfaceDebugSnapshot] = useState<SurfaceDebugSnapshot | null>(null);
+  const [phaseDebugSnapshot, setPhaseDebugSnapshot] = useState<PhaseDebugSnapshot | null>(null);
+  const [phaseHeatmapEnabled, setPhaseHeatmapEnabled] = useState(false);
+  const [phaseHeatmapSnapshot, setPhaseHeatmapSnapshot] = useState<PhaseHeatmapSnapshot | null>(null);
+  const [selectedSyntheticCase, setSelectedSyntheticCase] = useState<SyntheticCaseId>("circles");
+  const [syntheticBaselines, setSyntheticBaselines] = useState<
+    Record<SyntheticCaseId, { metrics: RainbowFrameMetrics; timestamp: number }>
+  >({});
+  const markFieldFresh = useCallback(
+    (kind: FieldKind, resolution: FieldResolution, source: string) => {
+      const now = performance.now();
+      setFieldStatuses((prev) => {
+        const next = setFieldAvailable(prev, kind, resolution, source, now);
+        if (!prev[kind].available) {
+          const contract = FIELD_CONTRACTS[kind];
+          console.info(
+            `[fields] ${contract.label} available ${resolution.width}x${resolution.height} via ${source}`
+          );
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  const markFieldGone = useCallback(
+    (kind: FieldKind, source: string) => {
+      const now = performance.now();
+      setFieldStatuses((prev) => {
+        if (!prev[kind].available) return prev;
+        const contract = FIELD_CONTRACTS[kind];
+        console.warn(`[fields] ${contract.label} unavailable via ${source}`);
+        return setFieldUnavailable(prev, kind, source, now);
+      });
+    },
+    []
+  );
 
   const stopCaptureStream = useCallback(() => {
     if (captureStreamRef.current) {
@@ -540,18 +782,28 @@ export default function App() {
 
   const kurSyncRef = useRef(false);
   const kurStateRef = useRef<KuramotoState | null>(null);
-  const cpuDerivedRef = useRef<KuramotoDerived | null>(null);
+  const kurTelemetryRef = useRef<KuramotoTelemetrySnapshot | null>(null);
+  const kurIrradianceRef = useRef<IrradianceFrameBuffer | null>(null);
+  const kurLogRef = useRef<{ kernelVersion: number; frameId: number }>({
+    kernelVersion: -1,
+    frameId: -1
+  });
+  const cpuDerivedRef = useRef<PhaseField | null>(null);
   const cpuDerivedBufferRef = useRef<ArrayBuffer | null>(null);
   const gradXRef = useRef<Float32Array | null>(null);
   const gradYRef = useRef<Float32Array | null>(null);
   const vortRef = useRef<Float32Array | null>(null);
   const cohRef = useRef<Float32Array | null>(null);
+  const ampRef = useRef<Float32Array | null>(null);
+  const volumeStubRef = useRef<VolumeStubState | null>(null);
+  const volumeFieldRef = useRef<VolumeField | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const workerReadyRef = useRef(false);
   const workerInflightRef = useRef(0);
   const workerNextFrameIdRef = useRef(0);
   const workerPendingFramesRef = useRef<KurFrameView[]>([]);
   const workerActiveFrameRef = useRef<KurFrameView | null>(null);
+  const workerLastFrameIdRef = useRef(-1);
 
   const frameBufferRef = useRef<{
     image: ImageData;
@@ -559,6 +811,24 @@ export default function App() {
     width: number;
     height: number;
   } | null>(null);
+
+  const metricsScratchRef = useRef<Uint8ClampedArray | null>(null);
+  const rimDebugRef = useRef<{
+    energy: Float32Array;
+    hue: Float32Array;
+    energyHist: Uint32Array;
+    hueHist: Uint32Array;
+  } | null>(null);
+  const surfaceDebugRef = useRef<{
+    phases: Float32Array[];
+    magnitudes: Float32Array[];
+    magnitudeHist: Float32Array;
+    orientationCount: number;
+  } | null>(null);
+  const phaseDebugRef = useRef<Float32Array | null>(null);
+  const phaseHeatmapRef = useRef<{ width: number; height: number; data: Float32Array } | null>(
+    null
+  );
 
   const orientationCacheRef = useRef<{
     count: number;
@@ -577,13 +847,37 @@ export default function App() {
     label: "frame-profiler"
   });
 
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      const now = performance.now();
+      setFieldStatuses((prev) => {
+        const { next, changes } = refreshFieldStaleness(prev, now);
+        if (changes.length === 0) return prev;
+        for (const change of changes) {
+          const contract = FIELD_CONTRACTS[change.kind];
+          if (change.becameStale) {
+            console.warn(
+              `[fields] ${contract.label} stale ${change.stalenessMs.toFixed(0)}ms`
+            );
+          } else if (change.recovered) {
+            console.info(`[fields] ${contract.label} recovered`);
+          }
+        }
+        return next;
+      });
+    }, 300);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const metricsRef = useRef<FrameMetricsEntry[]>([]);
+
   const telemetryRef = useRef<{
     enabled: boolean;
     thresholds: Record<TelemetryPhase, number>;
     history: TelemetryRecord[];
     lastLogTs: number;
   }>({
-    enabled: true,
+    enabled: false,
     thresholds: {
       frame: 28,
       renderGpu: 10,
@@ -594,7 +888,34 @@ export default function App() {
     lastLogTs: 0
   });
 
+  const frameLogRef = useRef<{
+    windowStart: number;
+    frames: number;
+  }>({
+    windowStart: performance.now(),
+    frames: 0
+  });
+
   const randn = useRandN();
+
+  const logKurTelemetry = useCallback((telemetry: KuramotoTelemetrySnapshot | null) => {
+    if (!telemetry) return;
+    const last = kurLogRef.current;
+    if (telemetry.frameId === last.frameId) {
+      return;
+    }
+    const baseMessage = `[kur-telemetry] frame ${telemetry.frameId} kernel v${telemetry.kernelVersion} R=${telemetry.orderParameter.magnitude.toFixed(4)} phase=${telemetry.orderParameter.phase.toFixed(3)} meanE=${telemetry.interference.mean.toFixed(4)}`;
+    if (telemetry.kernelVersion !== last.kernelVersion) {
+      console.info(
+        `${baseMessage} gain=${telemetry.kernel.gain.toFixed(3)} k0=${telemetry.kernel.k0.toFixed(
+          3
+        )} anis=${telemetry.kernel.anisotropy.toFixed(3)} chir=${telemetry.kernel.chirality.toFixed(3)}`
+      );
+    } else {
+      console.debug(baseMessage);
+    }
+    kurLogRef.current = { kernelVersion: telemetry.kernelVersion, frameId: telemetry.frameId };
+  }, []);
 
   const recordTelemetry = useCallback((phase: TelemetryPhase, ms: number) => {
     const tele = telemetryRef.current;
@@ -615,7 +936,77 @@ export default function App() {
 
   useEffect(() => {
     telemetryRef.current.enabled = telemetryEnabled;
+    if (!telemetryEnabled) {
+      telemetryRef.current.history = [];
+      telemetryRef.current.lastLogTs = 0;
+      metricsRef.current = [];
+    }
   }, [telemetryEnabled]);
+
+  useEffect(() => {
+    if (!frameLoggingEnabled) {
+      frameLogRef.current.frames = 0;
+      frameLogRef.current.windowStart = performance.now();
+    } else {
+      frameLogRef.current.windowStart = performance.now();
+      frameLogRef.current.frames = 0;
+    }
+  }, [frameLoggingEnabled]);
+
+  useEffect(() => {
+    if (!telemetryEnabled) {
+      setTelemetrySnapshot(null);
+      return;
+    }
+    const interval = window.setInterval(() => {
+      const history = metricsRef.current.slice(-120);
+      if (history.length === 0) return;
+      const accum = COMPOSER_FIELD_LIST.reduce<Record<ComposerFieldId, { energy: number; blend: number; share: number; weight: number }>>((acc, field) => {
+        acc[field] = { energy: 0, blend: 0, share: 0, weight: 0 };
+        return acc;
+      }, {} as Record<ComposerFieldId, { energy: number; blend: number; share: number; weight: number }>);
+      let lastComposer: ComposerTelemetry | null = null;
+      history.forEach((entry) => {
+        const telemetry = entry.metrics.composer;
+        if (!telemetry) return;
+        lastComposer = telemetry;
+        COMPOSER_FIELD_LIST.forEach((field) => {
+          accum[field].energy += telemetry.fields[field].energy;
+          accum[field].blend += telemetry.fields[field].blend;
+          accum[field].share += telemetry.fields[field].share;
+          accum[field].weight = telemetry.fields[field].weight;
+        });
+      });
+      if (!lastComposer) return;
+      const count = history.length;
+      const snapshot: TelemetrySnapshot = {
+        fields: {} as Record<ComposerFieldId, TelemetryFieldSnapshot>,
+        coupling: {
+          scale: lastComposer.coupling.scale,
+          base: cloneCouplingConfig(lastComposer.coupling.base),
+          effective: cloneCouplingConfig(lastComposer.coupling.effective)
+        },
+        updatedAt: Date.now()
+      };
+      COMPOSER_FIELD_LIST.forEach((field) => {
+        snapshot.fields[field] = {
+          energy: accum[field].energy / count,
+          blend: accum[field].blend / count,
+          share: accum[field].share / count,
+          weight: accum[field].weight
+        };
+      });
+      setTelemetrySnapshot(snapshot);
+    }, 500);
+    return () => window.clearInterval(interval);
+  }, [telemetryEnabled]);
+
+  useEffect(() => {
+    window.__getFrameMetrics = () => [...metricsRef.current];
+    return () => {
+      window.__getFrameMetrics = undefined;
+    };
+  }, []);
 
   const orientations = useMemo(() => {
     const N = clamp(Math.round(nOrient), 2, 8);
@@ -624,31 +1015,86 @@ export default function App() {
 
   const lambdas = useMemo(() => ({ L: 560, M: 530, S: 420 }), []);
   const lambdaRef = 520;
+  const fieldStatusEntries = useMemo(
+    () =>
+      FIELD_KINDS.map((kind) => {
+        const status = fieldStatuses[kind];
+        const contract = FIELD_CONTRACTS[kind];
+        const staleness = status.stalenessMs;
+        let state: "ok" | "warn" | "stale" | "missing";
+        if (!status.available) {
+          state = "missing";
+        } else if (status.stale) {
+          state = "stale";
+        } else if (
+          contract.lifetime.expectedMs !== Number.POSITIVE_INFINITY &&
+          staleness > contract.lifetime.expectedMs * 1.5
+        ) {
+          state = "warn";
+        } else {
+          state = "ok";
+        }
+        return {
+          kind,
+          label: contract.label,
+          state,
+          stalenessMs: staleness,
+          resolution: status.resolution
+        };
+      }),
+    [fieldStatuses]
+  );
 
   const ensureKurCpuState = useCallback(() => {
     if (!kurStateRef.current || kurStateRef.current.width !== width || kurStateRef.current.height !== height) {
       kurStateRef.current = createKuramotoState(width, height);
+      if (kurStateRef.current) {
+        kurTelemetryRef.current = kurStateRef.current.telemetry;
+        kurIrradianceRef.current = kurStateRef.current.irradiance;
+      }
+    }
+    if (kurStateRef.current) {
+      kurTelemetryRef.current = kurStateRef.current.telemetry;
+      kurIrradianceRef.current = kurStateRef.current.irradiance;
     }
     const expected = width * height;
     if (
       !cpuDerivedRef.current ||
-      cpuDerivedRef.current.gradX.length !== expected
+      cpuDerivedRef.current.gradX.length !== expected ||
+      cpuDerivedRef.current.resolution.width !== width ||
+      cpuDerivedRef.current.resolution.height !== height
     ) {
       const buffer = new ArrayBuffer(derivedBufferSize(width, height));
       cpuDerivedBufferRef.current = buffer;
       const derived = createDerivedViews(buffer, width, height);
+      assertPhaseField(derived, "cpu:init");
       cpuDerivedRef.current = derived;
       gradXRef.current = derived.gradX;
       gradYRef.current = derived.gradY;
       vortRef.current = derived.vort;
       cohRef.current = derived.coh;
+      ampRef.current = derived.amp;
       return true;
     }
+    assertPhaseField(cpuDerivedRef.current, "cpu:reuse");
     gradXRef.current = cpuDerivedRef.current.gradX;
     gradYRef.current = cpuDerivedRef.current.gradY;
     vortRef.current = cpuDerivedRef.current.vort;
     cohRef.current = cpuDerivedRef.current.coh;
+    ampRef.current = cpuDerivedRef.current.amp;
     return false;
+  }, [width, height]);
+
+  const ensureVolumeState = useCallback(() => {
+    if (width <= 0 || height <= 0) {
+      volumeStubRef.current = null;
+      volumeFieldRef.current = null;
+      return;
+    }
+    const stub = volumeStubRef.current;
+    if (!stub || stub.width !== width || stub.height !== height) {
+      volumeStubRef.current = createVolumeStubState(width, height);
+    }
   }, [width, height]);
 
   const ensureFrameBuffer = useCallback(
@@ -673,6 +1119,196 @@ export default function App() {
     [width, height]
   );
 
+  const ensureRimDebugBuffers = useCallback(() => {
+    const total = width * height;
+    let buffers = rimDebugRef.current;
+    if (!buffers || buffers.energy.length !== total) {
+      buffers = {
+        energy: new Float32Array(total),
+        hue: new Float32Array(total),
+        energyHist: new Uint32Array(RIM_HIST_BINS),
+        hueHist: new Uint32Array(RIM_HIST_BINS)
+      };
+      rimDebugRef.current = buffers;
+    } else {
+      buffers.energyHist.fill(0);
+      buffers.hueHist.fill(0);
+    }
+    return buffers;
+  }, [width, height]);
+
+  const ensureSurfaceDebugBuffers = useCallback(
+    (orientationCount: number) => {
+      if (orientationCount <= 0) return null;
+      const total = width * height;
+      let buffers = surfaceDebugRef.current;
+      const needsResize =
+        !buffers ||
+        buffers.orientationCount !== orientationCount ||
+        buffers.magnitudes.length !== orientationCount ||
+        buffers.magnitudes[0]?.length !== total;
+      if (needsResize) {
+        const phases = Array.from({ length: orientationCount }, () => new Float32Array(total));
+        const magnitudes = Array.from({ length: orientationCount }, () => new Float32Array(total));
+        buffers = {
+          phases,
+          magnitudes,
+          magnitudeHist: new Float32Array(orientationCount * SURFACE_HIST_BINS),
+          orientationCount
+        };
+        surfaceDebugRef.current = buffers;
+      } else if (buffers) {
+        buffers.magnitudeHist.fill(0);
+      }
+      return buffers ?? null;
+    },
+    [width, height]
+  );
+
+  const updateDebugSnapshots = useCallback(
+    (
+      commit: boolean,
+      rimBuffers: ReturnType<typeof ensureRimDebugBuffers> | null,
+      surfaceBuffers: ReturnType<typeof ensureSurfaceDebugBuffers> | null,
+      debug: ReturnType<typeof renderRainbowFrame>["debug"]
+    ) => {
+      if (!commit) return;
+      if (showRimDebug && rimBuffers && debug?.rim) {
+        setRimDebugSnapshot({
+          energyRange: [debug.rim.energyMin, debug.rim.energyMax],
+          hueRange: [debug.rim.hueMin, debug.rim.hueMax],
+          energyHist: Array.from(rimBuffers.energyHist),
+          hueHist: Array.from(rimBuffers.hueHist)
+        });
+      } else if (!showRimDebug) {
+        setRimDebugSnapshot(null);
+      }
+      if (showSurfaceDebug && surfaceBuffers && debug?.surface) {
+        const hist: number[][] = [];
+        for (let k = 0; k < surfaceBuffers.orientationCount; k++) {
+          const start = k * SURFACE_HIST_BINS;
+          const slice = surfaceBuffers.magnitudeHist.slice(
+            start,
+            start + SURFACE_HIST_BINS
+          );
+          hist.push(Array.from(slice));
+        }
+        setSurfaceDebugSnapshot({
+          orientationCount: surfaceBuffers.orientationCount,
+          magnitudeMax: debug.surface.magnitudeMax,
+          magnitudeHist: hist
+        });
+      } else if (!showSurfaceDebug) {
+        setSurfaceDebugSnapshot(null);
+      }
+    },
+    [
+      showRimDebug,
+      showSurfaceDebug,
+      setRimDebugSnapshot,
+      setSurfaceDebugSnapshot
+    ]
+  );
+
+  const updatePhaseDebug = useCallback(
+    (commit: boolean, phaseField: PhaseField | null | undefined) => {
+      if (!commit) {
+        if (!showPhaseDebug) {
+          setPhaseDebugSnapshot(null);
+        }
+        if (!phaseHeatmapEnabled) {
+          setPhaseHeatmapSnapshot(null);
+        }
+        return;
+      }
+      if (showPhaseDebug && phaseField && phaseField.amp) {
+        let hist = phaseDebugRef.current;
+        if (!hist || hist.length !== PHASE_HIST_BINS) {
+          hist = new Float32Array(PHASE_HIST_BINS);
+          phaseDebugRef.current = hist;
+        } else {
+          hist.fill(0);
+        }
+        let minAmp = Number.POSITIVE_INFINITY;
+        let maxAmp = 0;
+        const amps = phaseField.amp;
+        for (let i = 0; i < amps.length; i++) {
+          const value = amps[i];
+          if (value < minAmp) minAmp = value;
+          if (value > maxAmp) maxAmp = value;
+          const norm = Math.min(0.999999, value / PHASE_HIST_SCALE);
+          const bin = Math.min(PHASE_HIST_BINS - 1, Math.floor(norm * PHASE_HIST_BINS));
+          hist[bin] += 1;
+        }
+        setPhaseDebugSnapshot({
+          ampRange: [Number.isFinite(minAmp) ? minAmp : 0, maxAmp],
+          ampHist: Array.from(hist)
+        });
+      } else if (!showPhaseDebug || !phaseField) {
+        setPhaseDebugSnapshot(null);
+      }
+
+      if (phaseHeatmapEnabled && phaseField && phaseField.coh) {
+        const { width: srcW, height: srcH } = phaseField.resolution;
+        const targetW = Math.max(1, Math.min(96, srcW));
+        const targetH = Math.max(1, Math.min(96, srcH));
+        const scaleX = srcW / targetW;
+        const scaleY = srcH / targetH;
+        let store = phaseHeatmapRef.current;
+        if (!store || store.width !== targetW || store.height !== targetH) {
+          store = {
+            width: targetW,
+            height: targetH,
+            data: new Float32Array(targetW * targetH)
+          };
+          phaseHeatmapRef.current = store;
+        }
+        const data = store.data;
+        let minVal = Number.POSITIVE_INFINITY;
+        let maxVal = 0;
+        const cohValues = phaseField.coh;
+        for (let y = 0; y < targetH; y++) {
+          const srcY = Math.min(Math.floor((y + 0.5) * scaleY), srcH - 1);
+          for (let x = 0; x < targetW; x++) {
+            const srcX = Math.min(Math.floor((x + 0.5) * scaleX), srcW - 1);
+            const value = cohValues[srcY * srcW + srcX];
+            data[y * targetW + x] = value;
+            if (value < minVal) minVal = value;
+            if (value > maxVal) maxVal = value;
+          }
+        }
+        if (!Number.isFinite(minVal)) {
+          minVal = 0;
+        }
+        if (!Number.isFinite(maxVal) || maxVal < minVal) {
+          maxVal = minVal;
+        }
+        setPhaseHeatmapSnapshot({
+          width: targetW,
+          height: targetH,
+          values: Float32Array.from(data),
+          min: minVal,
+          max: maxVal
+        });
+      } else if (!phaseHeatmapEnabled || !phaseField) {
+        setPhaseHeatmapSnapshot(null);
+      }
+    },
+    [
+      showPhaseDebug,
+      phaseHeatmapEnabled,
+      setPhaseDebugSnapshot,
+      setPhaseHeatmapSnapshot
+    ]
+  );
+
+  useEffect(() => {
+    if (!phaseHeatmapEnabled) {
+      setPhaseHeatmapSnapshot(null);
+      phaseHeatmapRef.current = null;
+    }
+  }, [phaseHeatmapEnabled]);
+
   const getOrientationCache = useCallback((count: number) => {
     if (orientationCacheRef.current.count !== count) {
       orientationCacheRef.current = {
@@ -691,9 +1327,8 @@ export default function App() {
     if (basePixelsRef.current) {
       renderer.uploadBase(basePixelsRef.current);
     }
-    if (edgeDataRef.current) {
-      const edge = edgeDataRef.current as EdgeTextures;
-      renderer.uploadEdge(edge);
+    if (rimFieldRef.current) {
+      renderer.uploadRim(rimFieldRef.current);
     }
     pendingStaticUploadRef.current = false;
   }, []);
@@ -761,9 +1396,11 @@ export default function App() {
       gammaKur,
       omega0,
       K0,
-      epsKur
+      epsKur,
+      fluxX,
+      fluxY
     };
-  }, [alphaKur, gammaKur, omega0, K0, epsKur]);
+  }, [alphaKur, gammaKur, omega0, K0, epsKur, fluxX, fluxY]);
 
   // Re-initialize the Kuramoto field whenever the canvas size or twist changes.
   useEffect(() => {
@@ -776,26 +1413,89 @@ export default function App() {
         cpuDerivedRef.current.gradY.fill(0);
         cpuDerivedRef.current.vort.fill(0);
         cpuDerivedRef.current.coh.fill(0.5);
+        cpuDerivedRef.current.amp.fill(0);
+        ampRef.current = cpuDerivedRef.current.amp;
+        markFieldGone("phase", "cpu-reset");
       }
+      markFieldGone("volume", "cpu-reset");
     }
   }, [kurEnabled, qInit, initKuramotoCpu, ensureKurCpuState]);
+
+  useEffect(() => {
+    if (!volumeEnabled) {
+      volumeFieldRef.current = null;
+      volumeStubRef.current = null;
+      markFieldGone("volume", "volume-disabled");
+      return;
+    }
+    ensureVolumeState();
+    if (volumeStubRef.current) {
+      const field = snapshotVolumeStub(volumeStubRef.current);
+      assertVolumeField(field, "volume:init");
+      volumeFieldRef.current = field;
+      markFieldFresh("volume", field.resolution, "volume:stub");
+    }
+  }, [volumeEnabled, ensureVolumeState, markFieldFresh, markFieldGone]);
 
   const stepKuramotoCpu = useCallback(
     (dt: number) => {
       if (!kurEnabled) return;
       ensureKurCpuState();
       if (!kurStateRef.current) return;
-      stepKuramotoState(kurStateRef.current, getKurParams(), dt, randn);
+      const kernelSnapshot = kernelEventRef.current;
+      kurAppliedKernelVersionRef.current = kernelSnapshot.version;
+      const timestamp = typeof performance !== "undefined" ? performance.now() : Date.now();
+      const result = stepKuramotoState(kurStateRef.current, getKurParams(), dt, randn, timestamp, {
+        kernel: kernelSnapshot.spec,
+        controls: { dmt },
+        telemetry: { kernelVersion: kernelSnapshot.version }
+      });
+      kurTelemetryRef.current = result.telemetry;
+      kurIrradianceRef.current = result.irradiance;
+      logKurTelemetry(result.telemetry);
     },
-    [kurEnabled, ensureKurCpuState, getKurParams, randn]
+    [kurEnabled, ensureKurCpuState, getKurParams, randn, dmt, logKurTelemetry]
   );
 
   const deriveKurFieldsCpu = useCallback(() => {
     if (!kurEnabled) return;
     ensureKurCpuState();
     if (!kurStateRef.current || !cpuDerivedRef.current) return;
-    deriveKuramotoFieldsCore(kurStateRef.current, cpuDerivedRef.current);
-  }, [kurEnabled, ensureKurCpuState]);
+    const kernelSnapshot = kernelEventRef.current;
+    deriveKuramotoFieldsCore(kurStateRef.current, cpuDerivedRef.current, {
+      kernel: kernelSnapshot.spec,
+      controls: { dmt }
+    });
+    markFieldFresh("phase", cpuDerivedRef.current.resolution, "cpu");
+  }, [kurEnabled, ensureKurCpuState, dmt, markFieldFresh]);
+
+  const resetKuramotoField = useCallback(() => {
+    initKuramotoCpu(qInit);
+    if (!kurSyncRef.current && workerRef.current && workerReadyRef.current) {
+      workerRef.current.postMessage({
+        kind: "reset",
+        qInit
+      });
+    }
+  }, [initKuramotoCpu, qInit]);
+
+  const markKurCustom = useCallback(() => {
+    setKurRegime("custom");
+  }, [setKurRegime]);
+
+  const applyKurRegime = useCallback(
+    (regime: Exclude<KurRegime, "custom">) => {
+      const preset = KUR_REGIME_PRESETS[regime];
+      setK0(preset.params.K0);
+      setAlphaKur(preset.params.alphaKur);
+      setGammaKur(preset.params.gammaKur);
+      setOmega0(preset.params.omega0);
+      setEpsKur(preset.params.epsKur);
+      setKurRegime(regime);
+      resetKuramotoField();
+    },
+    [setK0, setAlphaKur, setGammaKur, setOmega0, setEpsKur, resetKuramotoField]
+  );
 
   useEffect(() => {
     kurSyncRef.current = kurSync;
@@ -806,10 +1506,14 @@ export default function App() {
     workerActiveFrameRef.current = null;
     workerInflightRef.current = 0;
     workerNextFrameIdRef.current = 0;
+    workerLastFrameIdRef.current = -1;
     gradXRef.current = null;
     gradYRef.current = null;
     vortRef.current = null;
     cohRef.current = null;
+    ampRef.current = null;
+    phaseDebugRef.current = null;
+    phaseHeatmapRef.current = null;
   }, []);
 
   const releaseFrameToWorker = useCallback((frame: KurFrameView) => {
@@ -833,35 +1537,81 @@ export default function App() {
     const next = queue.shift()!;
     const prev = workerActiveFrameRef.current;
     workerActiveFrameRef.current = next;
+    workerLastFrameIdRef.current = next.frameId;
     gradXRef.current = next.gradX;
     gradYRef.current = next.gradY;
     vortRef.current = next.vort;
     cohRef.current = next.coh;
+    ampRef.current = next.amp;
+    kurTelemetryRef.current = next.instrumentation.telemetry;
+    kurIrradianceRef.current = null;
+    logKurTelemetry(next.instrumentation.telemetry);
     if (prev) {
       releaseFrameToWorker(prev);
     }
-  }, [releaseFrameToWorker]);
+  }, [releaseFrameToWorker, logKurTelemetry]);
 
   const handleWorkerFrame = useCallback(
     (msg: WorkerFrameMessage) => {
       if (!workerRef.current) return;
       workerInflightRef.current = Math.max(workerInflightRef.current - 1, 0);
       const derived = createDerivedViews(msg.buffer, width, height);
+      assertPhaseField(derived, "worker:frame");
+      markFieldFresh("phase", derived.resolution, "worker");
       const frame: KurFrameView = {
         buffer: msg.buffer,
         gradX: derived.gradX,
         gradY: derived.gradY,
         vort: derived.vort,
         coh: derived.coh,
+        amp: derived.amp,
         timestamp: msg.timestamp,
-        frameId: msg.frameId
+        frameId: msg.meta?.frameId ?? msg.frameId,
+        kernelVersion: msg.kernelVersion ?? 0,
+        meta: msg.meta,
+        instrumentation: msg.instrumentation
       };
-      workerPendingFramesRef.current.push(frame);
+      if (msg.meta && msg.meta.frameId !== msg.frameId) {
+        console.warn(
+          `[kur-worker] frameId mismatch meta=${msg.meta.frameId} payload=${msg.frameId}`
+        );
+      }
+      if (frame.kernelVersion !== kernelEventRef.current.version) {
+        console.debug(
+          `[kur-worker] kernel version drift: worker=${frame.kernelVersion} ui=${kernelEventRef.current.version}`
+        );
+      }
+      const lastFrameId = workerLastFrameIdRef.current;
+      if (frame.frameId <= lastFrameId) {
+        console.debug(
+          `[kur-worker] dropping stale frame ${frame.frameId} (last=${lastFrameId})`
+        );
+        releaseFrameToWorker(frame);
+        return;
+      }
+      const queue = workerPendingFramesRef.current;
+      let inserted = false;
+      for (let i = 0; i < queue.length; i++) {
+        const existing = queue[i];
+        if (frame.frameId === existing.frameId) {
+          console.debug(`[kur-worker] skipping duplicate frame ${frame.frameId}`);
+          releaseFrameToWorker(frame);
+          return;
+        }
+        if (frame.frameId < existing.frameId) {
+          queue.splice(i, 0, frame);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) {
+        queue.push(frame);
+      }
       if (!kurSyncRef.current) {
         swapWorkerFrame();
       }
     },
-    [height, width, swapWorkerFrame]
+    [height, width, swapWorkerFrame, releaseFrameToWorker]
   );
 
   const stopKurWorker = useCallback(() => {
@@ -881,6 +1631,14 @@ export default function App() {
       switch (msg.kind) {
         case "ready":
           workerReadyRef.current = true;
+          if (!kurSyncRef.current && workerRef.current) {
+            const snapshot = kernelEventRef.current;
+            workerRef.current.postMessage({
+              kind: "kernelSpec",
+              spec: snapshot.spec,
+              version: snapshot.version
+            });
+          }
           break;
         case "frame":
           handleWorkerFrame(msg);
@@ -973,404 +1731,131 @@ export default function App() {
     });
   }, [getKurParams, kurEnabled, kurSync]);
 
-  const wallpaperAt = useCallback(
-    (
-      xp: number,
-      yp: number,
-      cosA: Float32Array,
-      sinA: Float32Array,
-      ke: KernelSpec,
-      tSeconds: number
-    ) => {
-      const N = cosA.length;
-      const twoPI = 2 * Math.PI;
-      let gx = 0;
-      let gy = 0;
-      for (let j = 0; j < N; j++) {
-        const phase =
-          ke.chirality * (j / N) +
-          (alive ? 0.2 * Math.sin(twoPI * 0.3 * tSeconds + j) : 0);
-        const s = xp * cosA[j] + yp * sinA[j];
-        const arg = twoPI * ke.k0 * s + phase;
-        const d = -twoPI * ke.k0 * Math.sin(arg);
-        gx += d * cosA[j];
-        gy += d * sinA[j];
-      }
-      const inv = N > 0 ? 1 / N : 1;
-      return { gx: gx * inv, gy: gy * inv };
-    },
-    [alive]
-  );
-
   const renderFrameCore = useCallback(
     (
       out: Uint8ClampedArray,
       tSeconds: number,
       commitObs = true,
-      fieldsOverride?: Pick<KurFrameView, "gradX" | "gradY" | "vort" | "coh">
+      fieldsOverride?: Pick<KurFrameView, "gradX" | "gradY" | "vort" | "coh" | "amp">,
+      options?: RenderFrameOptions
     ) => {
-      const gradX = fieldsOverride?.gradX ?? gradXRef.current;
-      const gradY = fieldsOverride?.gradY ?? gradYRef.current;
-      const vort = fieldsOverride?.vort ?? vortRef.current;
-      const coh = fieldsOverride?.coh ?? cohRef.current;
-      const ke = kEff(kernel, dmt);
-      const effectiveBlend = clamp01(blend + ke.transparency * 0.5);
-      const eps = 1e-6;
-      const frameGain = normPin
-        ? Math.pow(
-            (normTargetRef.current + eps) / (lastObsRef.current + eps),
-            0.5
-          )
-        : 1.0;
-
-      const baseOffsets = {
-        L: beta2 * (lambdaRef / lambdas.L - 1),
-        M: beta2 * (lambdaRef / lambdas.M - 1),
-        S: beta2 * (lambdaRef / lambdas.S - 1)
-      } as const;
-
-      const jitterPhase = microsaccade ? tSeconds * 6.0 : 0.0;
-      const breath = alive
-        ? 0.15 * Math.sin(2 * Math.PI * 0.55 * tSeconds)
-        : 0.0;
-
-      if (imgBitmap && edgeDataRef.current && basePixelsRef.current) {
-        const { gx, gy, mag } = edgeDataRef.current;
-        const base = basePixelsRef.current.data;
-
-        let muJ = 0;
-        let cnt = 0;
-        if (phasePin && microsaccade) {
-          const stride = 8;
-          for (let yy = 0; yy < height; yy += stride) {
-            for (let xx = 0; xx < width; xx += stride) {
-              const idx = yy * width + xx;
-              if (mag[idx] >= edgeThreshold) {
-                muJ += Math.sin(
-                  jitterPhase + hash2(xx, yy) * Math.PI * 2
-                );
-                cnt++;
-              }
-            }
-          }
-          muJ = cnt ? muJ / cnt : 0;
-        }
-
-        const ops = groupOps(wallGroup);
-        const opsCount = ops.length;
-        const useWallpaper = surfEnabled || coupleS2E;
-        const N = orientations.length;
-        const orientationCache = getOrientationCache(N);
-        const cosA = orientationCache.cos;
-        const sinA = orientationCache.sin;
-        for (let j = 0; j < N; j++) {
-          cosA[j] = Math.cos(orientations[j]);
-          sinA[j] = Math.sin(orientations[j]);
-        }
-
-        const cx = width * 0.5;
-        const cy = height * 0.5;
-        let obsSum = 0;
-        let obsCount = 0;
-
-        for (let y = 0; y < height; y++) {
-          for (let x = 0; x < width; x++) {
-            const p = y * width + x;
-            const i = p * 4;
-            out[i + 0] = base[i + 0];
-            out[i + 1] = base[i + 1];
-            out[i + 2] = base[i + 2];
-            out[i + 3] = 255;
-
-            if (
-              displayMode === "grayBaseColorRims" ||
-              displayMode === "grayBaseGrayRims"
-            ) {
-              const yb = Math.floor(
-                0.2126 * out[i + 0] +
-                  0.7152 * out[i + 1] +
-                  0.0722 * out[i + 2]
-              );
-              out[i + 0] = yb;
-              out[i + 1] = yb;
-              out[i + 2] = yb;
-            }
-
-            let gxT0 = 0;
-            let gyT0 = 0;
-            if (kurEnabled && gradX && gradY) {
-              gxT0 = gradX[p];
-              gyT0 = gradY[p];
-            } else if (useWallpaper) {
-              for (let k = 0; k < opsCount; k++) {
-                const pt = applyOp(ops[k], x, y, cx, cy);
-                const r = wallpaperAt(
-                  pt.x - cx,
-                  pt.y - cy,
-                  cosA,
-                  sinA,
-                  ke,
-                  tSeconds
-                );
-                gxT0 += r.gx;
-                gyT0 += r.gy;
-              }
-              const inv = opsCount > 0 ? 1 / opsCount : 1;
-              gxT0 *= inv;
-              gyT0 *= inv;
-            }
-
-            const magVal = mag[p];
-            let rimEnergy = 0;
-
-            if (magVal >= edgeThreshold) {
-              let nx = gx[p];
-              let ny = gy[p];
-              const nlen = Math.hypot(nx, ny) + 1e-8;
-              nx /= nlen;
-              ny /= nlen;
-              const tx = -ny;
-              const ty = nx;
-              const TAU = Math.PI * 2;
-              const thetaRaw = Math.atan2(ny, nx);
-              const thetaEdge =
-                thetaMode === "gradient"
-                  ? polBins > 0
-                    ? Math.round((thetaRaw / TAU) * polBins) * (TAU / polBins)
-                    : thetaRaw
-                  : thetaGlobal;
-
-              const gradNorm0 = Math.hypot(gxT0, gyT0);
-              let thetaUse = thetaEdge;
-              if (coupleS2E && gradNorm0 > 1e-6) {
-                const ex = Math.cos(thetaEdge);
-                const ey = Math.sin(thetaEdge);
-                const sx = gxT0 / gradNorm0;
-                const sy = gyT0 / gradNorm0;
-                const vx = (1 - alphaPol) * ex + alphaPol * sx;
-                const vy = (1 - alphaPol) * ey + alphaPol * sy;
-                let tBlend = Math.atan2(vy, vx);
-                if (polBins > 0) {
-                  tBlend =
-                    Math.round((tBlend / TAU) * polBins) *
-                    (TAU / polBins);
-                }
-                thetaUse = tBlend;
-              }
-
-              const delta = ke.anisotropy * 0.9;
-              const rho = ke.chirality * 0.75;
-              const thetaEff = thetaUse + rho * tSeconds;
-              const polL =
-                0.5 * (1 + Math.cos(delta) * Math.cos(2 * thetaEff));
-              const polM =
-                0.5 *
-                (1 + Math.cos(delta) * Math.cos(2 * (thetaEff + 0.3)));
-              const polS =
-                0.5 *
-                (1 + Math.cos(delta) * Math.cos(2 * (thetaEff + 0.6)));
-
-              const rawJ = Math.sin(jitterPhase + hash2(x, y) * Math.PI * 2);
-              const localJ =
-                jitter *
-                (microsaccade ? (phasePin ? rawJ - muJ : rawJ) : 0);
-
-              const gradNorm = Math.hypot(gxT0, gyT0);
-              const bias =
-                coupleS2E && gradNorm > 1e-6
-                  ? gammaOff * ((gxT0 * nx + gyT0 * ny) / gradNorm)
-                  : 0;
-              const Esurf = coupleS2E ? clamp01(gradNorm * kSigma) : 0;
-              const sigmaEff = coupleS2E
-                ? Math.max(0.35, sigma * (1 - gammaSigma * Esurf))
-                : sigma;
-
-              const offL = baseOffsets.L + localJ * 0.35 + bias;
-              const offM = baseOffsets.M + localJ * 0.5 + bias;
-              const offS = baseOffsets.S + localJ * 0.8 + bias;
-
-              const pL = sampleScalar(
-                mag,
-                x + (offL + breath) * nx,
-                y + (offL + breath) * ny,
-                width,
-                height
-              );
-              const pM = sampleScalar(
-                mag,
-                x + (offM + breath) * nx,
-                y + (offM + breath) * ny,
-                width,
-                height
-              );
-              const pS = sampleScalar(
-                mag,
-                x + (offS + breath) * nx,
-                y + (offS + breath) * ny,
-                width,
-                height
-              );
-
-              const gL = gauss(offL, sigmaEff) * ke.gain;
-              const gM = gauss(offM, sigmaEff) * ke.gain;
-              const gS = gauss(offS, sigmaEff) * ke.gain;
-
-              const QQ = 1 + 0.5 * ke.Q;
-              const modL = Math.pow(
-                0.5 * (1 + Math.cos(2 * Math.PI * ke.k0 * offL)),
-                QQ
-              );
-              const modM = Math.pow(
-                0.5 * (1 + Math.cos(2 * Math.PI * ke.k0 * offM)),
-                QQ
-              );
-              const modS = Math.pow(
-                0.5 * (1 + Math.cos(2 * Math.PI * ke.k0 * offS)),
-                QQ
-              );
-
-              const chiPhase =
-                2 * Math.PI * ke.k0 * (x * tx + y * ty) * 0.002;
-              const chBase =
-                ke.chirality +
-                (kurEnabled && vort
-                  ? clamp(vort[p] * 0.5, -1, 1)
-                  : 0);
-              const chiL = 0.5 + 0.5 * Math.sin(chiPhase) * chBase;
-              const chiM = 0.5 + 0.5 * Math.sin(chiPhase + 0.8) * chBase;
-              const chiS = 0.5 + 0.5 * Math.sin(chiPhase + 1.6) * chBase;
-
-              const cont = contrast * frameGain;
-              const Lc = pL * gL * modL * chiL * polL * cont;
-              const Mc = pM * gM * modM * chiM * polM * cont;
-              const Sc = pS * gS * modS * chiS * polS * cont;
-
-              rimEnergy = (Lc + Mc + Sc) / Math.max(1e-6, cont);
-
-              let R =
-                4.4679 * Lc + -3.5873 * Mc + 0.1193 * Sc;
-              let G =
-                -1.2186 * Lc + 2.3809 * Mc + -0.1624 * Sc;
-              let B =
-                0.0497 * Lc + -0.2439 * Mc + 1.2045 * Sc;
-              R = clamp01(R);
-              G = clamp01(G);
-              B = clamp01(B);
-              if (
-                displayMode === "grayBaseGrayRims" ||
-                displayMode === "colorBaseGrayRims"
-              ) {
-                const yr = luma01(R, G, B);
-                R = yr;
-                G = yr;
-                B = yr;
-              }
-              R *= rimAlpha;
-              G *= rimAlpha;
-              B *= rimAlpha;
-
-              out[i + 0] = Math.floor(
-                out[i + 0] * (1 - effectiveBlend) + R * 255 * effectiveBlend
-              );
-              out[i + 1] = Math.floor(
-                out[i + 1] * (1 - effectiveBlend) + G * 255 * effectiveBlend
-              );
-              out[i + 2] = Math.floor(
-                out[i + 2] * (1 - effectiveBlend) + B * 255 * effectiveBlend
-              );
-
-              if ((x & 7) === 0 && (y & 7) === 0) {
-                obsSum += (pL + pM + pS) / 3;
-                obsCount++;
-              }
-            }
-
-            if (surfEnabled) {
-              let mask = 1.0;
-              if (surfaceRegion === "surfaces") {
-                mask = clamp01(
-                  (edgeThreshold - magVal) /
-                    Math.max(1e-6, edgeThreshold)
-                );
-              } else if (surfaceRegion === "edges") {
-                mask = clamp01(
-                  (magVal - edgeThreshold) / Math.max(1e-6, 1 - edgeThreshold)
-                );
-              }
-              if (mask > 1e-3) {
-                let gxSurf = gxT0;
-                let gySurf = gyT0;
-                if (coupleE2S && magVal >= edgeThreshold) {
-                  const tx = -(gy[p] / (Math.hypot(gx[p], gy[p]) + 1e-8));
-                  const ty = gx[p] / (Math.hypot(gx[p], gy[p]) + 1e-8);
-                  const dot =
-                    (gxT0 * tx + gyT0 * ty) /
-                    (Math.hypot(gxT0, gyT0) * Math.hypot(tx, ty) + 1e-6);
-                  const align = Math.pow(clamp01((dot + 1) * 0.5), alphaPol);
-                  gxSurf = (1 - align) * gxSurf + align * tx;
-                  gySurf = (1 - align) * gySurf + align * ty;
-                }
-                const dirNorm = Math.hypot(gxSurf, gySurf) + 1e-6;
-                const dirW =
-                  1 +
-                  0.5 *
-                    ke.anisotropy *
-                    Math.cos(2 * Math.atan2(gySurf, gxSurf));
-                const wx = warpAmp * (gxSurf / dirNorm) * dirW;
-                const wy = warpAmp * (gySurf / dirNorm) * dirW;
-                const sample = sampleRGB(
-                  base,
-                  x + wx,
-                  y + wy,
-                  width,
-                  height
-                );
-                let rW = sample.R / 255;
-                let gW = sample.G / 255;
-                let bW = sample.B / 255;
-                if (displayMode === "grayBaseGrayRims") {
-                  const yy = luma01(rW, gW, bW);
-                  rW = yy;
-                  gW = yy;
-                  bW = yy;
-                }
-                let sb = surfaceBlend * mask;
-                if (coupleE2S) {
-                  sb *= 1 + etaAmp * clamp01(rimEnergy);
-                }
-                if (kurEnabled && coh) {
-                  sb *= 0.5 + 0.5 * coh[p];
-                }
-                sb = clamp01(sb);
-                out[i + 0] = Math.floor(out[i + 0] * (1 - sb) + rW * 255 * sb);
-                out[i + 1] = Math.floor(out[i + 1] * (1 - sb) + gW * 255 * sb);
-                out[i + 2] = Math.floor(out[i + 2] * (1 - sb) + bW * 255 * sb);
-              }
-            }
-          }
-        }
-
-        if (commitObs) {
-          const obs = obsCount ? obsSum / obsCount : lastObsRef.current;
-          lastObsRef.current = clamp(obs, 0.001, 10);
-        }
-      } else {
-        for (let y = 0; y < height; y++) {
-          for (let x = 0; x < width; x++) {
-            const i = (y * width + x) * 4;
-            const n = Math.sin((x / width) * Math.PI * 6 + tSeconds);
-            const m = Math.sin((y / height) * Math.PI * 6 - tSeconds * 0.7);
-            const v = clamp01(0.5 + 0.5 * n * m);
-            out[i + 0] = Math.floor(v * 255);
-            out[i + 1] = Math.floor((0.4 + 0.6 * v) * 180);
-            out[i + 2] = Math.floor((1 - v) * 255);
-            out[i + 3] = 255;
-          }
+      const kernelSnapshot = kernelEventRef.current;
+      const kernelSpec = kernelSnapshot.spec;
+      const surfaceField = surfaceFieldRef.current;
+      if (surfaceField) {
+        assertSurfaceField(surfaceField, "cpu:surface");
+      }
+      const rimField = rimFieldRef.current;
+      if (rimField) {
+        assertRimField(rimField, "cpu:rim");
+      }
+      const volumeField = volumeFieldRef.current;
+      if (volumeField) {
+        assertVolumeField(volumeField, "cpu:volume");
+      }
+      let phaseField: PhaseField | null = null;
+      const phaseSource = cpuDerivedRef.current;
+      if (phaseSource) {
+        const resolution = phaseSource.resolution;
+        const gradX = fieldsOverride?.gradX ?? gradXRef.current;
+        const gradY = fieldsOverride?.gradY ?? gradYRef.current;
+        const vort = fieldsOverride?.vort ?? vortRef.current;
+        const coh = fieldsOverride?.coh ?? cohRef.current;
+        const amp = fieldsOverride?.amp ?? ampRef.current;
+        if (gradX && gradY && vort && coh && amp) {
+          phaseField = {
+            kind: "phase",
+            resolution,
+            gradX,
+            gradY,
+            vort,
+            coh,
+            amp
+          };
+          assertPhaseField(phaseField, fieldsOverride ? "phase:override" : "phase:cpu");
+          markFieldFresh("phase", resolution, fieldsOverride ? "worker" : "cpu");
         }
       }
+
+      const rimDebugRequest = showRimDebug ? ensureRimDebugBuffers() : null;
+      const surfaceDebugRequest =
+        showSurfaceDebug && orientations.length > 0
+          ? ensureSurfaceDebugBuffers(orientations.length)
+          : null;
+
+      const { base: couplingBase, effective: couplingEffective } = computeCouplingPair(
+        options?.toggles
+      );
+
+      const result = renderRainbowFrame({
+        width,
+        height,
+        timeSeconds: tSeconds,
+        out,
+        surface: surfaceField,
+        rim: rimField,
+        phase: phaseField,
+        volume: volumeField,
+        kernel: kernelSpec,
+        dmt,
+        blend,
+        normPin,
+        normTarget: normTargetRef.current,
+        lastObs: lastObsRef.current,
+        lambdaRef,
+        lambdas,
+        beta2,
+        microsaccade,
+        alive,
+        phasePin,
+        edgeThreshold,
+        wallpaperGroup: wallGroup,
+        surfEnabled,
+        orientationAngles: orientations,
+        thetaMode,
+        thetaGlobal,
+        polBins,
+        jitter,
+        coupling: couplingEffective,
+        couplingBase,
+        sigma,
+        contrast,
+        rimAlpha,
+        rimEnabled,
+        displayMode,
+        surfaceBlend,
+        surfaceRegion,
+        warpAmp,
+        kurEnabled,
+        debug:
+          rimDebugRequest || surfaceDebugRequest
+            ? {
+                rim: rimDebugRequest ?? undefined,
+                surface: surfaceDebugRequest ?? undefined
+              }
+            : undefined,
+        composer,
+        kurTelemetry: kurTelemetryRef.current ?? undefined
+      });
+      if (commitObs && result.obsAverage != null) {
+        lastObsRef.current = result.obsAverage;
+      }
+      if (commitObs && result.metrics) {
+        metricsRef.current.push({
+          backend: "cpu",
+          ts: performance.now(),
+          metrics: result.metrics,
+          kernelVersion: kernelSnapshot.version
+        });
+        if (metricsRef.current.length > 240) {
+          metricsRef.current.shift();
+        }
+      }
+      updateDebugSnapshots(commitObs, rimDebugRequest, surfaceDebugRequest, result.debug);
+      updatePhaseDebug(commitObs, phaseField);
+      return result.metrics;
     },
     [
-      kernel,
       dmt,
       blend,
       normPin,
@@ -1379,42 +1864,85 @@ export default function App() {
       beta2,
       microsaccade,
       alive,
-      imgBitmap,
-      edgeDataRef,
-      basePixelsRef,
+      surfaceFieldRef,
+      rimFieldRef,
       phasePin,
       height,
       width,
       edgeThreshold,
       wallGroup,
       surfEnabled,
-      coupleS2E,
       orientations,
-      getOrientationCache,
-      wallpaperAt,
       thetaMode,
       thetaGlobal,
       polBins,
       jitter,
-      gammaOff,
-      kSigma,
-      gammaSigma,
       sigma,
       contrast,
       rimAlpha,
+      rimEnabled,
       displayMode,
       surfaceBlend,
       surfaceRegion,
       warpAmp,
-      coupleE2S,
-      etaAmp,
       kurEnabled,
-      vortRef,
-      gradXRef,
-      gradYRef,
-      cohRef,
-      alphaPol
+      volumeEnabled,
+      composer,
+      computeCouplingPair,
+      ensureRimDebugBuffers,
+      ensureSurfaceDebugBuffers,
+      updateDebugSnapshots,
+      updatePhaseDebug,
+      basePixelsRef
     ]
+  );
+
+  const logFrameMetrics = useCallback(
+    (tSeconds: number) => {
+      if (!frameLoggingEnabled) {
+        return;
+      }
+      const state = frameLogRef.current;
+      const now = performance.now();
+      if (state.frames === 0) {
+        state.windowStart = now;
+      }
+      state.frames += 1;
+      const elapsed = now - state.windowStart;
+      if (elapsed < 1000) {
+        return;
+      }
+      const fps = state.frames > 0 ? (state.frames * 1000) / elapsed : 0;
+      state.windowStart = now;
+      state.frames = 0;
+
+      if (!metricsScratchRef.current || metricsScratchRef.current.length !== width * height * 4) {
+        metricsScratchRef.current = new Uint8ClampedArray(width * height * 4);
+      }
+      const scratch = metricsScratchRef.current;
+      let metrics: RainbowFrameMetrics | null = null;
+      try {
+        metrics = renderFrameCore(scratch, tSeconds, false);
+      } catch (error) {
+        console.warn("[frame-log] failed to sample metrics", error);
+      }
+      if (!metrics) {
+        console.log(
+          `[frame-log] fps=${fps.toFixed(1)} metrics=unavailable heatmap=${phaseHeatmapEnabled ? "on" : "off"}`
+        );
+        return;
+      }
+      const rimEnergy = metrics.composer.fields.rim.energy;
+      const surfaceEnergy = metrics.composer.fields.surface.energy;
+      const cohMean = metrics.gradient.cohMean ?? 0;
+      const cohStd = metrics.gradient.cohStd ?? 0;
+      console.log(
+        `[frame-log] fps=${fps.toFixed(1)} rim=${rimEnergy.toFixed(3)} surface=${surfaceEnergy.toFixed(
+          3
+        )} |Z|=${cohMean.toFixed(3)}±${cohStd.toFixed(3)} heatmap=${phaseHeatmapEnabled ? "on" : "off"}`
+      );
+    },
+    [frameLoggingEnabled, renderFrameCore, phaseHeatmapEnabled, width, height]
   );
 
   const drawFrameGpu = useCallback(
@@ -1423,16 +1951,29 @@ export default function App() {
       tSeconds: number,
       commitObs: boolean
     ) => {
+      const kernelSnapshot = kernelEventRef.current;
+      const kernelSpec = kernelSnapshot.spec;
       const { gl, renderer } = state;
-      if (!edgeDataRef.current || !basePixelsRef.current) {
+      if (!rimFieldRef.current || !basePixelsRef.current) {
         gl.clear(gl.COLOR_BUFFER_BIT);
         return;
       }
 
+      const rimDebugRequest = showRimDebug ? ensureRimDebugBuffers() : null;
+      const surfaceDebugRequest =
+        showSurfaceDebug && orientations.length > 0
+          ? ensureSurfaceDebugBuffers(orientations.length)
+          : null;
+
+      const { base: couplingBase, effective: couplingEffective } = computeCouplingPair();
+
       const telemetryActive = telemetryRef.current.enabled && commitObs;
+      const needsCpuCompositor =
+        commitObs &&
+        (telemetryActive || rimDebugRequest != null || surfaceDebugRequest != null);
       const renderStart = telemetryActive ? performance.now() : 0;
 
-      const ke = kEff(kernel, dmt);
+      const ke = kEff(kernelSpec, dmt);
       const effectiveBlend = clamp01(blend + ke.transparency * 0.5);
       const eps = 1e-6;
       const frameGain = normPin
@@ -1453,15 +1994,46 @@ export default function App() {
         ? 0.15 * Math.sin(2 * Math.PI * 0.55 * tSeconds)
         : 0.0;
 
-      const { gx, gy, mag } = edgeDataRef.current;
+      const rimField = rimFieldRef.current!;
+      const { gx, gy, mag } = rimField;
       const gradX = gradXRef.current;
       const gradY = gradYRef.current;
       const vort = vortRef.current;
       const coh = cohRef.current;
+      const amp = ampRef.current;
+      const volumeField = volumeFieldRef.current;
+      if (volumeField) {
+        assertVolumeField(volumeField, "gpu:volume-active");
+      }
+      const surfaceField = surfaceFieldRef.current;
+      if (surfaceField) {
+        assertSurfaceField(surfaceField, "gpu:surface");
+      }
+      assertRimField(rimField, "gpu:rim-active");
+      const phaseSource = cpuDerivedRef.current;
+      const phaseField =
+        phaseSource && gradX && gradY && vort && coh && amp
+          ? {
+              kind: "phase" as const,
+              resolution: phaseSource.resolution,
+              gradX,
+              gradY,
+              vort,
+              coh,
+              amp
+            }
+          : null;
+      if (phaseField) {
+        assertPhaseField(phaseField, "gpu:phase-active");
+      }
 
       const ops = groupOps(wallGroup);
       const gpuOps = toGpuOps(ops);
-      const useWallpaper = surfEnabled || coupleS2E;
+      const useWallpaper =
+        surfEnabled ||
+        couplingEffective.surfaceToRimOffset > 1e-4 ||
+        couplingEffective.surfaceToRimSigma > 1e-4 ||
+        couplingEffective.surfaceToRimHue > 1e-4;
       const N = orientations.length;
       const orientationCache = getOrientationCache(N);
       const cosA = orientationCache.cos;
@@ -1491,97 +2063,88 @@ export default function App() {
         muJ = muCount ? muSum / muCount : 0;
       }
 
-      let obsSum = 0;
-      let obsCount = 0;
-      if (commitObs) {
-        for (let y = 0; y < height; y += 8) {
-          for (let x = 0; x < width; x += 8) {
-            const idx = y * width + x;
-            if (mag[idx] < edgeThreshold) continue;
-
-            let nx = gx[idx];
-            let ny = gy[idx];
-            const nlen = Math.hypot(nx, ny) + 1e-8;
-            nx /= nlen;
-            ny /= nlen;
-
-            let gxT0 = 0;
-            let gyT0 = 0;
-            if (kurEnabled && gradX && gradY) {
-              gxT0 = gradX[idx];
-              gyT0 = gradY[idx];
-            } else if (!kurEnabled && useWallpaper) {
-              for (let k = 0; k < ops.length; k++) {
-                const pt = applyOp(ops[k], x, y, cx, cy);
-                const r = wallpaperAt(
-                  pt.x - cx,
-                  pt.y - cy,
-                  cosA,
-                  sinA,
-                  ke,
-                  tSeconds
-                );
-                gxT0 += r.gx;
-                gyT0 += r.gy;
-              }
-              const inv = ops.length > 0 ? 1 / ops.length : 1;
-              gxT0 *= inv;
-              gyT0 *= inv;
-            }
-
-            const gradNorm = Math.hypot(gxT0, gyT0);
-            const rawJ = Math.sin(
-              jitterPhase + hash2(x, y) * Math.PI * 2
-            );
-            const localJ =
-              jitter *
-              (microsaccade ? (phasePin ? rawJ - muJ : rawJ) : 0);
-            const bias =
-              coupleS2E && gradNorm > 1e-6
-                ? gammaOff * ((gxT0 * nx + gyT0 * ny) / gradNorm)
-                : 0;
-            const Esurf = coupleS2E ? clamp01(gradNorm * kSigma) : 0;
-            const sigmaEff = coupleS2E
-              ? Math.max(0.35, sigma * (1 - gammaSigma * Esurf))
-              : sigma;
-
-            const offL = baseOffsets.L + localJ * 0.35 + bias;
-            const offM = baseOffsets.M + localJ * 0.5 + bias;
-            const offS = baseOffsets.S + localJ * 0.8 + bias;
-
-            const pL = sampleScalar(
-              mag,
-              x + (offL + breath) * nx,
-              y + (offL + breath) * ny,
-              width,
-              height
-            );
-            const pM = sampleScalar(
-              mag,
-              x + (offM + breath) * nx,
-              y + (offM + breath) * ny,
-              width,
-              height
-            );
-            const pS = sampleScalar(
-              mag,
-              x + (offS + breath) * nx,
-              y + (offS + breath) * ny,
-              width,
-              height
-            );
-            obsSum += (pL + pM + pS) / 3;
-            obsCount++;
+      let metricDebug: ReturnType<typeof renderRainbowFrame>["debug"] | null = null;
+      if (needsCpuCompositor) {
+        if (
+          !metricsScratchRef.current ||
+          metricsScratchRef.current.length !== width * height * 4
+        ) {
+          metricsScratchRef.current = new Uint8ClampedArray(width * height * 4);
+        }
+        const scratch = metricsScratchRef.current;
+        const metricsResult = renderRainbowFrame({
+          width,
+          height,
+          timeSeconds: tSeconds,
+          out: scratch,
+          surface: surfaceField,
+          rim: rimField,
+          phase: phaseField,
+          volume: volumeField,
+          kernel: kernelSpec,
+          dmt,
+          blend,
+          normPin,
+          normTarget: normTargetRef.current,
+          lastObs: lastObsRef.current,
+          lambdaRef,
+          lambdas,
+          beta2,
+          microsaccade,
+          alive,
+          phasePin,
+          edgeThreshold,
+          wallpaperGroup: wallGroup,
+          surfEnabled,
+          orientationAngles: orientations,
+          thetaMode,
+          thetaGlobal,
+          polBins,
+          jitter,
+          coupling: couplingEffective,
+          couplingBase,
+          sigma,
+          contrast,
+          rimAlpha,
+          rimEnabled,
+          displayMode,
+          surfaceBlend,
+          surfaceRegion,
+          warpAmp,
+          kurEnabled,
+          debug:
+            rimDebugRequest || surfaceDebugRequest
+              ? {
+                  rim: rimDebugRequest ?? undefined,
+                  surface: surfaceDebugRequest ?? undefined
+                }
+              : undefined,
+          composer,
+          kurTelemetry: kurTelemetryRef.current ?? undefined
+        });
+        metricDebug = metricsResult.debug;
+        if (telemetryActive) {
+          metricsRef.current.push({
+            backend: "gpu",
+            ts: performance.now(),
+            metrics: metricsResult.metrics,
+            kernelVersion: kernelSnapshot.version
+          });
+          if (metricsRef.current.length > 240) {
+            metricsRef.current.shift();
+          }
+          if (metricsResult.obsAverage != null) {
+            lastObsRef.current = metricsResult.obsAverage;
           }
         }
       }
+      updateDebugSnapshots(commitObs, rimDebugRequest, surfaceDebugRequest, metricDebug ?? undefined);
+      updatePhaseDebug(commitObs, phaseField);
 
-      renderer.uploadKur({
-        gradX,
-        gradY,
-        vort,
-        coh
-      });
+      renderer.uploadPhase(phaseField);
+      renderer.uploadVolume(volumeField ?? null);
+
+      const couplingScale = 1 + 0.65 * dmt;
 
       renderer.render({
         time: tSeconds,
@@ -1590,7 +2153,6 @@ export default function App() {
         displayMode: displayModeToEnum(displayMode),
         baseOffsets: [baseOffsets.L, baseOffsets.M, baseOffsets.S],
         sigma,
-        sigmaMin: coupleS2E ? 0.35 : sigma,
         jitter,
         jitterPhase,
         breath,
@@ -1600,42 +2162,42 @@ export default function App() {
         polBins,
         thetaMode: thetaMode === "gradient" ? 0 : 1,
         thetaGlobal,
-        coupleS2E,
-        alphaPol,
-        gammaOff,
-        kSigma,
-        gammaSigma,
         contrast,
         frameGain,
         rimAlpha,
+        rimEnabled,
         warpAmp,
         surfaceBlend,
         surfaceRegion: surfaceRegionToEnum(surfaceRegion),
         surfEnabled,
-        coupleE2S,
-        etaAmp,
         kurEnabled,
-        useWallpaper: !kurEnabled && useWallpaper,
+        volumeEnabled,
+        useWallpaper,
         kernel: ke,
         alive,
+        beta2,
+        coupling: couplingEffective,
+        couplingScale,
+        composerExposure: composerUniforms.exposure,
+        composerGamma: composerUniforms.gamma,
+        composerWeight: composerUniforms.weight,
+        composerBlendGain: composerUniforms.blendGain,
         orientations: orientationCache,
         ops: gpuOps,
         center: [cx, cy]
       });
 
+      logFrameMetrics(tSeconds);
+
       if (telemetryActive) {
         recordTelemetry("renderGpu", performance.now() - renderStart);
       }
 
-      if (commitObs) {
-        const obs = obsCount ? obsSum / obsCount : lastObsRef.current;
-        lastObsRef.current = clamp(obs, 0.001, 10);
-      }
     },
     [
-      edgeDataRef,
+      rimFieldRef,
+      surfaceFieldRef,
       basePixelsRef,
-      kernel,
       dmt,
       blend,
       normPin,
@@ -1648,30 +2210,47 @@ export default function App() {
       getOrientationCache,
       wallGroup,
       surfEnabled,
-      coupleS2E,
       thetaMode,
       thetaGlobal,
       polBins,
       jitter,
-      gammaOff,
-      kSigma,
-      gammaSigma,
+      computeCouplingPair,
       sigma,
       contrast,
       rimAlpha,
+      rimEnabled,
       warpAmp,
       surfaceBlend,
       surfaceRegion,
-      coupleE2S,
-      etaAmp,
       kurEnabled,
-      alphaPol,
       width,
       height,
       edgeThreshold,
-      wallpaperAt,
-      recordTelemetry
+      recordTelemetry,
+      showRimDebug,
+      showSurfaceDebug,
+      ensureRimDebugBuffers,
+      ensureSurfaceDebugBuffers,
+      updateDebugSnapshots,
+      updatePhaseDebug,
+      showPhaseDebug,
+      logFrameMetrics
     ]
+  );
+
+  const advanceVolume = useCallback(
+    (dt: number) => {
+      if (!volumeEnabled) return;
+      ensureVolumeState();
+      const stub = volumeStubRef.current;
+      if (!stub) return;
+      stepVolumeStub(stub, dt);
+      const field = snapshotVolumeStub(stub);
+      assertVolumeField(field, "volume:stub");
+      volumeFieldRef.current = field;
+      markFieldFresh("volume", field.resolution, "volume:stub");
+    },
+    [volumeEnabled, ensureVolumeState, markFieldFresh]
   );
 
   const advanceKuramoto = useCallback(
@@ -1717,6 +2296,7 @@ export default function App() {
       const frameStart = telemetryActive ? performance.now() : 0;
       const dt = 0.016 * speed;
       advanceKuramoto(dt, tSeconds);
+      advanceVolume(dt);
       const buffer = ensureFrameBuffer(ctx);
       const profiler = frameProfilerRef.current;
       let start = 0;
@@ -1751,24 +2331,27 @@ export default function App() {
         }
       }
       ctx.putImageData(buffer.image, 0, 0);
+      logFrameMetrics(tSeconds);
       if (frameStart) {
         recordTelemetry("frame", performance.now() - frameStart);
       }
     },
     [
       advanceKuramoto,
+      advanceVolume,
       speed,
       ensureFrameBuffer,
       renderFrameCore,
-      recordTelemetry
+      recordTelemetry,
+      logFrameMetrics
     ]
   );
 
   const runRegressionHarness = useCallback(
     async (frameCount = 10) => {
-      if (!edgeDataRef.current || !basePixelsRef.current) {
+      if (!rimFieldRef.current || !surfaceFieldRef.current) {
         console.warn(
-          "[regression] skipping: base pixels or edge data not ready."
+          "[regression] skipping: surface or rim field not ready."
         );
         return { maxDelta: 0, perFrameMax: [] as number[] };
       }
@@ -1782,6 +2365,8 @@ export default function App() {
       const dt = 0.016 * speed;
       const seed = 12345;
       const prevLastObs = lastObsRef.current;
+      const kernelSnapshot = kernelEventRef.current;
+      const operatorKernel = kernelSnapshot.spec;
 
       const cpuState = createKuramotoState(width, height);
       const cpuBuffer = new ArrayBuffer(derivedBufferSize(width, height));
@@ -1791,8 +2376,14 @@ export default function App() {
 
       const baselineFrames: Uint8ClampedArray[] = [];
       for (let i = 0; i < frameCount; i++) {
-        stepKuramotoState(cpuState, params, dt, cpuRand);
-        deriveKuramotoFieldsCore(cpuState, cpuDerived);
+        stepKuramotoState(cpuState, params, dt, cpuRand, dt * (i + 1), {
+          kernel: operatorKernel,
+          controls: { dmt }
+        });
+        deriveKuramotoFieldsCore(cpuState, cpuDerived, {
+          kernel: operatorKernel,
+          controls: { dmt }
+        });
         const buffer = new Uint8ClampedArray(total);
         const tSeconds = i * (1 / 60);
         renderFrameCore(buffer, tSeconds, false, cpuDerived);
@@ -1868,21 +2459,22 @@ export default function App() {
       return { maxDelta, perFrameMax };
     },
     [
-      edgeDataRef,
-      basePixelsRef,
+      rimFieldRef,
+      surfaceFieldRef,
       kurEnabled,
       width,
       height,
       renderFrameCore,
       getKurParams,
       speed,
-      qInit
+      qInit,
+      dmt
     ]
   );
 
   const runGpuParityCheck = useCallback(async () => {
-    if (!edgeDataRef.current || !basePixelsRef.current) {
-      console.warn("[gpu-regression] base pixels or edge data unavailable.");
+    if (!rimFieldRef.current || !basePixelsRef.current || !surfaceFieldRef.current) {
+      console.warn("[gpu-regression] base pixels, surface, or rim data unavailable.");
       return null;
     }
     const canvas = document.createElement("canvas");
@@ -1901,13 +2493,29 @@ export default function App() {
     const renderer = createGpuRenderer(gl);
     renderer.resize(width, height);
     renderer.uploadBase(basePixelsRef.current);
-    renderer.uploadEdge(edgeDataRef.current);
-    renderer.uploadKur({
-      gradX: gradXRef.current,
-      gradY: gradYRef.current,
-      vort: vortRef.current,
-      coh: cohRef.current
-    });
+    renderer.uploadRim(rimFieldRef.current);
+    const phaseSource = cpuDerivedRef.current;
+    const phaseField =
+      phaseSource &&
+      gradXRef.current &&
+      gradYRef.current &&
+      vortRef.current &&
+      cohRef.current &&
+      ampRef.current
+        ? {
+            kind: "phase" as const,
+            resolution: phaseSource.resolution,
+            gradX: gradXRef.current,
+            gradY: gradYRef.current,
+            vort: vortRef.current,
+            coh: cohRef.current,
+            amp: ampRef.current
+          }
+        : null;
+    if (phaseField) {
+      assertPhaseField(phaseField, "gpu:parity-phase");
+    }
+    renderer.uploadPhase(phaseField);
 
     const state = { gl, renderer };
     const total = width * height * 4;
@@ -1929,32 +2537,74 @@ export default function App() {
 
     try {
       for (const scene of scenes) {
-        renderer.uploadKur({
-          gradX: gradXRef.current,
-          gradY: gradYRef.current,
-          vort: vortRef.current,
-          coh: cohRef.current
-        });
+        const phaseUpload =
+          phaseSource &&
+          gradXRef.current &&
+          gradYRef.current &&
+          vortRef.current &&
+          cohRef.current &&
+          ampRef.current
+            ? {
+                kind: "phase" as const,
+                resolution: phaseSource.resolution,
+                gradX: gradXRef.current,
+                gradY: gradYRef.current,
+                vort: vortRef.current,
+                coh: cohRef.current,
+                amp: ampRef.current
+              }
+            : null;
+        if (phaseUpload) {
+          assertPhaseField(phaseUpload, "gpu:parity-phase-loop");
+        }
+        renderer.uploadPhase(phaseUpload);
         renderFrameCore(cpuBuffer, scene.time, false);
         drawFrameGpu(state, scene.time, false);
         gl.finish();
         renderer.readPixels(gpuBuffer);
         let mismatched = 0;
         let maxDelta = 0;
+        let worstIndex = -1;
+        let worstCpu: [number, number, number] = [0, 0, 0];
+        let worstGpu: [number, number, number] = [0, 0, 0];
         for (let i = 0; i < pixelCount; i++) {
           const idx = i * 4;
           const dr = Math.abs(cpuBuffer[idx] - gpuBuffer[idx]);
           const dg = Math.abs(cpuBuffer[idx + 1] - gpuBuffer[idx + 1]);
           const db = Math.abs(cpuBuffer[idx + 2] - gpuBuffer[idx + 2]);
           const delta = Math.max(dr, dg, db);
-          if (delta > maxDelta) maxDelta = delta;
+          if (delta > maxDelta) {
+            maxDelta = delta;
+            worstIndex = i;
+            worstCpu = [cpuBuffer[idx], cpuBuffer[idx + 1], cpuBuffer[idx + 2]];
+            worstGpu = [gpuBuffer[idx], gpuBuffer[idx + 1], gpuBuffer[idx + 2]];
+          }
           if (delta > 1) mismatched++;
+        }
+        const coord =
+          worstIndex >= 0
+            ? ([
+                worstIndex % width,
+                Math.floor(worstIndex / width)
+              ] as [number, number])
+            : ([0, 0] as [number, number]);
+        if (maxDelta > 1) {
+          console.warn(
+            `[gpu-regression] ${scene.label} worst Δ${maxDelta.toFixed(
+              2
+            )} at (${coord[0]},${coord[1]}) CPU ${printRgb(
+              worstCpu
+            )} GPU ${printRgb(worstGpu)}`
+          );
         }
         results.push({
           label: scene.label,
           mismatched,
           percent: (mismatched / pixelCount) * 100,
-          maxDelta
+          maxDelta,
+          maxCoord: coord,
+          cpuColor: worstCpu,
+          gpuColor: worstGpu
         });
       }
     } finally {
@@ -1967,7 +2617,8 @@ export default function App() {
       tolerancePercent: 0.5
     };
   }, [
-    edgeDataRef,
+    rimFieldRef,
+    surfaceFieldRef,
     basePixelsRef,
     width,
     height,
@@ -1981,8 +2632,8 @@ export default function App() {
 
   const measureRenderPerformance = useCallback(
     (frameCount = 60) => {
-      if (!edgeDataRef.current || !basePixelsRef.current) {
-        console.warn("[perf] base pixels or edge data unavailable.");
+      if (!rimFieldRef.current || !basePixelsRef.current || !surfaceFieldRef.current) {
+        console.warn("[perf] surface or rim field unavailable.");
         return null;
       }
       const prevLastObs = lastObsRef.current;
@@ -2022,7 +2673,7 @@ export default function App() {
         throughputGain: cpuMs / gpuMs
       };
     },
-    [edgeDataRef, basePixelsRef, width, height, renderFrameCore, ensureGpuRenderer, drawFrameGpu]
+    [rimFieldRef, surfaceFieldRef, basePixelsRef, width, height, renderFrameCore, ensureGpuRenderer, drawFrameGpu]
   );
 
   const handleParityCheck = useCallback(async () => {
@@ -2342,6 +2993,7 @@ export default function App() {
         const t = (performance.now() - start) * 0.001;
         const dt = 0.016 * speed;
         advanceKuramoto(dt, t);
+        advanceVolume(dt);
         drawFrameGpu(state, t, true);
         if (frameStart) {
           recordTelemetry("frame", performance.now() - frameStart);
@@ -2376,6 +3028,7 @@ export default function App() {
     drawFrameGpu,
     drawFrameCpu,
     advanceKuramoto,
+    advanceVolume,
     speed,
     width,
     height,
@@ -2403,6 +3056,148 @@ export default function App() {
     };
   }, [stopCaptureStream]);
 
+  const ingestImageData = useCallback(
+    (image: ImageData, source: string) => {
+      const newW = image.width;
+      const newH = image.height;
+      setWidth(newW);
+      setHeight(newH);
+      basePixelsRef.current = image;
+      const surfaceField = describeImageData(image);
+      assertSurfaceField(surfaceField, "io:surface");
+      surfaceFieldRef.current = surfaceField;
+      markFieldFresh("surface", surfaceField.resolution, source);
+
+      const rimField = computeEdgeField({
+        data: image.data,
+        width: newW,
+        height: newH
+      });
+      assertRimField(rimField, "io:rim");
+      rimFieldRef.current = rimField;
+      markFieldFresh("rim", rimField.resolution, source);
+      pendingStaticUploadRef.current = true;
+      const gpuState = gpuStateRef.current;
+      if (gpuState) {
+        gpuState.renderer.resize(newW, newH);
+      }
+      refreshGpuStaticTextures();
+      normTargetRef.current = 0.6;
+      lastObsRef.current = 0.6;
+    },
+    [markFieldFresh, refreshGpuStaticTextures]
+  );
+
+  const loadSyntheticCase = useCallback(
+    (caseId: SyntheticCaseId) => {
+      const synthetic = SYNTHETIC_CASES.find((entry) => entry.id === caseId);
+      if (!synthetic) {
+        console.warn(`[synthetic] unknown case ${caseId}`);
+        return;
+      }
+      setSelectedSyntheticCase(caseId);
+      const { width: defaultW, height: defaultH } = DEFAULT_SYNTHETIC_SIZE;
+      const image = synthetic.generate(defaultW, defaultH);
+      ingestImageData(image, `dev:${caseId}`);
+      if (kurEnabled) {
+        deriveKurFieldsCpu();
+      }
+      if (!metricsScratchRef.current || metricsScratchRef.current.length !== defaultW * defaultH * 4) {
+        metricsScratchRef.current = new Uint8ClampedArray(defaultW * defaultH * 4);
+      }
+      const scratch = metricsScratchRef.current;
+      const metrics = renderFrameCore(scratch, 0, false);
+      if (metrics) {
+        setSyntheticBaselines((prev) => ({
+          ...prev,
+          [caseId]: {
+            metrics,
+            timestamp: Date.now()
+          }
+        }));
+        const rimEnergy = metrics.composer.fields.rim.energy.toFixed(3);
+        const surfaceEnergy = metrics.composer.fields.surface.energy.toFixed(3);
+        const cohMean = metrics.gradient.cohMean.toFixed(3);
+        console.log(
+          `[synthetic] ${synthetic.label} rim=${rimEnergy} surface=${surfaceEnergy} |Z|=${cohMean}`
+        );
+      }
+    },
+    [deriveKurFieldsCpu, ingestImageData, kurEnabled, renderFrameCore, setSelectedSyntheticCase]
+  );
+
+  const exportCouplingDiff = useCallback(
+    (branch: "rimToSurface" | "surfaceToRim") => {
+      if (typeof document === "undefined") {
+        console.warn("[coupling-diff] document unavailable for export");
+        return;
+      }
+      if (!basePixelsRef.current || !rimFieldRef.current) {
+        console.warn("[coupling-diff] base image or rim field not ready");
+        return;
+      }
+      const total = width * height * 4;
+      const currentBuffer = new Uint8ClampedArray(total);
+      const toggledBuffer = new Uint8ClampedArray(total);
+      const override: CouplingToggleState = {
+        rimToSurface: branch === "rimToSurface" ? false : couplingToggles.rimToSurface,
+        surfaceToRim: branch === "surfaceToRim" ? false : couplingToggles.surfaceToRim
+      };
+      const baselineMetrics = renderFrameCore(currentBuffer, 0, false);
+      const toggledMetrics = renderFrameCore(toggledBuffer, 0, false, undefined, {
+        toggles: override
+      });
+      if (!baselineMetrics || !toggledMetrics) {
+        console.warn("[coupling-diff] unable to compute frame metrics");
+        return;
+      }
+      const diff = new Uint8ClampedArray(total);
+      let maxDelta = 0;
+      for (let i = 0; i < total; i += 4) {
+        const dr = Math.abs(currentBuffer[i] - toggledBuffer[i]);
+        const dg = Math.abs(currentBuffer[i + 1] - toggledBuffer[i + 1]);
+        const db = Math.abs(currentBuffer[i + 2] - toggledBuffer[i + 2]);
+        const delta = Math.max(dr, dg, db);
+        const amplified = Math.min(255, delta * 4);
+        diff[i + 0] = amplified;
+        diff[i + 1] = amplified;
+        diff[i + 2] = amplified;
+        diff[i + 3] = 255;
+        if (delta > maxDelta) {
+          maxDelta = delta;
+        }
+      }
+      if (maxDelta <= 0) {
+        console.warn(`[coupling-diff] delta is empty for ${branch}`);
+        return;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        console.warn("[coupling-diff] failed to create canvas context");
+        return;
+      }
+      const diffImage = new ImageData(diff, width, height);
+      ctx.putImageData(diffImage, 0, 0);
+      const url = canvas.toDataURL("image/png");
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `coupling-diff-${branch}-${timestamp}.png`;
+      anchor.click();
+      console.log(
+        `[coupling-diff] ${branch} maxΔ=${maxDelta.toFixed(1)} rim=${baselineMetrics.composer.fields.rim.energy.toFixed(3)}→${toggledMetrics.composer.fields.rim.energy.toFixed(3)} surface=${baselineMetrics.composer.fields.surface.energy.toFixed(3)}→${toggledMetrics.composer.fields.surface.energy.toFixed(3)}`
+      );
+    },
+    [couplingToggles, renderFrameCore, width, height]
+  );
+
+  const runSyntheticDeck = useCallback(() => {
+    SYNTHETIC_CASES.forEach((entry) => loadSyntheticCase(entry.id));
+  }, [loadSyntheticCase]);
+
   const onFile = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
       const file = event.target.files?.[0];
@@ -2426,66 +3221,20 @@ export default function App() {
       if (!octx) return;
       octx.drawImage(bitmap, 0, 0, newW, newH);
       const img = octx.getImageData(0, 0, newW, newH);
-      basePixelsRef.current = img;
-
-      const gray = new Float32Array(newW * newH);
-      const d = img.data;
-      for (let y = 0; y < newH; y++) {
-        for (let x = 0; x < newW; x++) {
-          const i = (y * newW + x) * 4;
-          gray[y * newW + x] =
-            (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) /
-            255;
-        }
-      }
-      const gx = new Float32Array(newW * newH);
-      const gy = new Float32Array(newW * newH);
-      const idx = (ix: number, iy: number) => iy * newW + ix;
-      for (let y = 1; y < newH - 1; y++) {
-        for (let x = 1; x < newW - 1; x++) {
-          let sx = 0;
-          let sy = 0;
-          const kx = [-1, 0, 1, -2, 0, 2, -1, 0, 1];
-          const ky = [-1, -2, -1, 0, 0, 0, 1, 2, 1];
-          let k = 0;
-          for (let j = -1; j <= 1; j++) {
-            for (let i2 = -1; i2 <= 1; i2++) {
-              const v = gray[idx(x + i2, y + j)];
-              sx += v * kx[k];
-              sy += v * ky[k];
-              k++;
-            }
-          }
-          gx[idx(x, y)] = sx;
-          gy[idx(x, y)] = sy;
-        }
-      }
-      const mag = new Float32Array(newW * newH);
-      let maxMag = 1e-6;
-      for (let i = 0; i < mag.length; i++) {
-        const m = Math.hypot(gx[i], gy[i]);
-        mag[i] = m;
-        if (m > maxMag) maxMag = m;
-      }
-      const inv = 1 / maxMag;
-      for (let i = 0; i < mag.length; i++) {
-        mag[i] *= inv;
-      }
-      edgeDataRef.current = { gx, gy, mag };
-      pendingStaticUploadRef.current = true;
-      refreshGpuStaticTextures();
-      normTargetRef.current = 0.6;
-      lastObsRef.current = 0.6;
+      ingestImageData(img, "io:file");
     },
-    [refreshGpuStaticTextures]
+    [ingestImageData]
   );
 
   const applyPreset = useCallback(
     (preset: Preset) => {
       const v = preset.params;
+      pendingStaticUploadRef.current = true;
+      setRenderBackend("gpu");
+      setVolumeEnabled(false);
       setEdgeThreshold(v.edgeThreshold);
       setBlend(v.blend);
-      setKernel({ ...v.kernel });
+      setKernel(createKernelSpec(v.kernel));
       setDmt(v.dmt);
       setThetaMode(v.thetaMode);
       setThetaGlobal(v.thetaGlobal);
@@ -2495,8 +3244,145 @@ export default function App() {
       setMicrosaccade(v.microsaccade);
       setSpeed(v.speed);
       setContrast(v.contrast);
+      setCoupling(cloneCouplingConfig(preset.coupling));
+      setComposer(cloneComposerConfig(preset.composer));
+      setCouplingToggles(
+        preset.couplingToggles
+          ? cloneCouplingToggles(preset.couplingToggles)
+          : DEFAULT_COUPLING_TOGGLES
+      );
     },
     []
+  );
+
+  const buildCurrentPreset = useCallback((): Preset => ({
+    name: PRESETS[presetIndex]?.name ?? "Custom snapshot",
+    params: {
+      edgeThreshold,
+      blend,
+      kernel: kernelSpecToJSON(kernel),
+      dmt,
+      thetaMode,
+      thetaGlobal,
+      beta2,
+      jitter,
+      sigma,
+      microsaccade,
+      speed,
+      contrast
+    },
+    coupling: cloneCouplingConfig(coupling),
+    composer: cloneComposerConfig(composer),
+    couplingToggles: cloneCouplingToggles(couplingToggles)
+  }), [
+    presetIndex,
+    edgeThreshold,
+    blend,
+    kernel,
+    dmt,
+    thetaMode,
+    thetaGlobal,
+    beta2,
+    jitter,
+    sigma,
+    microsaccade,
+    speed,
+    contrast,
+    coupling,
+    composer,
+    couplingToggles
+  ]);
+
+  const handlePresetExport = useCallback(() => {
+    const preset = buildCurrentPreset();
+    const payload = { version: 2, preset };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const downloadName = `${preset.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "preset"}.json`;
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = downloadName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, [buildCurrentPreset]);
+
+  const handlePresetImport = useCallback(() => {
+    const input = presetFileInputRef.current;
+    if (!input) return;
+    input.value = "";
+    input.click();
+  }, []);
+
+  const handlePresetImportFile = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      event.target.value = "";
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const payload = parsed?.preset ?? parsed;
+        if (!payload?.params) {
+          console.error("[preset] invalid payload");
+          return;
+        }
+        const importedPreset: Preset = {
+          name: typeof payload.name === "string" ? payload.name : "Imported preset",
+          params: {
+            edgeThreshold: typeof payload.params.edgeThreshold === "number" ? payload.params.edgeThreshold : edgeThreshold,
+            blend: typeof payload.params.blend === "number" ? payload.params.blend : blend,
+            kernel: createKernelSpec({
+              gain: payload.params.kernel?.gain ?? kernel.gain,
+              k0: payload.params.kernel?.k0 ?? kernel.k0,
+              Q: payload.params.kernel?.Q ?? kernel.Q,
+              anisotropy: payload.params.kernel?.anisotropy ?? kernel.anisotropy,
+              chirality: payload.params.kernel?.chirality ?? kernel.chirality,
+              transparency: payload.params.kernel?.transparency ?? kernel.transparency
+            }),
+            dmt: typeof payload.params.dmt === "number" ? payload.params.dmt : dmt,
+            thetaMode: payload.params.thetaMode === "global" ? "global" : "gradient",
+            thetaGlobal: typeof payload.params.thetaGlobal === "number" ? payload.params.thetaGlobal : thetaGlobal,
+            beta2: typeof payload.params.beta2 === "number" ? payload.params.beta2 : beta2,
+            jitter: typeof payload.params.jitter === "number" ? payload.params.jitter : jitter,
+            sigma: typeof payload.params.sigma === "number" ? payload.params.sigma : sigma,
+            microsaccade: payload.params.microsaccade ?? microsaccade,
+            speed: typeof payload.params.speed === "number" ? payload.params.speed : speed,
+            contrast: typeof payload.params.contrast === "number" ? payload.params.contrast : contrast
+          },
+          coupling: sanitizeCouplingConfig(payload.coupling, coupling),
+          composer: sanitizeComposerImport(payload.composer),
+          couplingToggles: {
+            rimToSurface:
+              payload.couplingToggles?.rimToSurface !== undefined
+                ? Boolean(payload.couplingToggles.rimToSurface)
+                : true,
+            surfaceToRim:
+              payload.couplingToggles?.surfaceToRim !== undefined
+                ? Boolean(payload.couplingToggles.surfaceToRim)
+                : true
+          }
+        };
+        applyPreset(importedPreset);
+      } catch (error) {
+        console.error("[preset] failed to import", error);
+      }
+    },
+    [
+      applyPreset,
+      coupling,
+      edgeThreshold,
+      blend,
+      kernel,
+      dmt,
+      thetaMode,
+      thetaGlobal,
+      beta2,
+      jitter,
+      sigma,
+      microsaccade,
+      speed,
+      contrast
+    ]
   );
 
   useEffect(() => {
@@ -2517,24 +3403,15 @@ export default function App() {
     refreshGpuStaticTextures();
   }, [width, height, refreshGpuStaticTextures]);
 
-  const resetKuramotoField = useCallback(() => {
-    initKuramotoCpu(qInit);
-    if (!kurSyncRef.current && workerRef.current && workerReadyRef.current) {
-      workerRef.current.postMessage({
-        kind: "reset",
-        qInit
-      });
-    }
-  }, [initKuramotoCpu, qInit]);
-
   return (
     <main
       style={{
-        minHeight: "100vh",
+        height: "100vh",
         padding: "2rem",
         display: "flex",
         flexDirection: "column",
-        gap: "1.5rem"
+        gap: "1.5rem",
+        overflow: "hidden"
       }}
     >
       <div>
@@ -2554,10 +3431,21 @@ export default function App() {
           display: "grid",
           gridTemplateColumns: "minmax(22rem, 27rem) 1fr",
           gap: "1.5rem",
-          alignItems: "start"
+          alignItems: "stretch",
+          flex: 1,
+          minHeight: 0
         }}
       >
-        <div className="panel" style={{ gap: "1.25rem" }}>
+        <div
+          className="panel"
+          style={{
+            gap: "1.25rem",
+            overflowY: "auto",
+            height: "100%",
+            minHeight: 0,
+            paddingRight: "1.25rem"
+          }}
+        >
           <section className="panel">
             <h2>Image & Preset</h2>
             <div className="control">
@@ -2591,6 +3479,47 @@ export default function App() {
             >
               Apply preset
             </button>
+            <div
+              style={{
+                display: "flex",
+                gap: "0.5rem",
+                flexWrap: "wrap"
+              }}
+            >
+              <button
+                onClick={handlePresetExport}
+                style={{
+                  padding: "0.4rem 0.65rem",
+                  borderRadius: "0.55rem",
+                  border: "1px solid rgba(148,163,184,0.35)",
+                  background: "rgba(15,118,110,0.18)",
+                  color: "#e0f2fe",
+                  cursor: "pointer"
+                }}
+              >
+                Export preset
+              </button>
+              <button
+                onClick={handlePresetImport}
+                style={{
+                  padding: "0.4rem 0.65rem",
+                  borderRadius: "0.55rem",
+                  border: "1px solid rgba(148,163,184,0.35)",
+                  background: "rgba(30,64,175,0.18)",
+                  color: "#e0e7ff",
+                  cursor: "pointer"
+                }}
+              >
+                Import preset
+              </button>
+              <input
+                ref={presetFileInputRef}
+                type="file"
+                accept="application/json"
+                style={{ display: "none" }}
+                onChange={handlePresetImportFile}
+              />
+            </div>
           </section>
 
           <section className="panel">
@@ -2604,6 +3533,36 @@ export default function App() {
               label="Telemetry logging"
               value={telemetryEnabled}
               onChange={setTelemetryEnabled}
+            />
+            <ToggleControl
+              label="Frame metric logging"
+              value={frameLoggingEnabled}
+              onChange={setFrameLoggingEnabled}
+            />
+            <ToggleControl
+              label="Enable rim generator"
+              value={rimEnabled}
+              onChange={setRimEnabled}
+            />
+            <ToggleControl
+              label="Rim debug overlays"
+              value={showRimDebug}
+              onChange={setShowRimDebug}
+            />
+            <ToggleControl
+              label="Surface flow debug"
+              value={showSurfaceDebug}
+              onChange={setShowSurfaceDebug}
+            />
+            <ToggleControl
+              label="Phase amplitude histogram"
+              value={showPhaseDebug}
+              onChange={setShowPhaseDebug}
+            />
+            <ToggleControl
+              label="Phase alignment heatmap"
+              value={phaseHeatmapEnabled}
+              onChange={setPhaseHeatmapEnabled}
             />
             <div className="control">
               <button
@@ -2632,6 +3591,16 @@ export default function App() {
                   </span>{" "}
                   | {parityDisplay.worst.percent.toFixed(2)}% &lt;= {parityDisplay.tolerance.toFixed(2)}%?{" "}
                   {parityDisplay.within ? "OK" : "Check reference"}
+                  {!parityDisplay.within && (
+                    <>
+                      <br />
+                      <span>
+                        pixel ({parityDisplay.worst.maxCoord[0]}, {parityDisplay.worst.maxCoord[1]}) CPU{" "}
+                        {printRgb(parityDisplay.worst.cpuColor)} vs GPU{" "}
+                        {printRgb(parityDisplay.worst.gpuColor)}
+                      </span>
+                    </>
+                  )}
                 </small>
               )}
             </div>
@@ -2661,6 +3630,213 @@ export default function App() {
                   {perfDisplay.cpuMs.toFixed(1)} ms CPU)
                 </small>
               )}
+            </div>
+            {(showRimDebug && rimDebugSnapshot) ||
+            (showSurfaceDebug && surfaceDebugSnapshot) ||
+            (showPhaseDebug && phaseDebugSnapshot) ? (
+              <div
+                className="control"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.75rem",
+                  background: "rgba(15,23,42,0.45)",
+                  borderRadius: "0.85rem",
+                  padding: "0.75rem"
+                }}
+              >
+                {showRimDebug && rimDebugSnapshot && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
+                    <HistogramPanel
+                      title="Rim energy"
+                      bins={rimDebugSnapshot.energyHist}
+                      defaultColor="#f97316"
+                      rangeLabel={`${rimDebugSnapshot.energyRange[0].toFixed(2)} – ${rimDebugSnapshot.energyRange[1].toFixed(2)}`}
+                    />
+                    <HistogramPanel
+                      title="Rim hue"
+                      bins={rimDebugSnapshot.hueHist}
+                      colorForBin={(idx) =>
+                        `hsl(${(idx / Math.max(rimDebugSnapshot.hueHist.length - 1, 1)) * 360}, 80%, 60%)`
+                      }
+                      rangeLabel={`${(rimDebugSnapshot.hueRange[0] * 360).toFixed(0)}° – ${(rimDebugSnapshot.hueRange[1] * 360).toFixed(0)}°`}
+                    />
+                  </div>
+                )}
+                {showSurfaceDebug && surfaceDebugSnapshot && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        fontSize: "0.75rem",
+                        color: "#cbd5f5"
+                      }}
+                    >
+                      <span>Surface flow magnitudes</span>
+                      <span>max {surfaceDebugSnapshot.magnitudeMax.toFixed(2)}</span>
+                    </div>
+                    {surfaceDebugSnapshot.magnitudeHist.map((bins, idx) => (
+                      <HistogramPanel
+                        key={`surface-hist-${idx}`}
+                        title={`Orientation ${idx + 1}`}
+                        bins={bins}
+                        defaultColor="#38bdf8"
+                      />
+                    ))}
+                  </div>
+                )}
+                {showPhaseDebug && phaseDebugSnapshot && (
+                  <HistogramPanel
+                    title="Phase amplitude |Z|"
+                    bins={phaseDebugSnapshot.ampHist}
+                    defaultColor="#a855f7"
+                    rangeLabel={`${phaseDebugSnapshot.ampRange[0].toFixed(2)} – ${phaseDebugSnapshot.ampRange[1].toFixed(2)}`}
+                  />
+                )}
+                {phaseHeatmapEnabled && phaseHeatmapSnapshot && (
+                  <PhaseHeatmapPanel snapshot={phaseHeatmapSnapshot} />
+                )}
+              </div>
+            ) : null}
+            <div
+              style={{
+                marginTop: "0.75rem",
+                display: "grid",
+                gap: "0.4rem"
+              }}
+            >
+              {fieldStatusEntries.map((entry) => {
+                const palette = FIELD_STATUS_STYLES[entry.state];
+                const statusLabel = FIELD_STATUS_LABELS[entry.state];
+                const resolutionText = entry.resolution
+                  ? `${entry.resolution.width}×${entry.resolution.height}`
+                  : "—";
+                const stalenessText =
+                  entry.state === "missing"
+                    ? "offline"
+                    : entry.stalenessMs === Number.POSITIVE_INFINITY
+                    ? "idle"
+                    : `${entry.stalenessMs.toFixed(0)}ms`;
+                return (
+                  <div
+                    key={entry.kind}
+                    style={{
+                      border: `1px solid ${palette.border}`,
+                      background: palette.background,
+                      color: palette.color,
+                      borderRadius: "0.65rem",
+                      padding: "0.45rem 0.6rem",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "baseline"
+                    }}
+                  >
+                    <div style={{ fontWeight: 600 }}>{entry.label}</div>
+                    <div style={{ fontSize: "0.75rem", fontFamily: "monospace" }}>
+                      {statusLabel} · {resolutionText} · {stalenessText}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="panel">
+            <h2>Dev Deck</h2>
+            <SelectControl
+              label="Synthetic case"
+              value={selectedSyntheticCase}
+              onChange={(value) => setSelectedSyntheticCase(value as SyntheticCaseId)}
+              options={SYNTHETIC_CASES.map((entry) => ({ value: entry.id, label: entry.label }))}
+            />
+            <div
+              style={{
+                display: "flex",
+                gap: "0.5rem",
+                flexWrap: "wrap"
+              }}
+            >
+              <button
+                onClick={() => loadSyntheticCase(selectedSyntheticCase)}
+                style={{
+                  padding: "0.4rem 0.65rem",
+                  borderRadius: "0.55rem",
+                  border: "1px solid rgba(148,163,184,0.35)",
+                  background: "rgba(30, 64, 175, 0.18)",
+                  color: "#e0e7ff",
+                  cursor: "pointer"
+                }}
+              >
+                Load selected case
+              </button>
+              <button
+                onClick={runSyntheticDeck}
+                style={{
+                  padding: "0.4rem 0.65rem",
+                  borderRadius: "0.55rem",
+                  border: "1px solid rgba(148,163,184,0.35)",
+                  background: "rgba(59, 130, 246, 0.2)",
+                  color: "#e0f2fe",
+                  cursor: "pointer"
+                }}
+              >
+                Run full deck
+              </button>
+            </div>
+            <small style={{ display: "block", color: "#94a3b8", marginTop: "0.35rem" }}>
+              Records rim, surface, and |Z| baselines for analytics.
+            </small>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "0.5rem",
+                marginTop: "0.75rem"
+              }}
+            >
+              {SYNTHETIC_CASES.map((entry) => {
+                const baseline = syntheticBaselines[entry.id];
+                return (
+                  <div
+                    key={entry.id}
+                    style={{
+                      border: "1px solid rgba(148,163,184,0.3)",
+                      borderRadius: "0.65rem",
+                      background: "rgba(15,23,42,0.4)",
+                      padding: "0.55rem 0.65rem"
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, color: "#e2e8f0" }}>{entry.label}</div>
+                    <div style={{ fontSize: "0.75rem", color: "#94a3b8", marginTop: "0.25rem" }}>
+                      {entry.description}
+                    </div>
+                    {baseline ? (
+                      <div
+                        style={{
+                          marginTop: "0.4rem",
+                          fontFamily: "monospace",
+                          fontSize: "0.8rem",
+                          color: "#a5b4fc"
+                        }}
+                      >
+                        rim {baseline.metrics.composer.fields.rim.energy.toFixed(3)} · surface {baseline.metrics.composer.fields.surface.energy.toFixed(3)} · |Z| {baseline.metrics.gradient.cohMean.toFixed(3)} · {new Date(baseline.timestamp).toLocaleTimeString()}
+                      </div>
+                    ) : (
+                      <div
+                        style={{
+                          marginTop: "0.4rem",
+                          fontFamily: "monospace",
+                          fontSize: "0.8rem",
+                          color: "#64748b"
+                        }}
+                      >
+                        No baseline recorded yet.
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </section>
 
@@ -2821,12 +3997,7 @@ export default function App() {
               min={0}
               max={5}
               step={0.05}
-              onChange={(v) =>
-                setKernel((prev) => ({
-                  ...prev,
-                  gain: v
-                }))
-              }
+              onChange={(v) => updateKernel({ gain: v })}
             />
             <SliderControl
               label="Spatial Frequency k₀"
@@ -2834,12 +4005,7 @@ export default function App() {
               min={0.01}
               max={0.4}
               step={0.01}
-              onChange={(v) =>
-                setKernel((prev) => ({
-                  ...prev,
-                  k0: v
-                }))
-              }
+              onChange={(v) => updateKernel({ k0: v })}
             />
             <SliderControl
               label="Sharpness Q"
@@ -2847,12 +4013,7 @@ export default function App() {
               min={0.5}
               max={8}
               step={0.05}
-              onChange={(v) =>
-                setKernel((prev) => ({
-                  ...prev,
-                  Q: v
-                }))
-              }
+              onChange={(v) => updateKernel({ Q: v })}
             />
             <SliderControl
               label="Anisotropy"
@@ -2860,12 +4021,7 @@ export default function App() {
               min={0}
               max={1.5}
               step={0.05}
-              onChange={(v) =>
-                setKernel((prev) => ({
-                  ...prev,
-                  anisotropy: v
-                }))
-              }
+              onChange={(v) => updateKernel({ anisotropy: v })}
             />
             <SliderControl
               label="Chirality"
@@ -2873,12 +4029,7 @@ export default function App() {
               min={0}
               max={2}
               step={0.05}
-              onChange={(v) =>
-                setKernel((prev) => ({
-                  ...prev,
-                  chirality: v
-                }))
-              }
+              onChange={(v) => updateKernel({ chirality: v })}
             />
             <SliderControl
               label="Transparency"
@@ -2886,12 +4037,7 @@ export default function App() {
               min={0}
               max={1}
               step={0.05}
-              onChange={(v) =>
-                setKernel((prev) => ({
-                  ...prev,
-                  transparency: v
-                }))
-              }
+              onChange={(v) => updateKernel({ transparency: v })}
             />
             <SliderControl
               label="DMT Gain"
@@ -2961,57 +4107,226 @@ export default function App() {
           </section>
 
           <section className="panel">
-            <h2>Coupling</h2>
+            <h2>3D Volume</h2>
             <ToggleControl
-              label="Edges → Surface"
-              value={coupleE2S}
-              onChange={setCoupleE2S}
+              label="Enable 3D volume feed"
+              value={volumeEnabled}
+              onChange={setVolumeEnabled}
             />
-            <SliderControl
-              label="Rim gain → Surface"
-              value={etaAmp}
-              min={0}
-              max={2}
-              step={0.05}
-              onChange={setEtaAmp}
+            <div className="control-hint">
+              Volume couplers wake once the feed is live. Press play and try the sliders below.
+            </div>
+          </section>
+
+          <section className="panel">
+            <h2>Coupling Fabric</h2>
+            <ToggleControl
+              label="Enable rims → surface coupling"
+              value={couplingToggles.rimToSurface}
+              onChange={setCouplingToggle("rimToSurface")}
             />
             <ToggleControl
-              label="Surface → Edges"
-              value={coupleS2E}
-              onChange={setCoupleS2E}
+              label="Enable surface → rims coupling"
+              value={couplingToggles.surfaceToRim}
+              onChange={setCouplingToggle("surfaceToRim")}
             />
+            <h3>Rims → Surface</h3>
             <SliderControl
-              label="Offset bias γₒff"
-              value={gammaOff}
-              min={-1}
-              max={1}
-              step={0.05}
-              onChange={setGammaOff}
-            />
-            <SliderControl
-              label="Sigma scaling γσ"
-              value={gammaSigma}
-              min={0}
-              max={1.5}
-              step={0.05}
-              onChange={setGammaSigma}
-            />
-            <SliderControl
-              label="Polarization blend αₚₒₗ"
-              value={alphaPol}
+              label="Energy → surface blend"
+              value={coupling.rimToSurfaceBlend}
               min={0}
               max={1}
-              step={0.05}
-              onChange={setAlphaPol}
+              step={0.01}
+              onChange={setCouplingValue("rimToSurfaceBlend")}
+              format={(v) => v.toFixed(2)}
             />
             <SliderControl
-              label="Warp → Sharpness kσ"
-              value={kSigma}
+              label="Tangent alignment weight"
+              value={coupling.rimToSurfaceAlign}
               min={0}
-              max={2}
-              step={0.05}
-              onChange={setKSigma}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("rimToSurfaceAlign")}
+              format={(v) => v.toFixed(2)}
             />
+            <h3>Surface → Rims</h3>
+            <SliderControl
+              label="Warp gradient → offset bias"
+              value={coupling.surfaceToRimOffset}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("surfaceToRimOffset")}
+              format={(v) => v.toFixed(2)}
+            />
+            <SliderControl
+              label="Warp gradient → sigma thinning"
+              value={coupling.surfaceToRimSigma}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("surfaceToRimSigma")}
+              format={(v) => v.toFixed(2)}
+            />
+            <SliderControl
+              label="Lattice phase → hue bias"
+              value={coupling.surfaceToRimHue}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("surfaceToRimHue")}
+              format={(v) => v.toFixed(2)}
+            />
+            <div
+              style={{
+                display: "flex",
+                gap: "0.5rem",
+                flexWrap: "wrap",
+                margin: "0.5rem 0 1rem"
+              }}
+            >
+              <button
+                onClick={() => exportCouplingDiff("rimToSurface")}
+                style={{
+                  padding: "0.4rem 0.65rem",
+                  borderRadius: "0.55rem",
+                  border: "1px solid rgba(148,163,184,0.35)",
+                  background: "rgba(59, 130, 246, 0.18)",
+                  color: "#e0f2fe",
+                  cursor: "pointer"
+                }}
+              >
+                Export rim→surface diff
+              </button>
+              <button
+                onClick={() => exportCouplingDiff("surfaceToRim")}
+                style={{
+                  padding: "0.4rem 0.65rem",
+                  borderRadius: "0.55rem",
+                  border: "1px solid rgba(148,163,184,0.35)",
+                  background: "rgba(14, 165, 233, 0.18)",
+                  color: "#cffafe",
+                  cursor: "pointer"
+                }}
+              >
+                Export surface→rim diff
+              </button>
+            </div>
+            <h3>Kuramoto Adapters</h3>
+            <SliderControl
+              label="|Z| → transparency"
+              value={coupling.kurToTransparency}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("kurToTransparency")}
+              format={(v) => v.toFixed(2)}
+            />
+            <SliderControl
+              label="∇θ → orientation blend"
+              value={coupling.kurToOrientation}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("kurToOrientation")}
+              format={(v) => v.toFixed(2)}
+            />
+            <SliderControl
+              label="Vorticity → chirality"
+              value={coupling.kurToChirality}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("kurToChirality")}
+              format={(v) => v.toFixed(2)}
+            />
+            <h3>Volume → 2D</h3>
+            <SliderControl
+              label="Phase → rim hue"
+              value={coupling.volumePhaseToHue}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("volumePhaseToHue")}
+              format={(v) => v.toFixed(2)}
+            />
+            <SliderControl
+              label="Depth grad → warp amp"
+              value={coupling.volumeDepthToWarp}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={setCouplingValue("volumeDepthToWarp")}
+              format={(v) => v.toFixed(2)}
+            />
+          </section>
+
+          <section className="panel">
+            <h2>Composer</h2>
+            <SelectControl
+              label="DMT routing"
+              value={composer.dmtRouting}
+              onChange={(value) => handleComposerRouting(value as DmtRoutingMode)}
+              options={[
+                { value: "auto", label: "Auto" },
+                { value: "rimBias", label: "Rim bias" },
+                { value: "surfaceBias", label: "Surface bias" }
+              ]}
+            />
+            <SelectControl
+              label="Solver regime"
+              value={composer.solverRegime}
+              onChange={(value) => handleComposerSolver(value as SolverRegime)}
+              options={[
+                { value: "balanced", label: "Balanced" },
+                { value: "rimLocked", label: "Rim locked" },
+                { value: "surfaceLocked", label: "Surface locked" }
+              ]}
+            />
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "1rem"
+              }}
+            >
+              {COMPOSER_FIELD_LIST.map((field) => {
+                const cfg = composer.fields[field];
+                const label = COMPOSER_FIELD_LABELS[field];
+                return (
+                  <div key={field} style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                    <h3 style={{ margin: 0 }}>{label}</h3>
+                    <SliderControl
+                      label="Exposure"
+                      value={cfg.exposure}
+                      min={0}
+                      max={4}
+                      step={0.05}
+                      onChange={setComposerFieldValue(field, "exposure")}
+                      format={(v) => v.toFixed(2)}
+                    />
+                    <SliderControl
+                      label="Gamma"
+                      value={cfg.gamma}
+                      min={0.2}
+                      max={3}
+                      step={0.05}
+                      onChange={setComposerFieldValue(field, "gamma")}
+                      format={(v) => v.toFixed(2)}
+                    />
+                    <SliderControl
+                      label="Weight"
+                      value={cfg.weight}
+                      min={0}
+                      max={2.5}
+                      step={0.05}
+                      onChange={setComposerFieldValue(field, "weight")}
+                      format={(v) => v.toFixed(2)}
+                    />
+                  </div>
+                );
+              })}
+            </div>
           </section>
 
           <section className="panel">
@@ -3026,13 +4341,39 @@ export default function App() {
               value={kurSync}
               onChange={setKurSync}
             />
+            <SelectControl
+              label="Regime"
+              value={kurRegime}
+              onChange={(value) => {
+                const next = value as KurRegime;
+                if (next === "custom") {
+                  setKurRegime("custom");
+                } else {
+                  applyKurRegime(next);
+                }
+              }}
+              options={[
+                { value: "locked", label: KUR_REGIME_PRESETS.locked.label },
+                { value: "highEnergy", label: KUR_REGIME_PRESETS.highEnergy.label },
+                { value: "chaotic", label: KUR_REGIME_PRESETS.chaotic.label },
+                { value: "custom", label: "Custom (manual)" }
+              ]}
+            />
+            {kurRegime !== "custom" && (
+              <small style={{ display: "block", color: "#94a3b8", marginTop: "0.35rem" }}>
+                {KUR_REGIME_PRESETS[kurRegime as Exclude<KurRegime, "custom">].description}
+              </small>
+            )}
             <SliderControl
               label="Coupling K₀"
               value={K0}
               min={0}
               max={2}
               step={0.05}
-              onChange={setK0}
+              onChange={(value) => {
+                markKurCustom();
+                setK0(value);
+              }}
             />
             <SliderControl
               label="Phase lag α"
@@ -3040,7 +4381,10 @@ export default function App() {
               min={-Math.PI}
               max={Math.PI}
               step={0.05}
-              onChange={setAlphaKur}
+              onChange={(value) => {
+                markKurCustom();
+                setAlphaKur(value);
+              }}
             />
             <SliderControl
               label="Line width γ"
@@ -3048,7 +4392,10 @@ export default function App() {
               min={0}
               max={1}
               step={0.02}
-              onChange={setGammaKur}
+              onChange={(value) => {
+                markKurCustom();
+                setGammaKur(value);
+              }}
             />
             <SliderControl
               label="Mean freq ω₀"
@@ -3056,7 +4403,10 @@ export default function App() {
               min={-2}
               max={2}
               step={0.05}
-              onChange={setOmega0}
+              onChange={(value) => {
+                markKurCustom();
+                setOmega0(value);
+              }}
             />
             <SliderControl
               label="Noise ε"
@@ -3064,8 +4414,35 @@ export default function App() {
               min={0}
               max={0.02}
               step={0.0005}
-              onChange={setEpsKur}
+              onChange={(value) => {
+                markKurCustom();
+                setEpsKur(value);
+              }}
               format={(v) => v.toFixed(4)}
+            />
+            <SliderControl
+              label="Flux φₓ"
+              value={fluxX}
+              min={0}
+              max={Math.PI * 2}
+              step={0.01}
+              onChange={(value) => {
+                markKurCustom();
+                setFluxX(value);
+              }}
+              format={(v) => `${(v / Math.PI).toFixed(2)}π`}
+            />
+            <SliderControl
+              label="Flux φ_y"
+              value={fluxY}
+              min={0}
+              max={Math.PI * 2}
+              step={0.01}
+              onChange={(value) => {
+                markKurCustom();
+                setFluxY(value);
+              }}
+              format={(v) => `${(v / Math.PI).toFixed(2)}π`}
             />
             <SliderControl
               label="Init twist q"
@@ -3110,6 +4487,10 @@ export default function App() {
                 {
                   value: "colorBaseGrayRims",
                   label: "Color base + gray rims"
+                },
+                {
+                  value: "colorBaseBlendedRims",
+                  label: "Color base + blended rims"
                 }
               ]}
             />
@@ -3134,29 +4515,136 @@ export default function App() {
           style={{
             display: "flex",
             flexDirection: "column",
-            gap: "1rem"
+            gap: "1rem",
+            overflowY: "auto",
+            height: "100%",
+            minHeight: 0,
+            paddingRight: "0.75rem"
           }}
         >
-          <canvas
-            ref={canvasRef}
-            width={width}
-            height={height}
+          <div
             style={{
+              position: "relative",
               width: "100%",
-              height: "auto",
               maxWidth: `${Math.min(width, 1000)}px`,
               maxHeight: `${Math.min(height, 1000)}px`,
               aspectRatio: `${width} / ${height}`,
               borderRadius: "1.25rem",
               border: "1px solid rgba(148,163,184,0.2)",
-              boxShadow: "0 20px 60px rgba(15,23,42,0.65)"
+              boxShadow: "0 20px 60px rgba(15,23,42,0.65)",
+              overflow: "hidden"
             }}
-          />
+          >
+            <canvas
+              ref={canvasRef}
+              width={width}
+              height={height}
+              style={{
+                width: "100%",
+                height: "100%",
+                display: "block"
+              }}
+            />
+            <div
+              style={{
+                position: "absolute",
+                top: "0.75rem",
+                left: "0.75rem",
+                padding: "0.25rem 0.6rem",
+                borderRadius: "9999px",
+                background: "rgba(15,23,42,0.65)",
+                color: "#e2e8f0",
+                fontSize: "0.75rem",
+                letterSpacing: "0.02em",
+                fontWeight: 500,
+                pointerEvents: "none"
+              }}
+            >
+              {`Flux (φₓ=${fluxX.toFixed(2)}, φ_y=${fluxY.toFixed(2)})`}
+            </div>
+          </div>
           <p style={{ color: "#64748b", margin: 0 }}>
             Tip: enable the OA field once you have rims dialed in, then
             gradually increase K₀ and lower ε to let the oscillator field
             steer both rims and surface morph in a coherent way.
           </p>
+          <section className="panel">
+            <h2>Telemetry</h2>
+            {telemetrySnapshot ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(11rem, 1fr))",
+                    gap: "0.75rem"
+                  }}
+                >
+                  {COMPOSER_FIELD_LIST.map((field) => {
+                    const data = telemetrySnapshot.fields[field];
+                    return (
+                      <div
+                        key={field}
+                        style={{
+                          background: "rgba(15,23,42,0.45)",
+                          borderRadius: "0.75rem",
+                          padding: "0.75rem",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "0.35rem"
+                        }}
+                      >
+                        <strong style={{ color: "#e2e8f0" }}>{COMPOSER_FIELD_LABELS[field]}</strong>
+                        <span style={{ fontSize: "0.8rem", color: "#a5b4fc" }}>
+                          Energy {data.energy.toFixed(3)}
+                        </span>
+                        <span style={{ fontSize: "0.8rem", color: "#cbd5f5" }}>
+                          Blend {(data.blend * 100).toFixed(1)}%
+                        </span>
+                        <span style={{ fontSize: "0.8rem", color: "#cbd5f5" }}>
+                          Share {(data.share * 100).toFixed(1)}%
+                        </span>
+                        <span style={{ fontSize: "0.8rem", color: "#94a3b8" }}>
+                          Weight {data.weight.toFixed(2)}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div
+                  style={{
+                    background: "rgba(15,23,42,0.45)",
+                    borderRadius: "0.75rem",
+                    padding: "0.75rem",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "0.5rem"
+                  }}
+                >
+                  <div style={{ color: "#e2e8f0", fontWeight: 600 }}>
+                    Coupling scale {telemetrySnapshot.coupling.scale.toFixed(2)}
+                  </div>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(13rem, 1fr))",
+                      gap: "0.5rem"
+                    }}
+                  >
+                    {Object.entries(telemetrySnapshot.coupling.effective).map(([key, value]) => (
+                      <div key={key} style={{ fontSize: "0.75rem", color: "#cbd5f5" }}>
+                        <strong style={{ color: "#facc15" }}>{formatCouplingKey(key as keyof CouplingConfig)}</strong>
+                        : {value.toFixed(2)}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <p style={{ color: "#94a3b8", margin: 0 }}>
+                {telemetryEnabled ? "Collecting telemetry…" : "Telemetry disabled."}
+              </p>
+            )}
+          </section>
         </div>
       </div>
     </main>
@@ -3171,6 +4659,174 @@ type SliderProps = {
   step: number;
   onChange: (value: number) => void;
   format?: (value: number) => string;
+};
+
+type RimDebugSnapshot = {
+  energyRange: [number, number];
+  hueRange: [number, number];
+  energyHist: number[];
+  hueHist: number[];
+};
+
+type SurfaceDebugSnapshot = {
+  orientationCount: number;
+  magnitudeMax: number;
+  magnitudeHist: number[][];
+};
+
+type PhaseDebugSnapshot = {
+  ampRange: [number, number];
+  ampHist: number[];
+};
+
+type PhaseHeatmapSnapshot = {
+  width: number;
+  height: number;
+  values: Float32Array;
+  min: number;
+  max: number;
+};
+
+type HistogramPanelProps = {
+  title: string;
+  bins: number[];
+  defaultColor?: string;
+  colorForBin?: (index: number, value: number, max: number) => string;
+  rangeLabel?: string;
+};
+
+type TelemetryFieldSnapshot = {
+  energy: number;
+  blend: number;
+  share: number;
+  weight: number;
+};
+
+type TelemetrySnapshot = {
+  fields: Record<ComposerFieldId, TelemetryFieldSnapshot>;
+  coupling: {
+    scale: number;
+    base: CouplingConfig;
+    effective: CouplingConfig;
+  };
+  updatedAt: number;
+};
+
+const HistogramPanel = ({
+  title,
+  bins,
+  defaultColor = "#38bdf8",
+  colorForBin,
+  rangeLabel
+}: HistogramPanelProps) => {
+  const max = bins.reduce((acc, value) => (value > acc ? value : acc), 0);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "0.45rem" }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: "0.75rem",
+          color: "#cbd5f5"
+        }}
+      >
+        <span>{title}</span>
+        {rangeLabel ? <span>{rangeLabel}</span> : null}
+      </div>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: `repeat(${bins.length}, 1fr)`,
+          alignItems: "end",
+          gap: "2px",
+          height: "64px",
+          background: "rgba(15,23,42,0.45)",
+          borderRadius: "0.6rem",
+          padding: "6px"
+        }}
+      >
+        {bins.map((value, idx) => {
+          const normalized = max > 0 ? value / max : 0;
+          const color = colorForBin
+            ? colorForBin(idx, value, max)
+            : defaultColor;
+          return (
+            <span
+              key={idx}
+              style={{
+                display: "block",
+                width: "100%",
+                height: `${Math.max(normalized * 100, 2)}%`,
+                background: color,
+                borderRadius: "0.35rem 0.35rem 0 0"
+              }}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+const phaseHeatmapColor = (t: number): [number, number, number] => {
+  const clamped = Math.min(1, Math.max(0, t));
+  const r = Math.round(255 * clamped);
+  const g = Math.round(255 * Math.sin(clamped * Math.PI));
+  const b = Math.round(255 * (1 - clamped * 0.85));
+  return [r, g, b];
+};
+
+const PhaseHeatmapPanel = ({ snapshot }: { snapshot: PhaseHeatmapSnapshot }) => {
+  const canvasRef = React.useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const { width, height, values, min, max } = snapshot;
+    const range = Math.max(1e-6, max - min);
+    const image = ctx.createImageData(width, height);
+    for (let i = 0; i < values.length; i++) {
+      const norm = (values[i] - min) / range;
+      const [r, g, b] = phaseHeatmapColor(norm);
+      const idx = i * 4;
+      image.data[idx + 0] = r;
+      image.data[idx + 1] = g;
+      image.data[idx + 2] = b;
+      image.data[idx + 3] = 255;
+    }
+    ctx.putImageData(image, 0, 0);
+  }, [snapshot]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: "0.75rem",
+          color: "#cbd5f5"
+        }}
+      >
+        <span>Phase alignment heatmap</span>
+        <span>
+          {snapshot.min.toFixed(3)} – {snapshot.max.toFixed(3)}
+        </span>
+      </div>
+      <canvas
+        ref={canvasRef}
+        width={snapshot.width}
+        height={snapshot.height}
+        style={{
+          width: "160px",
+          height: "160px",
+          borderRadius: "0.6rem",
+          border: "1px solid rgba(148,163,184,0.35)",
+          background: "rgba(15,23,42,0.35)"
+        }}
+      />
+    </div>
+  );
 };
 
 function SliderControl({

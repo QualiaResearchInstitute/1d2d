@@ -1,0 +1,58 @@
+{
+  "width": 256,
+  "height": 256,
+  "preset": "Rainbow Rims + DMT Kernel Effects",
+  "timestamp": "2025-10-07T10:40:00.966Z",
+  "metrics": {
+    "rim": {
+      "mean": 0.2713195510249252,
+      "std": 0.19897725704810845,
+      "max": 3.442372491421044,
+      "count": 5277
+    },
+    "warp": {
+      "mean": 0.05719568721304084,
+      "std": 0.029787491338875864,
+      "dominantAngle": 0.0037276788122762423,
+      "count": 65536
+    },
+    "gradient": {
+      "gradMean": 0.05719568721304084,
+      "gradStd": 0.029787491338875864,
+      "vortMean": -1.6429903079168829e-22,
+      "vortStd": 9.554140931009417e-18,
+      "cohMean": 0.7942690923673581,
+      "cohStd": 0.04257203554706451,
+      "sampleCount": 65536
+    },
+    "compositor": {
+      "effectiveBlend": 0.5800000000000001,
+      "surfaceMean": 0,
+      "surfaceMax": 0,
+      "surfaceCount": 0
+    }
+  },
+  "obsAverage": 0.10116634438555858,
+  "kurParams": {
+    "alphaKur": 0.2,
+    "gammaKur": 0.15,
+    "omega0": 0,
+    "K0": 0.6,
+    "epsKur": 0.002,
+    "fluxX": 0,
+    "fluxY": 0
+  },
+  "canonicalParams": {
+    "edgeThreshold": 0.08,
+    "blend": 0.39,
+    "dmt": 0.2,
+    "thetaMode": "gradient",
+    "thetaGlobal": 0,
+    "beta2": 1.9,
+    "jitter": 1.16,
+    "sigma": 4,
+    "microsaccade": true,
+    "speed": 1.32,
+    "contrast": 1.62
+  }
+}

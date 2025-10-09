@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "build/tests",
+    "allowJs": false,
+    "noEmit": false,
+    "rootDir": "."
+  },
+  "include": ["src/fields/**/*.ts", "src/validation/**/*.ts", "tests/**/*.ts", "tests/**/*.d.ts"],
+  "exclude": []
+}

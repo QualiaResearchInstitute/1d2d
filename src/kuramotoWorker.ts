@@ -172,7 +172,7 @@ const handleTick = (msg: TickMessage) => {
 const handleInit = (msg: InitMessage) => {
   width = msg.width;
   height = msg.height;
-  params = { fluxX: 0, fluxY: 0, ...msg.params };
+  params = { ...msg.params };
   ensureState(width, height);
   ensureRand(msg.seed);
   bufferPool = [...msg.buffers];
@@ -189,7 +189,7 @@ const handleReset = (msg: ResetMessage) => {
 
 const handleSimulate = (msg: SimulateMessage) => {
   const simState = createKuramotoState(msg.width, msg.height);
-  const simParams = { fluxX: 0, fluxY: 0, ...msg.params };
+  const simParams = { ...msg.params };
   const simRand = createNormalGenerator(msg.seed);
   initKuramotoState(simState, msg.qInit);
   const size = derivedBufferSize(msg.width, msg.height);
@@ -229,7 +229,7 @@ ctx.onmessage = (event: MessageEvent<IncomingMessage>) => {
       handleTick(msg);
       break;
     case "updateParams":
-      params = { fluxX: 0, fluxY: 0, ...msg.params };
+      params = { ...msg.params };
       break;
     case "kernelSpec":
       kernelSpec = clampKernelSpec(msg.spec);

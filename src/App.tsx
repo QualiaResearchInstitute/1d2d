@@ -733,7 +733,7 @@ export default function App() {
   const [phaseHeatmapSnapshot, setPhaseHeatmapSnapshot] = useState<PhaseHeatmapSnapshot | null>(null);
   const [selectedSyntheticCase, setSelectedSyntheticCase] = useState<SyntheticCaseId>("circles");
   const [syntheticBaselines, setSyntheticBaselines] = useState<
-    Record<SyntheticCaseId, { metrics: RainbowFrameMetrics; timestamp: number }>
+    Partial<Record<SyntheticCaseId, { metrics: RainbowFrameMetrics; timestamp: number }>>
   >({});
   const markFieldFresh = useCallback(
     (kind: FieldKind, resolution: FieldResolution, source: string) => {
@@ -965,11 +965,8 @@ export default function App() {
         acc[field] = { energy: 0, blend: 0, share: 0, weight: 0 };
         return acc;
       }, {} as Record<ComposerFieldId, { energy: number; blend: number; share: number; weight: number }>);
-      let lastComposer: ComposerTelemetry | null = null;
       history.forEach((entry) => {
         const telemetry = entry.metrics.composer;
-        if (!telemetry) return;
-        lastComposer = telemetry;
         COMPOSER_FIELD_LIST.forEach((field) => {
           accum[field].energy += telemetry.fields[field].energy;
           accum[field].blend += telemetry.fields[field].blend;
@@ -977,7 +974,7 @@ export default function App() {
           accum[field].weight = telemetry.fields[field].weight;
         });
       });
-      if (!lastComposer) return;
+      const lastComposer = history[history.length - 1].metrics.composer;
       const count = history.length;
       const snapshot: TelemetrySnapshot = {
         fields: {} as Record<ComposerFieldId, TelemetryFieldSnapshot>,
@@ -2527,12 +2524,7 @@ export default function App() {
       { label: "scene-B", time: 0.37 },
       { label: "scene-C", time: 0.73 }
     ];
-    const results: {
-      label: string;
-      mismatched: number;
-      percent: number;
-      maxDelta: number;
-    }[] = [];
+    const results: ParitySceneSummary[] = [];
     const prevLastObs = lastObsRef.current;
 
     try {

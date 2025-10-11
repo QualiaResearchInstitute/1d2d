@@ -5,6 +5,7 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
 ---
 
 ## System Data Flow (Phase 8)
+
 - **Diagram:** `docs/diagrams/phase8_data_flow.mmd` (Mermaid). Render it via [Mermaid Live Editor](https://mermaid.live/) or your docs tooling.
 - **Pipeline narrative**
   1. **UI intake** – image upload & preset surface in `src/App.tsx`.
@@ -17,6 +18,7 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
 ---
 
 ## Telemetry & Instrumentation
+
 - **Runtime toggles (Diagnostics panel):**
   - `Telemetry logging` streams `KuramotoTelemetrySnapshot` objects to the console or telemetry hook.
   - `Frame metric logging` expands logs with histogram-friendly `RainbowFrameMetrics`.
@@ -38,6 +40,7 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
 ---
 
 ## DMT & Arousal Tuning Playbook
+
 1. **Establish a baseline**
    - Capture the current canonical metrics (`npm run baseline`) and stash the render for visual reference.
    - Record operator gains for `d=0.2, a=0.2` via `getThinElementOperatorGains` to anchor expectations.
@@ -67,6 +70,7 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
 ---
 
 ## Ops Runbook (Rollback & Histogram Analysis)
+
 - **Pre-deploy checklist**
   - Ensure `npm run baseline:check` passes locally.
   - Attach `dist/cross-tier/latest.json` to the change review.
@@ -87,6 +91,7 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
   - Reference all 17 wallpaper symmetry groups when classifying texture tiles (cheat sheet below).
 
 ### Wallpaper Symmetry Group Reference
+
 - `p1` – translations only; no rotational or mirror symmetry.
 - `p2` – translations with 2-fold (180°) rotations.
 - `pm` – translations and parallel mirror lines.
@@ -108,6 +113,7 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
 ---
 
 ## Knowledge Base & Diagram Index
+
 - `docs/diagrams/phase8_data_flow.mmd` – authoritative Phase 8 flow.
 - `overview.md` – end-user control reference (link from onboarding emails).
 - `part1.md` / `part2.md` – React implementation walkthrough; they remain current as of commit `[phase8-docs]`.
@@ -116,6 +122,7 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
 ---
 
 ## Validation Walkthrough Log
+
 - **Checklist for reviewers**
   - [ ] Read “System Data Flow” and trace each box in code (`edgeDetection.ts`, `kuramotoCore.ts`, `rainbowFrame.ts`).
   - [ ] Dry-run telemetry scripts (`npm run baseline`, `npm run cross-tier:check`) or table-top review if Node.js unavailable locally.

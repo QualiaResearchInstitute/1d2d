@@ -1,15 +1,15 @@
-declare module "node:fs" {
+declare module 'node:fs' {
   export function mkdirSync(path: string, options?: { recursive?: boolean }): void;
   export function writeFileSync(path: string, data: string | NodeJS.ArrayBufferView): void;
-  export function readFileSync(path: string, encoding: "utf8"): string;
+  export function readFileSync(path: string, encoding: 'utf8'): string;
 }
 
-declare module "node:path" {
+declare module 'node:path' {
   export function join(...parts: string[]): string;
   export function dirname(path: string): string;
 }
 
-declare module "node:url" {
+declare module 'node:url' {
   export function fileURLToPath(url: string | URL): string;
 }
 

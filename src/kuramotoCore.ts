@@ -1,10 +1,24 @@
-import { makeResolution, type FieldResolution, type PhaseField, type VolumeField } from "./fields/contracts.js";
-import { OpticalFieldManager, OpticalFieldFrame, type OpticalFieldMetadata } from "./fields/opticalField.js";
-import { KERNEL_SPEC_DEFAULT, cloneKernelSpec, type KernelSpec } from "./kernel/kernelSpec.js";
-export type { PhaseField, VolumeField } from "./fields/contracts.js";
+import {
+  makeResolution,
+  type FieldResolution,
+  type PhaseField,
+  type VolumeField,
+} from './fields/contracts.js';
+import {
+  OpticalFieldManager,
+  OpticalFieldFrame,
+  type OpticalFieldMetadata,
+} from './fields/opticalField.js';
+import {
+  KERNEL_SPEC_DEFAULT,
+  COUPLING_KERNEL_PRESETS,
+  cloneKernelSpec,
+  type CouplingKernelParams,
+  type KernelSpec,
+} from './kernel/kernelSpec.js';
+export type { PhaseField, VolumeField } from './fields/contracts.js';
 
-const clamp = (v: number, lo: number, hi: number) =>
-  Math.max(lo, Math.min(hi, v));
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 const clamp01 = (v: number) => clamp(v, 0, 1);
 
@@ -13,6 +27,78 @@ const wrapAngle = (a: number) => {
   while (ang > Math.PI) ang -= 2 * Math.PI;
   while (ang <= -Math.PI) ang += 2 * Math.PI;
   return ang;
+};
+
+const mulberry32 = (seed: number) => {
+  let t = seed >>> 0;
+  return () => {
+    t += 0x6d2b79f5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+};
+
+type SmallWorldRewiring = {
+  degree: number;
+  targets: Int32Array;
+};
+
+const SMALL_WORLD_DEFAULT_DEGREE = 12;
+const SMALL_WORLD_MAX_DEGREE = 64;
+const SMALL_WORLD_CACHE = new Map<string, SmallWorldRewiring>();
+
+const clampSmallWorldDegree = (value: number) => {
+  if (!Number.isFinite(value)) return 0;
+  if (value <= 0) return 0;
+  const degree = Math.floor(value);
+  return Math.max(1, Math.min(SMALL_WORLD_MAX_DEGREE, degree));
+};
+
+export const createSmallWorldRewiring = (
+  width: number,
+  height: number,
+  degree: number,
+  seed: number,
+): SmallWorldRewiring => {
+  const clampedDegree = clampSmallWorldDegree(degree);
+  if (clampedDegree === 0) {
+    return { degree: 0, targets: new Int32Array(0) };
+  }
+  const total = width * height;
+  const targets = new Int32Array(total * clampedDegree);
+  if (total <= 1) {
+    targets.fill(0);
+    return { degree: clampedDegree, targets };
+  }
+  const rng = mulberry32(seed);
+  for (let idx = 0; idx < total; idx++) {
+    const offset = idx * clampedDegree;
+    for (let edge = 0; edge < clampedDegree; edge++) {
+      let candidate = Math.floor(rng() * total);
+      if (candidate === idx) {
+        candidate = (candidate + 1) % total;
+      }
+      targets[offset + edge] = candidate;
+    }
+  }
+  return { degree: clampedDegree, targets };
+};
+
+const getSmallWorldRewiring = (
+  width: number,
+  height: number,
+  degree: number,
+  seed: number,
+): SmallWorldRewiring | null => {
+  const clampedDegree = clampSmallWorldDegree(degree);
+  if (clampedDegree === 0) return null;
+  const key = `${width}x${height}:${clampedDegree}:${seed}`;
+  const cached = SMALL_WORLD_CACHE.get(key);
+  if (cached) return cached;
+  const rewiring = createSmallWorldRewiring(width, height, clampedDegree, seed);
+  SMALL_WORLD_CACHE.set(key, rewiring);
+  return rewiring;
 };
 
 export const IRRADIANCE_FRAME_SCHEMA_VERSION = 1 as const;
@@ -74,25 +160,30 @@ export type KuramotoInstrumentationSnapshot = {
   irradiance: KuramotoIrradianceSnapshot;
 };
 
-export type ThinElementOperatorKind = "flux" | "amplitude" | "phase";
+export type ThinElementOperatorKind = 'flux' | 'amplitude' | 'phase';
 
 /**
  * Canonical ordering for thin-element operators applied during phase/flux derivation.
  * Consumers should respect this order when constructing custom schedules to ensure that
  * amplitude updates run before phase gradients and that any flux phase masks execute first.
  */
-export const THIN_ELEMENT_OPERATOR_ORDER = ["flux", "amplitude", "phase"] as const;
+export const THIN_ELEMENT_OPERATOR_ORDER = ['flux', 'amplitude', 'phase'] as const;
 
 export type ThinElementOperatorControls = {
   dmt?: number;
   arousal?: number;
 };
 
-export type BeamSplitRecombine = "sum" | "average" | "energy";
+export type BeamSplitRecombine = 'sum' | 'average' | 'energy';
 
 export type ThinElementOperatorStep =
-  | { kind: "operator"; operator: ThinElementOperatorKind; label?: string }
-  | { kind: "beamSplit"; branches: readonly BeamSplitBranch[]; recombine?: BeamSplitRecombine; label?: string };
+  | { kind: 'operator'; operator: ThinElementOperatorKind; label?: string }
+  | {
+      kind: 'beamSplit';
+      branches: readonly BeamSplitBranch[];
+      recombine?: BeamSplitRecombine;
+      label?: string;
+    };
 
 export type ThinElementSchedule = readonly ThinElementOperatorStep[];
 
@@ -110,6 +201,11 @@ export type KuramotoParams = {
   epsKur: number;
   fluxX: number;
   fluxY: number;
+  smallWorldWeight: number;
+  p_sw: number;
+  smallWorldEnabled?: boolean;
+  smallWorldDegree?: number;
+  smallWorldSeed?: number;
 };
 
 export type KuramotoState = {
@@ -153,6 +249,97 @@ type FluxOperator = {
   coupling: (x: number, y: number, idx: number) => FluxCoupling;
 };
 
+type CouplingKernelTable = {
+  key: string;
+  params: CouplingKernelParams;
+  radius: number;
+  selfWeight: number;
+  offsetsX: Int16Array;
+  offsetsY: Int16Array;
+  weights: Float32Array;
+  orientations: Float32Array;
+};
+
+const COUPLING_KERNEL_CACHE = new Map<string, CouplingKernelTable>();
+
+const clampRadius = (value: number) => Math.max(0, Math.floor(value));
+
+export const computeCouplingWeight = (distance: number, params: CouplingKernelParams): number => {
+  if (!Number.isFinite(distance) || distance > params.radius) return 0;
+  const gaussian = (gain: number, sigma: number) => {
+    if (gain === 0) return 0;
+    if (sigma <= 0) return 0;
+    const scaled = distance / sigma;
+    return gain * Math.exp(-0.5 * scaled * scaled);
+  };
+  const far = gaussian(params.farGain, params.farSigma);
+  const near = gaussian(params.nearGain, params.nearSigma);
+  return params.baseGain + far - near;
+};
+
+export const computeCouplingWeights = (
+  distances: ArrayLike<number>,
+  params: CouplingKernelParams,
+  out?: Float32Array,
+): Float32Array => {
+  const target = out ?? new Float32Array(distances.length);
+  for (let i = 0; i < distances.length; i++) {
+    target[i] = computeCouplingWeight(distances[i], params);
+  }
+  return target;
+};
+
+const buildCouplingKernelTable = (params: CouplingKernelParams): CouplingKernelTable => {
+  const radius = clampRadius(params.radius);
+  const offsetsX: number[] = [];
+  const offsetsY: number[] = [];
+  const weights: number[] = [];
+  const orientations: number[] = [];
+  let centerWeight = computeCouplingWeight(0, params);
+  let l1 = Math.abs(centerWeight);
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const distance = Math.hypot(dx, dy);
+      if (distance > radius + 1e-6) continue;
+      const weight = computeCouplingWeight(distance, params);
+      if (Math.abs(weight) < 1e-5) continue;
+      offsetsX.push(dx);
+      offsetsY.push(dy);
+      weights.push(weight);
+      l1 += Math.abs(weight);
+      const denom = dx * dx + dy * dy;
+      orientations.push(denom === 0 ? 0 : (dx * dx - dy * dy) / denom);
+    }
+  }
+  if (params.normalization === 'l1' && l1 > 0) {
+    const inv = 1 / l1;
+    centerWeight *= inv;
+    for (let i = 0; i < weights.length; i++) {
+      weights[i] *= inv;
+    }
+  }
+  return {
+    key: `${params.preset}:${params.radius}:${params.nearSigma}:${params.nearGain}:${params.farSigma}:${params.farGain}:${params.baseGain}:${params.normalization}`,
+    params,
+    radius,
+    selfWeight: centerWeight,
+    offsetsX: Int16Array.from(offsetsX),
+    offsetsY: Int16Array.from(offsetsY),
+    weights: Float32Array.from(weights),
+    orientations: Float32Array.from(orientations),
+  };
+};
+
+const getCouplingKernelTable = (params: CouplingKernelParams): CouplingKernelTable => {
+  const key = `${params.preset}:${params.radius}:${params.nearSigma}:${params.nearGain}:${params.farSigma}:${params.farGain}:${params.baseGain}:${params.normalization}`;
+  const cached = COUPLING_KERNEL_CACHE.get(key);
+  if (cached) return cached;
+  const table = buildCouplingKernelTable(params);
+  COUPLING_KERNEL_CACHE.set(key, table);
+  return table;
+};
+
 const wrapIndex = (x: number, y: number, width: number, height: number) => {
   const xx = ((x % width) + width) % width;
   const yy = ((y % height) + height) % height;
@@ -164,13 +351,13 @@ const controlValue = (value: number | undefined) => clamp01(value ?? 0);
 const cloneOpticalMeta = (meta: OpticalFieldMetadata): OpticalFieldMetadata => ({
   ...meta,
   phaseOrigin: meta.phaseOrigin ? { ...meta.phaseOrigin } : undefined,
-  userTags: meta.userTags ? { ...meta.userTags } : undefined
+  userTags: meta.userTags ? { ...meta.userTags } : undefined,
 });
 
 export const createIrradianceFrameBuffer = (
   width: number,
   height: number,
-  initialMeta: OpticalFieldMetadata
+  initialMeta: OpticalFieldMetadata,
 ): IrradianceFrameBuffer => {
   const resolution = makeResolution(width, height);
   const texels = resolution.texels;
@@ -185,7 +372,7 @@ export const createIrradianceFrameBuffer = (
     S: buffer.subarray(texels * 2, texels * 3),
     opticalMeta: cloneOpticalMeta(initialMeta),
     kernel: cloneKernelSpec(KERNEL_SPEC_DEFAULT),
-    kernelVersion: 0
+    kernelVersion: 0,
   };
 };
 
@@ -200,18 +387,18 @@ export const createTelemetrySnapshot = (): KuramotoTelemetrySnapshot => ({
     phase: 0,
     real: 0,
     imag: 0,
-    sampleCount: 0
+    sampleCount: 0,
   },
   interference: {
     mean: 0,
     variance: 0,
-    max: 0
-  }
+    max: 0,
+  },
 });
 
 const computeOperatorGains = (
   kernel: KernelSpec,
-  controls?: ThinElementOperatorControls
+  controls?: ThinElementOperatorControls,
 ): OperatorGains => {
   const d = controlValue(controls?.dmt);
   const a = controlValue(controls?.arousal);
@@ -231,7 +418,7 @@ const computeOperatorGains = (
 
   const transparency = Math.max(
     0,
-    1 + 0.55 * (kernel.transparency - transparencyBaseline) + 0.25 * d
+    1 + 0.55 * (kernel.transparency - transparencyBaseline) + 0.25 * d,
   );
 
   return { flux, amplitude, phase, transparency };
@@ -239,7 +426,7 @@ const computeOperatorGains = (
 
 export const getThinElementOperatorGains = (
   kernel: KernelSpec,
-  controls?: ThinElementOperatorControls
+  controls?: ThinElementOperatorControls,
 ) => computeOperatorGains(kernel, controls);
 
 const ensureThetaScratch = (scratch: ThinElementScratch, size: number) => {
@@ -264,7 +451,7 @@ const computeVorticityScale = (gains: OperatorGains, kernel: KernelSpec) => {
 const applyFluxPhaseMask = (
   field: OpticalFieldFrame,
   params: KuramotoParams,
-  gains: OperatorGains
+  gains: OperatorGains,
 ) => {
   const { fluxX = 0, fluxY = 0 } = params;
   if (fluxX === 0 && fluxY === 0) return;
@@ -295,81 +482,127 @@ const createFluxOperator = (
   field: OpticalFieldFrame,
   params: KuramotoParams,
   kernel: KernelSpec,
-  gains: OperatorGains
+  gains: OperatorGains,
 ): FluxOperator => {
   const { width, height } = field.resolution;
   const real = field.real;
   const imag = field.imag;
   const { fluxX = 0, fluxY = 0 } = params;
-  const cosFluxX = Math.cos(fluxX);
-  const sinFluxX = Math.sin(fluxX);
-  const cosFluxY = Math.cos(fluxY);
-  const sinFluxY = Math.sin(fluxY);
-  const sinNegFluxX = -sinFluxX;
-  const sinNegFluxY = -sinFluxY;
   const hasFluxX = fluxX !== 0;
   const hasFluxY = fluxY !== 0;
   const fluxScale = 0.2 * gains.flux;
-
+  const smallWorldEnabled = params.smallWorldEnabled ?? true;
+  const rawSmallWorldWeight = clamp(params.smallWorldWeight, 0, 4);
+  const baseSmallWorldWeight = smallWorldEnabled ? rawSmallWorldWeight : 0;
+  const pSwValue = clamp(params.p_sw, -0.5, 0.5);
+  const pSw = baseSmallWorldWeight !== 0 ? pSwValue : 0;
+  const smallWorldDegree = params.smallWorldDegree ?? SMALL_WORLD_DEFAULT_DEGREE;
+  const smallWorldSeed = params.smallWorldSeed ?? 0;
+  const smallWorldRewiring =
+    baseSmallWorldWeight !== 0 && pSw !== 0
+      ? getSmallWorldRewiring(width, height, smallWorldDegree, smallWorldSeed)
+      : null;
+  const smallWorldScale =
+    smallWorldRewiring && smallWorldRewiring.degree > 0
+      ? clamp(baseSmallWorldWeight * pSw, -4, 4)
+      : 0;
+  const smallWorldFactor =
+    smallWorldRewiring && smallWorldRewiring.degree > 0
+      ? smallWorldScale / smallWorldRewiring.degree
+      : 0;
+  const couplingPreset = kernel.couplingPreset;
+  const couplingParams: CouplingKernelParams =
+    COUPLING_KERNEL_PRESETS[couplingPreset] ?? COUPLING_KERNEL_PRESETS.dmt;
+  const table = getCouplingKernelTable(couplingParams);
+  const offsetsX = table.offsetsX;
+  const offsetsY = table.offsetsY;
+  const weights = table.weights;
+  const orientations = table.orientations;
+  const selfWeight = table.selfWeight;
   const anisBaseline = KERNEL_SPEC_DEFAULT.anisotropy;
   const anisBias = clamp(kernel.anisotropy - anisBaseline, -1, 1);
-  const weightX = 1 + 0.5 * anisBias;
-  const weightY = 1 - 0.5 * anisBias;
+  const anisScale = 0.6;
 
   return {
     coupling(x, y, idx) {
-      const left = wrapIndex(x - 1, y, width, height);
-      const right = wrapIndex(x + 1, y, width, height);
-      const up = wrapIndex(x, y - 1, width, height);
-      const down = wrapIndex(x, y + 1, width, height);
-      let leftR = real[left];
-      let leftI = imag[left];
-      let rightR = real[right];
-      let rightI = imag[right];
-      let upR = real[up];
-      let upI = imag[up];
-      let downR = real[down];
-      let downI = imag[down];
-      if (hasFluxX && x === width - 1) {
-        const zr = rightR;
-        const zi = rightI;
-        rightR = zr * cosFluxX - zi * sinFluxX;
-        rightI = zr * sinFluxX + zi * cosFluxX;
-      }
-      if (hasFluxX && x === 0) {
-        const zr = leftR;
-        const zi = leftI;
-        leftR = zr * cosFluxX - zi * sinNegFluxX;
-        leftI = zr * sinNegFluxX + zi * cosFluxX;
-      }
-      if (hasFluxY && y === height - 1) {
-        const zr = downR;
-        const zi = downI;
-        downR = zr * cosFluxY - zi * sinFluxY;
-        downI = zr * sinFluxY + zi * cosFluxY;
-      }
-      if (hasFluxY && y === 0) {
-        const zr = upR;
-        const zi = upI;
-        upR = zr * cosFluxY - zi * sinNegFluxY;
-        upI = zr * sinNegFluxY + zi * cosFluxY;
-      }
       const selfR = real[idx];
       const selfI = imag[idx];
-      const sumR = selfR + weightX * (leftR + rightR) + weightY * (upR + downR);
-      const sumI = selfI + weightX * (leftI + rightI) + weightY * (upI + downI);
+      let sumR = selfWeight * selfR;
+      let sumI = selfWeight * selfI;
+      for (let i = 0; i < weights.length; i++) {
+        const baseWeight = weights[i];
+        const orientation = orientations[i];
+        const weight =
+          anisBias === 0 ? baseWeight : baseWeight * (1 + anisScale * anisBias * orientation);
+        let nx = x + offsetsX[i];
+        let ny = y + offsetsY[i];
+        let phaseShift = 0;
+        let wraps = 0;
+        while (nx < 0) {
+          nx += width;
+          wraps -= 1;
+        }
+        while (nx >= width) {
+          nx -= width;
+          wraps += 1;
+        }
+        if (wraps !== 0 && hasFluxX) {
+          phaseShift += wraps * fluxX;
+        }
+        wraps = 0;
+        while (ny < 0) {
+          ny += height;
+          wraps -= 1;
+        }
+        while (ny >= height) {
+          ny -= height;
+          wraps += 1;
+        }
+        if (wraps !== 0 && hasFluxY) {
+          phaseShift += wraps * fluxY;
+        }
+        const neighborIdx = ny * width + nx;
+        let nr = real[neighborIdx];
+        let ni = imag[neighborIdx];
+        if (phaseShift !== 0) {
+          const cos = Math.cos(phaseShift);
+          const sin = Math.sin(phaseShift);
+          const rotR = nr * cos - ni * sin;
+          const rotI = nr * sin + ni * cos;
+          nr = rotR;
+          ni = rotI;
+        }
+        sumR += weight * nr;
+        sumI += weight * ni;
+      }
+      if (smallWorldRewiring && smallWorldFactor !== 0) {
+        // This executes only when small-world coupling is active. We accumulate the mean
+        // long-range delta to gently bias the oscillator toward (or away from) distant peers.
+        const offset = idx * smallWorldRewiring.degree;
+        let deltaR = 0;
+        let deltaI = 0;
+        for (let edge = 0; edge < smallWorldRewiring.degree; edge++) {
+          const targetIdx = smallWorldRewiring.targets[offset + edge];
+          const nr = real[targetIdx];
+          const ni = imag[targetIdx];
+          deltaR += nr - selfR;
+          deltaI += ni - selfI;
+        }
+        sumR += smallWorldFactor * deltaR;
+        sumI += smallWorldFactor * deltaI;
+      }
       return {
         Hr: fluxScale * sumR,
-        Hi: fluxScale * sumI
+        Hi: fluxScale * sumI,
       };
-    }
+    },
   };
 };
 
 const applyAmplitudeOperator = (
   field: OpticalFieldFrame,
   phase: PhaseField,
-  gains: OperatorGains
+  gains: OperatorGains,
 ) => {
   const { amp, coh } = phase;
   const { real, imag } = field;
@@ -386,7 +619,7 @@ const applyPhaseOperator = (
   phase: PhaseField,
   gains: OperatorGains,
   kernel: KernelSpec,
-  scratch: ThinElementScratch
+  scratch: ThinElementScratch,
 ) => {
   const { gradX, gradY, vort } = phase;
   const { width, height } = field.resolution;
@@ -436,14 +669,15 @@ type ThinElementExecutionContext = {
 
 const applyOperatorKind = (kind: ThinElementOperatorKind, ctx: ThinElementExecutionContext) => {
   switch (kind) {
-    case "flux":
+    case 'flux':
       if (ctx.params) applyFluxPhaseMask(ctx.field, ctx.params, ctx.gains);
       break;
-    case "amplitude":
+    case 'amplitude':
       if (ctx.derived) applyAmplitudeOperator(ctx.field, ctx.derived, ctx.gains);
       break;
-    case "phase":
-      if (ctx.derived) applyPhaseOperator(ctx.field, ctx.derived, ctx.gains, ctx.kernel, ctx.scratch);
+    case 'phase':
+      if (ctx.derived)
+        applyPhaseOperator(ctx.field, ctx.derived, ctx.gains, ctx.kernel, ctx.scratch);
       break;
     default:
       // no-op
@@ -452,11 +686,11 @@ const applyOperatorKind = (kind: ThinElementOperatorKind, ctx: ThinElementExecut
 };
 
 const executeBeamSplitStep = (
-  step: Extract<ThinElementOperatorStep, { kind: "beamSplit" }>,
-  ctx: ThinElementExecutionContext
+  step: Extract<ThinElementOperatorStep, { kind: 'beamSplit' }>,
+  ctx: ThinElementExecutionContext,
 ) => {
   const { field } = ctx;
-  const { branches, recombine = "sum" } = step;
+  const { branches, recombine = 'sum' } = step;
   if (!branches.length) return;
   const resolution = field.resolution;
   const texels = resolution.texels;
@@ -478,7 +712,7 @@ const executeBeamSplitStep = (
       params: ctx.params,
       kernel: ctx.kernel,
       gains: ctx.gains,
-      scratch: {}
+      scratch: {},
     };
     executeThinElementSchedule(branch.steps, branchCtx);
     const branchReal = branchFrame.real;
@@ -491,13 +725,13 @@ const executeBeamSplitStep = (
 
   let norm = 1;
   switch (recombine) {
-    case "average":
+    case 'average':
       if (weightSum !== 0) norm = 1 / weightSum;
       break;
-    case "energy":
+    case 'energy':
       if (weightSqSum !== 0) norm = 1 / Math.sqrt(weightSqSum);
       break;
-    case "sum":
+    case 'sum':
     default:
       norm = 1;
       break;
@@ -513,34 +747,34 @@ const executeBeamSplitStep = (
 
 const executeThinElementSchedule = (
   schedule: ThinElementSchedule,
-  ctx: ThinElementExecutionContext
+  ctx: ThinElementExecutionContext,
 ) => {
   for (const step of schedule) {
-    if (step.kind === "operator") {
+    if (step.kind === 'operator') {
       applyOperatorKind(step.operator, ctx);
-    } else if (step.kind === "beamSplit") {
+    } else if (step.kind === 'beamSplit') {
       executeBeamSplitStep(step, ctx);
     }
   }
 };
 
 const DEFAULT_PHASE_SCHEDULE: ThinElementSchedule = [
-  { kind: "operator", operator: "amplitude" },
-  { kind: "operator", operator: "phase" }
+  { kind: 'operator', operator: 'amplitude' },
+  { kind: 'operator', operator: 'phase' },
 ] as const;
 
 export const createKuramotoState = (
   width: number,
   height: number,
-  manager?: OpticalFieldManager
+  manager?: OpticalFieldManager,
 ): KuramotoState => {
   const resolution = makeResolution(width, height);
   const fieldManager =
     manager ??
     new OpticalFieldManager({
-      solver: "kuramoto",
+      solver: 'kuramoto',
       resolution,
-      initialFrameId: 0
+      initialFrameId: 0,
     });
   const frame = fieldManager.acquireFrame();
   const telemetry = createTelemetrySnapshot();
@@ -554,7 +788,7 @@ export const createKuramotoState = (
     Zr: frame.real,
     Zi: frame.imag,
     telemetry,
-    irradiance
+    irradiance,
   };
 };
 
@@ -566,7 +800,7 @@ export const derivedBufferSize = (width: number, height: number) =>
 export const createDerivedViews = (
   buffer: ArrayBuffer,
   width: number,
-  height: number
+  height: number,
 ): PhaseField => {
   const total = width * height;
   const view = new Float32Array(buffer);
@@ -576,13 +810,13 @@ export const createDerivedViews = (
   const coh = view.subarray(total * 3, total * 4);
   const amp = view.subarray(total * 4, total * 5);
   return {
-    kind: "phase",
+    kind: 'phase',
     resolution: makeResolution(width, height),
     gradX,
     gradY,
     vort,
     coh,
-    amp
+    amp,
   };
 };
 
@@ -635,7 +869,7 @@ export const stepKuramotoState = (
   dt: number,
   randn: () => number,
   timestamp?: number,
-  options?: ThinElementOperatorOptions
+  options?: ThinElementOperatorOptions,
 ): KuramotoStepResult => {
   const { width, height, Zr, Zi } = state;
   const { alphaKur, gammaKur, omega0, K0, epsKur } = params;
@@ -651,7 +885,7 @@ export const stepKuramotoState = (
       params,
       kernel,
       gains,
-      scratch: {}
+      scratch: {},
     });
   }
 
@@ -747,12 +981,12 @@ export const stepKuramotoState = (
 
   return {
     telemetry,
-    irradiance
+    irradiance,
   };
 };
 
 export const createKuramotoInstrumentationSnapshot = (
-  state: KuramotoState
+  state: KuramotoState,
 ): KuramotoInstrumentationSnapshot => ({
   telemetry: {
     frameId: state.telemetry.frameId,
@@ -765,27 +999,27 @@ export const createKuramotoInstrumentationSnapshot = (
       phase: state.telemetry.orderParameter.phase,
       real: state.telemetry.orderParameter.real,
       imag: state.telemetry.orderParameter.imag,
-      sampleCount: state.telemetry.orderParameter.sampleCount
+      sampleCount: state.telemetry.orderParameter.sampleCount,
     },
     interference: {
       mean: state.telemetry.interference.mean,
       variance: state.telemetry.interference.variance,
-      max: state.telemetry.interference.max
-    }
+      max: state.telemetry.interference.max,
+    },
   },
   irradiance: {
     exposureSeconds: state.irradiance.exposureSeconds,
     foveaPx: [state.irradiance.foveaPx[0], state.irradiance.foveaPx[1]],
     kernelVersion: state.irradiance.kernelVersion,
     kernel: cloneKernelSpec(state.irradiance.kernel),
-    opticalMeta: cloneOpticalMeta(state.irradiance.opticalMeta)
-  }
+    opticalMeta: cloneOpticalMeta(state.irradiance.opticalMeta),
+  },
 });
 
 export const deriveKuramotoFields = (
   state: KuramotoState,
   phase: PhaseField,
-  options?: ThinElementOperatorOptions
+  options?: ThinElementOperatorOptions,
 ) => {
   const kernel = options?.kernel ?? KERNEL_SPEC_DEFAULT;
   const gains = computeOperatorGains(kernel, options?.controls);
@@ -796,19 +1030,9 @@ export const deriveKuramotoFields = (
     params: options?.params,
     kernel,
     gains,
-    scratch: {}
+    scratch: {},
   };
   executeThinElementSchedule(schedule, context);
-};
-
-const mulberry32 = (seed: number) => {
-  let t = seed >>> 0;
-  return () => {
-    t += 0x6d2b79f5;
-    let r = Math.imul(t ^ (t >>> 15), 1 | t);
-    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
 };
 
 export const createNormalGenerator = (seed?: number) => {
@@ -855,10 +1079,10 @@ export const snapshotVolumeField = (state: KuramotoState): VolumeField => {
     }
   }
   return {
-    kind: "volume",
+    kind: 'volume',
     resolution: makeResolution(width, height),
     phase,
     depth,
-    intensity
+    intensity,
   };
 };

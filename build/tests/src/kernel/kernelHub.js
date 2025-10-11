@@ -9,7 +9,15 @@ const EPS = 1e-6;
 const computeChangedKeys = (prev, next) => {
     const keys = [];
     Object.keys(prev).forEach((key) => {
-        if (Math.abs(prev[key] - next[key]) > EPS) {
+        const prevValue = prev[key];
+        const nextValue = next[key];
+        if (typeof prevValue === "number" && typeof nextValue === "number") {
+            if (Math.abs(prevValue - nextValue) > EPS) {
+                keys.push(key);
+            }
+            return;
+        }
+        if (prevValue !== nextValue) {
             keys.push(key);
         }
     });
@@ -60,7 +68,7 @@ export class KernelSpecHub {
             version: 0,
             timestamp: now(),
             source,
-            changed: ["gain", "k0", "Q", "anisotropy", "chirality", "transparency"]
+            changed: ["gain", "k0", "Q", "anisotropy", "chirality", "transparency", "couplingPreset"]
         };
         this.subscribers = new Set();
         this.pendingEvent = null;

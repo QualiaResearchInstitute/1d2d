@@ -3,11 +3,11 @@ import {
   cloneKernelSpec,
   getDefaultKernelSpec,
   type KernelSpec,
-  type KernelSpecInit
-} from "./kernelSpec.js";
+  type KernelSpecInit,
+} from './kernelSpec.js';
 
 const now = () => {
-  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
     return performance.now();
   }
   return Date.now();
@@ -30,7 +30,15 @@ const EPS = 1e-6;
 const computeChangedKeys = (prev: KernelSpec, next: KernelSpec): (keyof KernelSpec)[] => {
   const keys: (keyof KernelSpec)[] = [];
   (Object.keys(prev) as (keyof KernelSpec)[]).forEach((key) => {
-    if (Math.abs(prev[key] - next[key]) > EPS) {
+    const prevValue = prev[key];
+    const nextValue = next[key];
+    if (typeof prevValue === 'number' && typeof nextValue === 'number') {
+      if (Math.abs(prevValue - nextValue) > EPS) {
+        keys.push(key);
+      }
+      return;
+    }
+    if (prevValue !== nextValue) {
       keys.push(key);
     }
   });
@@ -42,7 +50,7 @@ const cloneEvent = (event: KernelSpecEvent): KernelSpecEvent => ({
   version: event.version,
   timestamp: event.timestamp,
   source: event.source,
-  changed: [...event.changed]
+  changed: [...event.changed],
 });
 
 export class KernelSpecHub {
@@ -52,14 +60,14 @@ export class KernelSpecHub {
   private scheduled = false;
   private lastDispatchLatency = 0;
 
-  constructor(initial?: KernelSpecInit, source = "init") {
+  constructor(initial?: KernelSpecInit, source = 'init') {
     const base = clampKernelSpec(initial ?? getDefaultKernelSpec());
     this.snapshot = {
       spec: base,
       version: 0,
       timestamp: now(),
       source,
-      changed: ["gain", "k0", "Q", "anisotropy", "chirality", "transparency"]
+      changed: ['gain', 'k0', 'Q', 'anisotropy', 'chirality', 'transparency', 'couplingPreset'],
     };
     this.subscribers = new Set();
     this.pendingEvent = null;
@@ -89,8 +97,8 @@ export class KernelSpecHub {
       spec: merged,
       version: this.snapshot.version + 1,
       timestamp: now(),
-      source: options?.source ?? "unspecified",
-      changed
+      source: options?.source ?? 'unspecified',
+      changed,
     };
     this.snapshot = event;
     this.enqueueBroadcast(event);
@@ -125,7 +133,7 @@ export class KernelSpecHub {
       subscriberCount: this.subscribers.size,
       lastVersion: this.snapshot.version,
       lastSource: this.snapshot.source,
-      lastDispatchLatency: this.lastDispatchLatency
+      lastDispatchLatency: this.lastDispatchLatency,
     };
   }
 

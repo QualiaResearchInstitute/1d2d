@@ -7,35 +7,41 @@ import {
   initKuramotoState,
   stepKuramotoState,
   type KuramotoParams,
-  type PhaseField
-} from "../kuramotoCore.js";
-import { clampKernelSpec, cloneKernelSpec, KERNEL_SPEC_DEFAULT, type KernelSpec } from "../kernel/kernelSpec.js";
+  type PhaseField,
+} from '../kuramotoCore.js';
+import {
+  clampKernelSpec,
+  cloneKernelSpec,
+  KERNEL_SPEC_DEFAULT,
+  type KernelSpec,
+} from '../kernel/kernelSpec.js';
 import {
   createVolumeStubState,
   snapshotVolumeStub,
   stepVolumeStub,
-  type VolumeStubState
-} from "../volumeStub.js";
+  type VolumeStubState,
+} from '../volumeStub.js';
 import {
   makeResolution,
   type FieldResolution,
   type RimField,
   type SurfaceField,
-  type VolumeField
-} from "../fields/contracts.js";
+  type VolumeField,
+} from '../fields/contracts.js';
 import {
   createDefaultComposerConfig,
   renderRainbowFrame,
   type CouplingConfig,
-  type ComposerConfig
-} from "../pipeline/rainbowFrame.js";
+  type ComposerConfig,
+} from '../pipeline/rainbowFrame.js';
+import { createDefaultSu7RuntimeParams } from '../pipeline/su7/types.js';
 
-export type TierId = "rim1p5D" | "surface2D" | "volume2p5D";
+export type TierId = 'rim1p5D' | 'surface2D' | 'volume2p5D';
 
 const DEFAULT_HALF_LIVES: Record<TierId, number> = {
   rim1p5D: 0.65,
   surface2D: 1.0,
-  volume2p5D: 1.3
+  volume2p5D: 1.3,
 };
 
 const DEFAULT_WIDTH = 32;
@@ -56,7 +62,10 @@ const DEFAULT_KURAMOTO_PARAMS: KuramotoParams = {
   K0: 0.6,
   epsKur: 0.0015,
   fluxX: 0,
-  fluxY: 0
+  fluxY: 0,
+  smallWorldWeight: 0,
+  p_sw: 0,
+  smallWorldEnabled: false,
 };
 
 export type TierSeries = {
@@ -116,8 +125,8 @@ export type CrossTierScenarioOptions = {
 };
 
 export type CrossTierAlert =
-  | { kind: "coherence"; pair: PairwiseKey; value: number; threshold: number }
-  | { kind: "divergence"; tier: TierId; value: number; threshold: number };
+  | { kind: 'coherence'; pair: PairwiseKey; value: number; threshold: number }
+  | { kind: 'divergence'; tier: TierId; value: number; threshold: number };
 
 export type CrossTierValidationReport = {
   scenario: {
@@ -139,18 +148,20 @@ export type CrossTierValidationReport = {
   kernelDelta: {
     baseline: KernelSpec;
     variant: KernelSpec;
-    perTier: Record<TierId, {
-      baselineMean: number;
-      variantMean: number;
-      delta: number;
-      relativeDelta: number;
-    }>;
+    perTier: Record<
+      TierId,
+      {
+        baselineMean: number;
+        variantMean: number;
+        delta: number;
+        relativeDelta: number;
+      }
+    >;
   };
   alerts: CrossTierAlert[];
 };
 
-const pairKey = (a: TierId, b: TierId): PairwiseKey =>
-  a < b ? `${a}~${b}` : `${b}~${a}`;
+const pairKey = (a: TierId, b: TierId): PairwiseKey => (a < b ? `${a}~${b}` : `${b}~${a}`);
 
 const computeScale = (time: number, halfLife: number) => {
   if (!Number.isFinite(halfLife) || halfLife <= 1e-6) {
@@ -281,9 +292,9 @@ const cloneSurfaceField = (resolution: FieldResolution): SurfaceField => {
     }
   }
   return {
-    kind: "surface",
+    kind: 'surface',
     resolution,
-    rgba
+    rgba,
   };
 };
 
@@ -306,11 +317,11 @@ const cloneRimField = (resolution: FieldResolution): RimField => {
     }
   }
   return {
-    kind: "rim",
+    kind: 'rim',
     resolution,
     gx,
     gy,
-    mag
+    mag,
   };
 };
 
@@ -324,7 +335,7 @@ const buildBaseCoupling = (): CouplingConfig => ({
   kurToOrientation: 0.32,
   kurToChirality: 0.35,
   volumePhaseToHue: 0.52,
-  volumeDepthToWarp: 0.48
+  volumeDepthToWarp: 0.48,
 });
 
 const applyTierNoise = (value: number, tier: TierId, noise: NoiseOptions, rng: () => number) => {
@@ -339,7 +350,7 @@ const simulateScenarioRun = (
   kernelInput: KernelSpec,
   options: CrossTierScenarioOptions,
   noise: NoiseOptions,
-  seedOffset = 0
+  seedOffset = 0,
 ): CrossTierScenarioRun => {
   const width = options.width ?? DEFAULT_WIDTH;
   const height = options.height ?? DEFAULT_HEIGHT;
@@ -349,7 +360,7 @@ const simulateScenarioRun = (
   const halfLives: Record<TierId, number> = {
     rim1p5D: options.halfLives?.rim1p5D ?? DEFAULT_HALF_LIVES.rim1p5D,
     surface2D: options.halfLives?.surface2D ?? DEFAULT_HALF_LIVES.surface2D,
-    volume2p5D: options.halfLives?.volume2p5D ?? DEFAULT_HALF_LIVES.volume2p5D
+    volume2p5D: options.halfLives?.volume2p5D ?? DEFAULT_HALF_LIVES.volume2p5D,
   };
   const dmt = options.dmt ?? DEFAULT_DMT;
   const blend = options.blend ?? DEFAULT_BLEND;
@@ -372,7 +383,12 @@ const simulateScenarioRun = (
   const tiers: Record<TierId, TierSeries> = {
     rim1p5D: { raw: [], normalized: [], appliedScale: [], expectedHalfLife: halfLives.rim1p5D },
     surface2D: { raw: [], normalized: [], appliedScale: [], expectedHalfLife: halfLives.surface2D },
-    volume2p5D: { raw: [], normalized: [], appliedScale: [], expectedHalfLife: halfLives.volume2p5D }
+    volume2p5D: {
+      raw: [],
+      normalized: [],
+      appliedScale: [],
+      expectedHalfLife: halfLives.volume2p5D,
+    },
   };
 
   const out = new Uint8ClampedArray(width * height * 4);
@@ -384,14 +400,10 @@ const simulateScenarioRun = (
 
   for (let step = 0; step < steps; step++) {
     const t = step * dt;
-    stepKuramotoState(
-      kurState,
-      DEFAULT_KURAMOTO_PARAMS,
-      dt,
-      kurRandom,
-      (step + 1) * dt,
-      { kernel, controls: { dmt } }
-    );
+    stepKuramotoState(kurState, DEFAULT_KURAMOTO_PARAMS, dt, kurRandom, (step + 1) * dt, {
+      kernel,
+      controls: { dmt },
+    });
     deriveKuramotoFields(kurState, phaseField, { kernel, controls: { dmt } });
     stepVolumeStub(volumeStub, dt);
     const volumeField: VolumeField = snapshotVolumeStub(volumeStub);
@@ -410,8 +422,8 @@ const simulateScenarioRun = (
         surface: { ...composerTemplate.fields.surface, weight: Math.max(0.1, surfaceScale) },
         rim: { ...composerTemplate.fields.rim, weight: Math.max(0.1, rimScale) },
         kur: { ...composerTemplate.fields.kur },
-        volume: { ...composerTemplate.fields.volume, weight: Math.max(0.1, volumeScale) }
-      }
+        volume: { ...composerTemplate.fields.volume, weight: Math.max(0.1, volumeScale) },
+      },
     };
 
     const coupling: CouplingConfig = {
@@ -422,7 +434,7 @@ const simulateScenarioRun = (
       rimToSurfaceAlign: couplingBase.rimToSurfaceAlign * Math.max(0.4, surfaceScale + 0.2),
       surfaceToRimOffset: couplingBase.surfaceToRimOffset * Math.max(0.4, surfaceScale + 0.2),
       surfaceToRimSigma: couplingBase.surfaceToRimSigma * Math.max(0.4, surfaceScale + 0.2),
-      surfaceToRimHue: couplingBase.surfaceToRimHue * Math.max(0.4, surfaceScale + 0.2)
+      surfaceToRimHue: couplingBase.surfaceToRimHue * Math.max(0.4, surfaceScale + 0.2),
     };
 
     const result = renderRainbowFrame({
@@ -436,6 +448,7 @@ const simulateScenarioRun = (
       volume: volumeField,
       kernel,
       dmt,
+      arousal: 0,
       blend,
       normPin: true,
       normTarget: 0.6,
@@ -447,10 +460,10 @@ const simulateScenarioRun = (
       alive: false,
       phasePin: true,
       edgeThreshold: 0.18,
-      wallpaperGroup: "off",
+      wallpaperGroup: 'off',
       surfEnabled: true,
       orientationAngles,
-      thetaMode: "gradient",
+      thetaMode: 'gradient',
       thetaGlobal: 0,
       polBins: 16,
       jitter: 0.35,
@@ -459,26 +472,29 @@ const simulateScenarioRun = (
       contrast,
       rimAlpha: Math.max(DEFAULT_RIM_ALPHA_LO, rimScale),
       rimEnabled: true,
-      displayMode: "color",
+      displayMode: 'color',
       surfaceBlend: surfaceBlendBase * Math.max(0.2, surfaceScale),
-      surfaceRegion: "both",
+      surfaceRegion: 'both',
       warpAmp: 1.35,
+      curvatureStrength: 0,
+      curvatureMode: 'poincare',
       kurEnabled: true,
-      composer: composerConfig
+      su7: createDefaultSu7RuntimeParams(),
+      composer: composerConfig,
     });
 
-    const rimMetricRaw = applyTierNoise(result.metrics.rim.mean, "rim1p5D", noise, noiseGenerator);
+    const rimMetricRaw = applyTierNoise(result.metrics.rim.mean, 'rim1p5D', noise, noiseGenerator);
     const surfaceMetricRaw = applyTierNoise(
       result.metrics.compositor.surfaceMean,
-      "surface2D",
+      'surface2D',
       noise,
-      noiseGenerator
+      noiseGenerator,
     );
     const volumeMetricRaw = applyTierNoise(
       result.metrics.volume.intensityMean,
-      "volume2p5D",
+      'volume2p5D',
       noise,
-      noiseGenerator
+      noiseGenerator,
     );
 
     const readyMetric = (value: number, fallback: number) => {
@@ -505,7 +521,7 @@ const simulateScenarioRun = (
     tiers,
     dt,
     steps,
-    kernel: cloneKernelSpec(kernel)
+    kernel: cloneKernelSpec(kernel),
   };
 };
 
@@ -522,13 +538,13 @@ const buildTierReport = (series: TierSeries, dt: number): TierReport => {
     halfLifeError,
     raw: [...series.raw],
     normalized: [...series.normalized],
-    appliedScale: [...series.appliedScale]
+    appliedScale: [...series.appliedScale],
   };
 };
 
 const computePairwiseCoherence = (tiers: Record<TierId, TierSeries>): PairwiseMetrics => {
   const keys: PairwiseMetrics = {} as PairwiseMetrics;
-  const order: TierId[] = ["rim1p5D", "surface2D", "volume2p5D"];
+  const order: TierId[] = ['rim1p5D', 'surface2D', 'volume2p5D'];
   for (let i = 0; i < order.length; i++) {
     for (let j = i + 1; j < order.length; j++) {
       const a = order[i];
@@ -541,7 +557,7 @@ const computePairwiseCoherence = (tiers: Record<TierId, TierSeries>): PairwiseMe
 
 const computeDivergenceReport = (
   baseline: Record<TierId, TierSeries>,
-  variant: Record<TierId, TierSeries>
+  variant: Record<TierId, TierSeries>,
 ): DivergenceReport => {
   const report: Partial<DivergenceReport> = {};
   for (const tier of Object.keys(baseline) as TierId[]) {
@@ -552,28 +568,32 @@ const computeDivergenceReport = (
 
 const computeKernelDelta = (
   baseline: Record<TierId, TierSeries>,
-  variant: Record<TierId, TierSeries>
+  variant: Record<TierId, TierSeries>,
 ) => {
-  const delta: Record<TierId, {
-    baselineMean: number;
-    variantMean: number;
-    delta: number;
-    relativeDelta: number;
-  }> = {
+  const delta: Record<
+    TierId,
+    {
+      baselineMean: number;
+      variantMean: number;
+      delta: number;
+      relativeDelta: number;
+    }
+  > = {
     rim1p5D: { baselineMean: 0, variantMean: 0, delta: 0, relativeDelta: 0 },
     surface2D: { baselineMean: 0, variantMean: 0, delta: 0, relativeDelta: 0 },
-    volume2p5D: { baselineMean: 0, variantMean: 0, delta: 0, relativeDelta: 0 }
+    volume2p5D: { baselineMean: 0, variantMean: 0, delta: 0, relativeDelta: 0 },
   };
   for (const tier of Object.keys(baseline) as TierId[]) {
     const baseMean = computeMean(baseline[tier].normalized);
     const variantMean = computeMean(variant[tier].normalized);
     const diff = variantMean - baseMean;
-    const rel = Math.abs(baseMean) > 1e-9 ? diff / baseMean : (Math.abs(variantMean) > 1e-9 ? Infinity : 0);
+    const rel =
+      Math.abs(baseMean) > 1e-9 ? diff / baseMean : Math.abs(variantMean) > 1e-9 ? Infinity : 0;
     delta[tier] = {
       baselineMean: baseMean,
       variantMean,
       delta: diff,
-      relativeDelta: rel
+      relativeDelta: rel,
     };
   }
   return delta;
@@ -586,33 +606,39 @@ const mergeKernelDelta = (kernel: KernelSpec, delta?: Partial<KernelSpec>): Kern
 };
 
 export const runCrossTierValidation = (
-  options: CrossTierScenarioOptions = {}
+  options: CrossTierScenarioOptions = {},
 ): CrossTierValidationReport => {
   const coherenceTolerance = options.coherenceTolerance ?? 0.85;
   const divergenceTolerance = options.divergenceTolerance ?? 0.12;
   const halfLives: Record<TierId, number> = {
     rim1p5D: options.halfLives?.rim1p5D ?? DEFAULT_HALF_LIVES.rim1p5D,
     surface2D: options.halfLives?.surface2D ?? DEFAULT_HALF_LIVES.surface2D,
-    volume2p5D: options.halfLives?.volume2p5D ?? DEFAULT_HALF_LIVES.volume2p5D
+    volume2p5D: options.halfLives?.volume2p5D ?? DEFAULT_HALF_LIVES.volume2p5D,
   };
 
   const baseKernel = clampKernelSpec(options.kernel ?? KERNEL_SPEC_DEFAULT);
   const variantKernel = clampKernelSpec(
-    options.enforceVariantKernel ?? mergeKernelDelta(baseKernel, options.kernelDelta ?? { gain: baseKernel.gain * 1.08 })
+    options.enforceVariantKernel ??
+      mergeKernelDelta(baseKernel, options.kernelDelta ?? { gain: baseKernel.gain * 1.08 }),
   );
 
   const baselineRun = simulateScenarioRun(baseKernel, options, options.baselineNoise ?? {});
-  const variantRun = simulateScenarioRun(variantKernel, options, options.variantNoise ?? {}, 10_000);
+  const variantRun = simulateScenarioRun(
+    variantKernel,
+    options,
+    options.variantNoise ?? {},
+    10_000,
+  );
 
   const baselineReport: Record<TierId, TierReport> = {
     rim1p5D: buildTierReport(baselineRun.tiers.rim1p5D, baselineRun.dt),
     surface2D: buildTierReport(baselineRun.tiers.surface2D, baselineRun.dt),
-    volume2p5D: buildTierReport(baselineRun.tiers.volume2p5D, baselineRun.dt)
+    volume2p5D: buildTierReport(baselineRun.tiers.volume2p5D, baselineRun.dt),
   };
   const variantReport: Record<TierId, TierReport> = {
     rim1p5D: buildTierReport(variantRun.tiers.rim1p5D, variantRun.dt),
     surface2D: buildTierReport(variantRun.tiers.surface2D, variantRun.dt),
-    volume2p5D: buildTierReport(variantRun.tiers.volume2p5D, variantRun.dt)
+    volume2p5D: buildTierReport(variantRun.tiers.volume2p5D, variantRun.dt),
   };
 
   const coherenceBaseline = computePairwiseCoherence(baselineRun.tiers);
@@ -623,21 +649,21 @@ export const runCrossTierValidation = (
   const alerts: CrossTierAlert[] = [];
   for (const [pair, value] of Object.entries(coherenceBaseline) as [PairwiseKey, number][]) {
     if (value < coherenceTolerance) {
-      alerts.push({ kind: "coherence", pair, value, threshold: coherenceTolerance });
+      alerts.push({ kind: 'coherence', pair, value, threshold: coherenceTolerance });
     }
   }
   for (const [pair, value] of Object.entries(coherenceVariant) as [PairwiseKey, number][]) {
     if (value < coherenceTolerance) {
-      alerts.push({ kind: "coherence", pair, value, threshold: coherenceTolerance });
+      alerts.push({ kind: 'coherence', pair, value, threshold: coherenceTolerance });
     }
   }
   for (const tier of Object.keys(divergence) as TierId[]) {
     if (divergence[tier].maxAbs > divergenceTolerance) {
       alerts.push({
-        kind: "divergence",
+        kind: 'divergence',
         tier,
         value: divergence[tier].maxAbs,
-        threshold: divergenceTolerance
+        threshold: divergenceTolerance,
       });
     }
   }
@@ -650,27 +676,27 @@ export const runCrossTierValidation = (
       dt: options.dt ?? DEFAULT_DT,
       halfLives,
       coherenceTolerance,
-      divergenceTolerance
+      divergenceTolerance,
     },
     baseline: baselineReport,
     variant: variantReport,
     coherence: {
       baseline: coherenceBaseline,
-      variant: coherenceVariant
+      variant: coherenceVariant,
     },
     divergence,
     kernelDelta: {
       baseline: cloneKernelSpec(baseKernel),
       variant: cloneKernelSpec(variantKernel),
-      perTier: kernelDelta
+      perTier: kernelDelta,
     },
-    alerts
+    alerts,
   };
 };
 
 export const summarizeAlerts = (alerts: CrossTierAlert[]): string[] =>
   alerts.map((alert) => {
-    if (alert.kind === "coherence") {
+    if (alert.kind === 'coherence') {
       return `coherence drop for ${alert.pair}: ${alert.value.toFixed(3)} < ${alert.threshold.toFixed(3)}`;
     }
     return `divergence envelope breach for ${alert.tier}: ${alert.value.toFixed(3)} > ${alert.threshold.toFixed(3)}`;

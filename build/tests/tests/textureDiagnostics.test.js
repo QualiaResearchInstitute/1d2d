@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { makeResolution } from "../src/fields/contracts.js";
 import { computeTextureDiagnostics } from "../src/pipeline/textureDiagnostics.js";
 import { renderRainbowFrame } from "../src/pipeline/rainbowFrame.js";
+import { createDefaultSu7RuntimeParams } from "../src/pipeline/su7/types.js";
 import { createKernelSpec } from "../src/kernel/kernelSpec.js";
 const clamp01 = (value) => Math.max(0, Math.min(1, value));
 const createSurfaceFromFn = (width, height, fn) => {
@@ -101,6 +102,7 @@ const buildRenderInput = (surface, rim) => {
             transparency: 0.28
         }),
         dmt: 0.25,
+        arousal: 0.2,
         blend: 0.4,
         normPin: true,
         normTarget: 0.6,
@@ -139,8 +141,11 @@ const buildRenderInput = (surface, rim) => {
         surfaceBlend: 0.3,
         surfaceRegion: "both",
         warpAmp: 1,
+        curvatureStrength: 0,
+        curvatureMode: "poincare",
         kurEnabled: false,
         debug: undefined,
+        su7: createDefaultSu7RuntimeParams(),
         composer: undefined
     };
 };

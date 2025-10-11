@@ -1,16 +1,13 @@
-import test from "node:test";
-import assert from "node:assert/strict";
+import test from 'node:test';
+import assert from 'node:assert/strict';
 
-import {
-  OPTICAL_FIELD_SCHEMA_VERSION,
-  OpticalFieldManager
-} from "../src/fields/opticalField.js";
+import { OPTICAL_FIELD_SCHEMA_VERSION, OpticalFieldManager } from '../src/fields/opticalField.js';
 
-test("OpticalFieldManager stamps monotonic frame IDs and reuses buffers", () => {
+test('OpticalFieldManager stamps monotonic frame IDs and reuses buffers', () => {
   const manager = new OpticalFieldManager({
-    solver: "unit",
+    solver: 'unit',
     resolution: { width: 4, height: 4 },
-    initialFrameId: 0
+    initialFrameId: 0,
   });
 
   const frame0 = manager.acquireFrame();
@@ -23,16 +20,16 @@ test("OpticalFieldManager stamps monotonic frame IDs and reuses buffers", () => 
   manager.releaseFrame(frame0);
 
   const frame1 = manager.acquireFrame({ timestamp: 2 });
-  assert.equal(frame1.buffer, frame0.buffer, "expected buffer reuse from pool");
+  assert.equal(frame1.buffer, frame0.buffer, 'expected buffer reuse from pool');
   manager.stampFrame(frame1, { dt: 0.01, timestamp: 2 });
   assert.equal(frame1.getMeta().frameId, 1);
 });
 
-test("phase alignment rotates complex field and notifies hooks", () => {
+test('phase alignment rotates complex field and notifies hooks', () => {
   const manager = new OpticalFieldManager({
-    solver: "align",
+    solver: 'align',
     resolution: { width: 2, height: 2 },
-    initialFrameId: -1
+    initialFrameId: -1,
   });
   const frame = manager.acquireFrame();
   frame.real.fill(0);
@@ -52,8 +49,11 @@ test("phase alignment rotates complex field and notifies hooks", () => {
   const delta = manager.alignPhase(frame, { anchorIndex: 0, referencePhase: 0 });
   assert.ok(Math.abs(delta + Math.PI / 2) < 1e-6);
   assert.ok(Math.abs(observedDelta + Math.PI / 2) < 1e-6);
-  assert.ok(Math.abs(frame.getPhase(0)) < 1e-6, "anchor should align to reference");
+  assert.ok(Math.abs(frame.getPhase(0)) < 1e-6, 'anchor should align to reference');
   const rotatedDiff = frame.getPhase(1) - frame.getPhase(0);
-  const diffError = Math.atan2(Math.sin(rotatedDiff - originalDiff), Math.cos(rotatedDiff - originalDiff));
-  assert.ok(Math.abs(diffError) < 1e-6, "global rotation preserves relative phase");
+  const diffError = Math.atan2(
+    Math.sin(rotatedDiff - originalDiff),
+    Math.cos(rotatedDiff - originalDiff),
+  );
+  assert.ok(Math.abs(diffError) < 1e-6, 'global rotation preserves relative phase');
 });

@@ -1,0 +1,10 @@
+node_modules/
+build/
+dist/
+baseline-dist/
+build/tests/
+dist/assets/
+rainbow-rims-app@0.1.0/
+public/uploads/
+*.tsbuildinfo
+coverage/

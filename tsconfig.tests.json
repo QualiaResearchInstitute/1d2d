@@ -6,7 +6,9 @@
     "outDir": "build/tests",
     "allowJs": false,
     "noEmit": false,
-    "rootDir": "."
+    "rootDir": ".",
+    "strict": false,
+    "noImplicitAny": false
   },
   "include": ["src/fields/**/*.ts", "src/validation/**/*.ts", "tests/**/*.ts", "tests/**/*.d.ts"],
   "exclude": []

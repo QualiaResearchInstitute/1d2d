@@ -10,7 +10,10 @@ const defaultParams = {
     K0: 0.6,
     epsKur: 0.001,
     fluxX: 0,
-    fluxY: 0
+    fluxY: 0,
+    smallWorldWeight: 0,
+    p_sw: 0,
+    smallWorldEnabled: false
 };
 const makePhaseField = (width, height) => {
     const buffer = new ArrayBuffer(derivedBufferSize(width, height));
@@ -88,7 +91,10 @@ test("Kuramoto telemetry updates order parameter and irradiance metadata", () =>
         K0: 0,
         epsKur: 0,
         fluxX: 0,
-        fluxY: 0
+        fluxY: 0,
+        smallWorldWeight: 0,
+        p_sw: 0,
+        smallWorldEnabled: false
     };
     const result = stepKuramotoState(state, params, 0, () => 0, 1, {
         telemetry: { kernelVersion: 7 }

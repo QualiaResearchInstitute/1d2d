@@ -9,7 +9,9 @@ const defaultParams = {
     K0: 0.6,
     epsKur: 0.001,
     fluxX: 0,
-    fluxY: 0
+    fluxY: 0,
+    smallWorldWeight: 0,
+    p_sw: 0
 };
 test("thin-element gains respond deterministically to DMT/arousal controls", () => {
     const kernel = clampKernelSpec({

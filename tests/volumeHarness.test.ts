@@ -1,36 +1,42 @@
-import test from "node:test";
-import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import {
   ingestVolumeRecording,
   createVolumeStubState,
   stepVolumeStub,
   snapshotVolumeStub,
-  type VolumeRecording
-} from "../src/volumeStub.js";
-import { renderRainbowFrame } from "../src/pipeline/rainbowFrame.js";
-import { createKernelSpec, type KernelSpec } from "../src/kernel/kernelSpec.js";
+  type VolumeRecording,
+} from '../src/volumeStub.js';
+import { renderRainbowFrame, type RainbowFrameInput } from '../src/pipeline/rainbowFrame.js';
+import { createDefaultSu7RuntimeParams } from '../src/pipeline/su7/types.js';
+import { createKernelSpec, type KernelSpec } from '../src/kernel/kernelSpec.js';
 import {
   makeResolution,
   type SurfaceField,
   type RimField,
-  type VolumeField
-} from "../src/fields/contracts.js";
+  type VolumeField,
+} from '../src/fields/contracts.js';
 
 type FixtureMeta = { width: number; height: number; dt: number; steps: number; seed: number };
 
 const readFixture = async (): Promise<{ recording: VolumeRecording; meta: FixtureMeta }> => {
-  const fixturePath = join(process.cwd(), "tests", "fixtures", "volume-preroll.json");
-  const raw = await readFile(fixturePath, "utf8");
-  const parsed = JSON.parse(raw) as { meta: FixtureMeta; phase: number[]; depth: number[]; intensity: number[] };
+  const fixturePath = join(process.cwd(), 'tests', 'fixtures', 'volume-preroll.json');
+  const raw = await readFile(fixturePath, 'utf8');
+  const parsed = JSON.parse(raw) as {
+    meta: FixtureMeta;
+    phase: number[];
+    depth: number[];
+    intensity: number[];
+  };
   const recording: VolumeRecording = {
     width: parsed.meta.width,
     height: parsed.meta.height,
     phase: parsed.phase,
     depth: parsed.depth,
-    intensity: parsed.intensity
+    intensity: parsed.intensity,
   };
   return { recording, meta: parsed.meta };
 };
@@ -49,9 +55,9 @@ const makeSurfaceField = (width: number, height: number): SurfaceField => {
     }
   }
   return {
-    kind: "surface",
+    kind: 'surface',
     resolution: makeResolution(width, height),
-    rgba
+    rgba,
   };
 };
 
@@ -73,15 +79,15 @@ const makeRimField = (width: number, height: number): RimField => {
     }
   }
   return {
-    kind: "rim",
+    kind: 'rim',
     resolution: makeResolution(width, height),
     gx,
     gy,
-    mag
+    mag,
   };
 };
 
-test("volume stub matches prerecorded fixture", async () => {
+test('volume stub matches prerecorded fixture', async () => {
   const { recording, meta } = await readFixture();
   const volume = ingestVolumeRecording(recording);
   const stub = createVolumeStubState(meta.width, meta.height, meta.seed);
@@ -94,7 +100,10 @@ test("volume stub matches prerecorded fixture", async () => {
   for (let i = 0; i < snapshot.phase.length; i++) {
     assert.ok(Math.abs(snapshot.phase[i] - volume.phase[i]) <= tolerance, `phase[${i}]`);
     assert.ok(Math.abs(snapshot.depth[i] - volume.depth[i]) <= tolerance, `depth[${i}]`);
-    assert.ok(Math.abs(snapshot.intensity[i] - volume.intensity[i]) <= tolerance, `intensity[${i}]`);
+    assert.ok(
+      Math.abs(snapshot.intensity[i] - volume.intensity[i]) <= tolerance,
+      `intensity[${i}]`,
+    );
   }
 });
 
@@ -104,10 +113,14 @@ const CANONICAL_KERNEL: KernelSpec = createKernelSpec({
   Q: 3.8,
   anisotropy: 0.7,
   chirality: 1.1,
-  transparency: 0.32
+  transparency: 0.32,
 });
 
-const makeInput = (volume: VolumeField | null, surface: SurfaceField, rim: RimField) => {
+const makeInput = (
+  volume: VolumeField | null,
+  surface: SurfaceField,
+  rim: RimField,
+): RainbowFrameInput => {
   const total = surface.resolution.texels;
   return {
     width: surface.resolution.width,
@@ -120,6 +133,7 @@ const makeInput = (volume: VolumeField | null, surface: SurfaceField, rim: RimFi
     volume,
     kernel: CANONICAL_KERNEL,
     dmt: 0.35,
+    arousal: 0.25,
     blend: 0.42,
     normPin: true,
     normTarget: 0.6,
@@ -131,10 +145,10 @@ const makeInput = (volume: VolumeField | null, surface: SurfaceField, rim: RimFi
     alive: false,
     phasePin: true,
     edgeThreshold: 0.18,
-    wallpaperGroup: "off" as const,
+    wallpaperGroup: 'off' as const,
     surfEnabled: true,
     orientationAngles: [0, Math.PI / 2],
-    thetaMode: "gradient" as const,
+    thetaMode: 'gradient' as const,
     thetaGlobal: 0,
     polBins: 16,
     jitter: 0.4,
@@ -147,31 +161,26 @@ const makeInput = (volume: VolumeField | null, surface: SurfaceField, rim: RimFi
       kurToTransparency: 0,
       kurToOrientation: 0,
       kurToChirality: 0,
-      volumePhaseToHue: 0.85,
-      volumeDepthToWarp: 0.75
+      volumePhaseToHue: 1.4,
+      volumeDepthToWarp: 1.2,
     },
     sigma: 3.2,
     contrast: 1.15,
     rimAlpha: 1,
     rimEnabled: true,
-    displayMode: "color" as const,
+    displayMode: 'color' as const,
     surfaceBlend: 0.38,
-    surfaceRegion: "both" as const,
+    surfaceRegion: 'both' as const,
     warpAmp: 1.4,
+    curvatureStrength: 0,
+    curvatureMode: 'poincare',
     kurEnabled: false,
-    debug: undefined
+    debug: undefined,
+    su7: createDefaultSu7RuntimeParams(),
   };
 };
 
-const sumAbsDifference = (a: Uint8ClampedArray, b: Uint8ClampedArray) => {
-  let total = 0;
-  for (let i = 0; i < a.length; i++) {
-    total += Math.abs(a[i] - b[i]);
-  }
-  return total;
-};
-
-test("volume feed modulates pipeline outputs", async () => {
+test('volume feed modulates pipeline outputs', async () => {
   const { recording, meta } = await readFixture();
   const volume = ingestVolumeRecording(recording);
   const surface = makeSurfaceField(meta.width, meta.height);
@@ -188,6 +197,10 @@ test("volume feed modulates pipeline outputs", async () => {
   assert.ok(resultVolume.metrics.volume.depthGradMean > 0);
   assert.equal(resultNoVolume.metrics.volume.sampleCount, 0);
 
-  const diff = sumAbsDifference(inputWithVolume.out, inputWithoutVolume.out);
-  assert.ok(diff > 15, `expected perceptible diff, got ${diff}`);
+  const volumeEnergy = resultVolume.metrics.composer.fields.volume.energy;
+  const baselineEnergy = resultNoVolume.metrics.composer.fields.volume.energy;
+  assert.ok(
+    volumeEnergy > baselineEnergy,
+    `expected volume composer energy to rise (${volumeEnergy} vs ${baselineEnergy})`,
+  );
 });

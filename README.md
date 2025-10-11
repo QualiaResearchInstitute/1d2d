@@ -4,12 +4,12 @@ This repo now ships a dual-path renderer that keeps the original CPU reference i
 
 ## Architecture Overview
 
-| Layer | CPU reference | GPU pipeline |
-|-------|---------------|--------------|
-| Kuramoto evolution | `stepKuramotoState` + `deriveKuramotoFieldsCore` in `App.tsx` / `kuramotoCore.ts` | Worker-driven OA step writing float buffers (`kuramotoWorker.ts`) that are uploaded to textures each frame |
+| Layer                      | CPU reference                                                                       | GPU pipeline                                                                                                                                            |
+| -------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Kuramoto evolution         | `stepKuramotoState` + `deriveKuramotoFieldsCore` in `App.tsx` / `kuramotoCore.ts`   | Worker-driven OA step writing float buffers (`kuramotoWorker.ts`) that are uploaded to textures each frame                                              |
 | Rim + wallpaper compositor | CPU loop in `renderFrameCore` (per-pixel LMS offsets, wallpaper sampling, coupling) | Fragment shader in `gpuRenderer.ts` mirrors the same math: normal-aligned offsets, comb filters, chirality mixing, wallpaper warp, and surface coupling |
-| Frame transport | Canvas 2D `putImageData` | Full-screen quad, RGBA + RGBA32F textures, `texelFetch` in shader |
-| Diagnostics | `drawFrameCpu` | `drawFrameGpu` (default) |
+| Frame transport            | Canvas 2D `putImageData`                                                            | Full-screen quad, RGBA + RGBA32F textures, `texelFetch` in shader                                                                                       |
+| Diagnostics                | `drawFrameCpu`                                                                      | `drawFrameGpu` (default)                                                                                                                                |
 
 The GPU path consumes three textures:
 
@@ -23,13 +23,13 @@ All textures and shader math keep a **top-left origin** to match the CPU path; t
 
 `src/kuramotoWorker.ts` listens for:
 
-| Message | Payload | Effect |
-|---------|---------|--------|
-| `init`  | `{ width, height, params, qInit, buffers, seed }` | Seeds state slices & derived buffer views |
-| `tick`  | `{ dt, timestamp, frameId }` | Evolves state, computes derived field, posts `frame` with transferable buffer |
-| `updateParams` | `{ params }` | Hot-swaps OA coefficients |
-| `simulate` | `{ frameCount, dt, params, width, height, qInit, seed }` | Batch-simulates frames for regression harness |
-| `reset` | `{ qInit }` | Reinitialises the field with the requested twist |
+| Message        | Payload                                                  | Effect                                                                        |
+| -------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `init`         | `{ width, height, params, qInit, buffers, seed }`        | Seeds state slices & derived buffer views                                     |
+| `tick`         | `{ dt, timestamp, frameId }`                             | Evolves state, computes derived field, posts `frame` with transferable buffer |
+| `updateParams` | `{ params }`                                             | Hot-swaps OA coefficients                                                     |
+| `simulate`     | `{ frameCount, dt, params, width, height, qInit, seed }` | Batch-simulates frames for regression harness                                 |
+| `reset`        | `{ qInit }`                                              | Reinitialises the field with the requested twist                              |
 
 Frames are recycled with `postMessage({ kind: "frame", buffer, ... }, [buffer])` to keep GC pressure off.
 
@@ -52,15 +52,28 @@ UI controls (left panel):
 
 Developer hooks (`window` globals):
 
-| Function | Purpose |
-|----------|---------|
-| `__setRenderBackend("gpu" \| "cpu")` | Programmatic toggle (uses the same cleanup/reupload path as the UI) |
-| `__setTelemetryEnabled(true/false)` | Master switch for anomaly logging |
-| `__getTelemetryHistory()` | Returns the rolling 6‑second telemetry buffer (phase, ms, timestamp) |
-| `__runFrameRegression(frameCount?)` | CPU vs worker sanity sweep |
-| `__runGpuParityCheck()` | GPU vs CPU image comparison (same as UI button) |
-| `__measureRenderPerformance(frameCount?)` | Returns `cpuMs`, `gpuMs`, fps, and throughput gain |
-| `__setFrameProfiler(enabled, samples?, label?)` | Collects raw canvas frame timings |
+| Function                                        | Purpose                                                              |
+| ----------------------------------------------- | -------------------------------------------------------------------- |
+| `__setRenderBackend("gpu" \| "cpu")`            | Programmatic toggle (uses the same cleanup/reupload path as the UI)  |
+| `__setTelemetryEnabled(true/false)`             | Master switch for anomaly logging                                    |
+| `__getTelemetryHistory()`                       | Returns the rolling 6‑second telemetry buffer (phase, ms, timestamp) |
+| `__runFrameRegression(frameCount?)`             | CPU vs worker sanity sweep                                           |
+| `__runGpuParityCheck()`                         | GPU vs CPU image comparison (same as UI button)                      |
+| `__measureRenderPerformance(frameCount?)`       | Returns `cpuMs`, `gpuMs`, fps, and throughput gain                   |
+| `__setFrameProfiler(enabled, samples?, label?)` | Collects raw canvas frame timings                                    |
+
+## Behind the Scenes – QRI Motivation
+
+Phase 5 leans into the Qualia Research Institute goal of making psychedelic-style
+visualisations _legible_. The new hyperbolic ruler overlay is more than eye
+candy: it exposes the atlas’ hyperbolic arc length right next to the Euclidean
+pixel distance so researchers can document how curvature manipulations reshape
+perceptual space. The toggle/slider pair is fully preset-aware, meaning QRI
+playbooks can now ship “explainer” presets that carry both the curvature warp
+and the teaching overlay into exported captures. This keeps the Tactile
+Visualizer narrative—clarity, measurability, and reproducibility—front and
+centre while still letting artists disable the guide when they just want the
+look.
 
 ## Manual Regression Checklist
 

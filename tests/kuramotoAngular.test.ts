@@ -1,5 +1,5 @@
-import test from "node:test";
-import assert from "node:assert/strict";
+import test from 'node:test';
+import assert from 'node:assert/strict';
 
 import {
   createKuramotoState,
@@ -12,10 +12,10 @@ import {
   createTelemetrySnapshot,
   type KuramotoParams,
   type KuramotoState,
-  type PhaseField
-} from "../src/kuramotoCore.js";
-import { AngularSpectrumSolver } from "../src/optics/angularSpectrum.js";
-import { KERNEL_SPEC_DEFAULT } from "../src/kernel/kernelSpec.js";
+  type PhaseField,
+} from '../src/kuramotoCore.js';
+import { AngularSpectrumSolver } from '../src/optics/angularSpectrum.js';
+import { KERNEL_SPEC_DEFAULT } from '../src/kernel/kernelSpec.js';
 
 const defaultParams: KuramotoParams = {
   alphaKur: 0.2,
@@ -24,7 +24,10 @@ const defaultParams: KuramotoParams = {
   K0: 0.6,
   epsKur: 0.001,
   fluxX: 0,
-  fluxY: 0
+  fluxY: 0,
+  smallWorldWeight: 0,
+  p_sw: 0,
+  smallWorldEnabled: false,
 };
 
 const makePhaseField = (width: number, height: number): PhaseField => {
@@ -41,7 +44,7 @@ const computeMaxDiff = (a: Float32Array, b: Float32Array) => {
   return max;
 };
 
-test("Kuramoto and angular-spectrum phases agree after alignment", () => {
+test('Kuramoto and angular-spectrum phases agree after alignment', () => {
   const width = 12;
   const height = 10;
   const steps = 4;
@@ -61,7 +64,7 @@ test("Kuramoto and angular-spectrum phases agree after alignment", () => {
     height,
     wavelengthNm: 550,
     pixelPitchMeters: 1e-6,
-    dzMeters: 0.004
+    dzMeters: 0.004,
   });
 
   const angularFrame = solver.propagate(kurState.field, { dzMeters: 0.004, timestamp: 0.25 });
@@ -76,7 +79,7 @@ test("Kuramoto and angular-spectrum phases agree after alignment", () => {
     Zr: angularFrame.real,
     Zi: angularFrame.imag,
     telemetry: angularTelemetry,
-    irradiance: angularIrradiance
+    irradiance: angularIrradiance,
   };
   const angularPhase = makePhaseField(width, height);
   deriveKuramotoFields(angularState, angularPhase);
@@ -86,7 +89,7 @@ test("Kuramoto and angular-spectrum phases agree after alignment", () => {
     gradY: computeMaxDiff(kurPhase.gradY, angularPhase.gradY),
     vort: computeMaxDiff(kurPhase.vort, angularPhase.vort),
     coh: computeMaxDiff(kurPhase.coh, angularPhase.coh),
-    amp: computeMaxDiff(kurPhase.amp, angularPhase.amp)
+    amp: computeMaxDiff(kurPhase.amp, angularPhase.amp),
   };
 
   const tolerance = 1e-5;
@@ -95,10 +98,10 @@ test("Kuramoto and angular-spectrum phases agree after alignment", () => {
   assert.ok(metrics.vort < tolerance, `vort diff ${metrics.vort}`);
   assert.ok(metrics.coh < tolerance, `coh diff ${metrics.coh}`);
   assert.ok(metrics.amp < tolerance, `amp diff ${metrics.amp}`);
-  assert.ok(angularFrame.getMeta().frameId >= 0, "angular solver should stamp frame IDs");
+  assert.ok(angularFrame.getMeta().frameId >= 0, 'angular solver should stamp frame IDs');
 });
 
-test("Kuramoto telemetry updates order parameter and irradiance metadata", () => {
+test('Kuramoto telemetry updates order parameter and irradiance metadata', () => {
   const width = 2;
   const height = 1;
   const state = createKuramotoState(width, height);
@@ -110,10 +113,13 @@ test("Kuramoto telemetry updates order parameter and irradiance metadata", () =>
     K0: 0,
     epsKur: 0,
     fluxX: 0,
-    fluxY: 0
+    fluxY: 0,
+    smallWorldWeight: 0,
+    p_sw: 0,
+    smallWorldEnabled: false,
   };
   const result = stepKuramotoState(state, params, 0, () => 0, 1, {
-    telemetry: { kernelVersion: 7 }
+    telemetry: { kernelVersion: 7 },
   });
   const meta = state.field.getMeta();
   assert.equal(result.telemetry.frameId, meta.frameId);
@@ -125,7 +131,7 @@ test("Kuramoto telemetry updates order parameter and irradiance metadata", () =>
   assert.equal(result.telemetry.orderParameter.sampleCount, width * height);
   assert.ok(
     result.telemetry.orderParameter.magnitude > 0.99,
-    `expected high coherence, got ${result.telemetry.orderParameter.magnitude}`
+    `expected high coherence, got ${result.telemetry.orderParameter.magnitude}`,
   );
   for (let i = 0; i < state.irradiance.L.length; i++) {
     assert.ok(Math.abs(state.irradiance.L[i] - 1) < 1e-6, `irradiance L[${i}]`);

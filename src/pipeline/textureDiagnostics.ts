@@ -1,4 +1,4 @@
-import type { SurfaceField } from "../fields/contracts.js";
+import type { SurfaceField } from '../fields/contracts.js';
 
 export type TextureDiagnosticsConfig = {
   orientations: readonly number[];
@@ -39,7 +39,7 @@ const DEFAULT_RESULT: TextureDiagnosticsResult = {
   orientationMean: 0,
   orientationStd: 0,
   divisiveMean: 0,
-  divisiveStd: 0
+  divisiveStd: 0,
 };
 
 const toGray = (surface: SurfaceField): Float32Array => {
@@ -82,7 +82,7 @@ const applySeparableBlur = (
   input: Float32Array,
   width: number,
   height: number,
-  kernel: Float32Array
+  kernel: Float32Array,
 ) => {
   const radius = (kernel.length - 1) >> 1;
   const temp = new Float32Array(width * height);
@@ -115,7 +115,7 @@ const computeDoG = (
   width: number,
   height: number,
   sigma: number,
-  factor = 1.6
+  factor = 1.6,
 ) => {
   const kernelA = buildGaussianKernel(Math.max(sigma, EPS));
   const kernelB = buildGaussianKernel(Math.max(sigma * factor, EPS));
@@ -167,7 +167,7 @@ const stats = (sum: number, sumSq: number, count: number) => {
 
 export const computeTextureDiagnostics = (
   surface: SurfaceField | null,
-  config: TextureDiagnosticsConfig
+  config: TextureDiagnosticsConfig,
 ): TextureDiagnosticsResult => {
   if (!surface) {
     return { ...DEFAULT_RESULT };
@@ -231,8 +231,7 @@ export const computeTextureDiagnostics = (
         const alignment = Math.abs(gxVal * cos[k] + gyVal * sin[k]) * invMag;
         if (alignment >= ORIENTATION_OFFSET) {
           const norm = (alignment - ORIENTATION_OFFSET) * ORIENTATION_INV_RANGE;
-          const tuned =
-            ORIENTATION_POWER === 2 ? norm * norm : Math.pow(norm, ORIENTATION_POWER);
+          const tuned = ORIENTATION_POWER === 2 ? norm * norm : Math.pow(norm, ORIENTATION_POWER);
           const alignmentSq = alignment * alignment;
           energy = gMagSq * alignmentSq * tuned;
         }
@@ -300,6 +299,6 @@ export const computeTextureDiagnostics = (
     divisiveMean: divisiveStats.mean,
     divisiveStd: divisiveStats.std,
     wallpapericityMap,
-    beatEnvelopeMap
+    beatEnvelopeMap,
   };
 };

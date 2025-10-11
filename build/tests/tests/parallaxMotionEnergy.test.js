@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { makeResolution } from "../src/fields/contracts.js";
 import { renderRainbowFrame } from "../src/pipeline/rainbowFrame.js";
+import { createDefaultSu7RuntimeParams } from "../src/pipeline/su7/types.js";
 import { createKernelSpec } from "../src/kernel/kernelSpec.js";
 const createSurface = (width, height, value) => {
     const rgba = new Uint8ClampedArray(width * height * 4);
@@ -97,6 +98,7 @@ test("parallax metrics report positive radial slope for radial gradients", () =>
             transparency: 0.45
         }),
         dmt: 0,
+        arousal: 0,
         blend: 0.4,
         normPin: false,
         normTarget: 0.6,
@@ -124,8 +126,11 @@ test("parallax metrics report positive radial slope for radial gradients", () =>
         surfaceBlend: 0,
         surfaceRegion: "surfaces",
         warpAmp: 0,
+        curvatureStrength: 0,
+        curvatureMode: "poincare",
         kurEnabled: true,
         debug: undefined,
+        su7: createDefaultSu7RuntimeParams(),
         composer: undefined
     });
     const parallax = result.metrics.parallax;
@@ -157,6 +162,7 @@ test("motion energy captures cross-branch phase shift for multi-orientation over
             transparency: 0.3
         }),
         dmt: 0.1,
+        arousal: 0,
         blend: 0.35,
         normPin: false,
         normTarget: 0.6,
@@ -184,8 +190,11 @@ test("motion energy captures cross-branch phase shift for multi-orientation over
         surfaceBlend: 0.2,
         surfaceRegion: "surfaces",
         warpAmp: 0.2,
+        curvatureStrength: 0,
+        curvatureMode: "poincare",
         kurEnabled: false,
         debug: undefined,
+        su7: createDefaultSu7RuntimeParams(),
         composer: undefined
     });
     const motionEnergy = result.metrics.motionEnergy;

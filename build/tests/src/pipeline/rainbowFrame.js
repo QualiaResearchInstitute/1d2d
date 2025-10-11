@@ -1,5 +1,11 @@
+import { createHyperbolicAtlas } from "../hyperbolic/atlas.js";
 import { clampKernelSpec, cloneKernelSpec } from "../kernel/kernelSpec.js";
 import { computeTextureDiagnostics } from "./textureDiagnostics.js";
+import { embedToC7 } from "./su7/embed.js";
+import { buildScheduledUnitary, computeSu7Telemetry } from "./su7/math.js";
+import { projectSu7Vector } from "./su7/projector.js";
+import { applySU7 } from "./su7/unitary.js";
+import { createDefaultSu7RuntimeParams } from "./su7/types.js";
 const DMT_SENS = {
     g1: 0.6,
     k1: 0.35,
@@ -74,6 +80,14 @@ const wrapPi = (theta) => {
     t = t - Math.floor((t + Math.PI) / twoPi) * twoPi;
     return t - Math.PI;
 };
+const computeC7Norm = (vector) => {
+    let sum = 0;
+    for (let i = 0; i < vector.length; i++) {
+        const cell = vector[i];
+        sum += cell.re * cell.re + cell.im * cell.im;
+    }
+    return Math.sqrt(sum);
+};
 const responseSoft = (value, shaping) => {
     const v = clamp01(value);
     const exp = mixScalar(1.2, 3.5, clamp01(shaping));
@@ -84,10 +98,128 @@ const responsePow = (value, shaping) => {
     const exp = mixScalar(1.65, 0.55, clamp01(shaping));
     return Math.pow(v, exp);
 };
+const FLOW_FIELD_GRID_SIZE = 4;
+export const deriveSu7ScheduleContext = (params) => {
+    const { width, height, phase, rim, volume, dmt, arousal, curvatureStrength } = params;
+    const gradX = phase?.gradX ?? rim?.gx ?? null;
+    const gradY = phase?.gradY ?? rim?.gy ?? null;
+    const gridSize = FLOW_FIELD_GRID_SIZE;
+    const gridVectors = new Float32Array(gridSize * gridSize * 2);
+    const gridCounts = new Uint32Array(gridSize * gridSize);
+    const axisBias = new Float32Array(7);
+    axisBias.fill(1e-5);
+    const stride = Math.max(1, Math.floor(Math.sqrt(Math.max(width * height, 1)) / 48));
+    let sumGx = 0;
+    let sumGy = 0;
+    let magSum = 0;
+    let magSqSum = 0;
+    let samples = 0;
+    let radialSum = 0;
+    let radialAbsSum = 0;
+    const cx = (width - 1) * 0.5;
+    const cy = (height - 1) * 0.5;
+    if (gradX && gradY) {
+        for (let y = 0; y < height; y += stride) {
+            for (let x = 0; x < width; x += stride) {
+                const idx = y * width + x;
+                const gx = Number.isFinite(gradX[idx]) ? gradX[idx] : 0;
+                const gy = Number.isFinite(gradY[idx]) ? gradY[idx] : 0;
+                const mag = Math.hypot(gx, gy);
+                if (mag <= 1e-6)
+                    continue;
+                sumGx += gx;
+                sumGy += gy;
+                magSum += mag;
+                magSqSum += mag * mag;
+                samples++;
+                const normX = width > 1 ? x / (width - 1) : 0;
+                const normY = height > 1 ? y / (height - 1) : 0;
+                const cellX = Math.min(gridSize - 1, Math.floor(normX * gridSize));
+                const cellY = Math.min(gridSize - 1, Math.floor(normY * gridSize));
+                const cell = cellY * gridSize + cellX;
+                gridVectors[cell * 2] += gx;
+                gridVectors[cell * 2 + 1] += gy;
+                gridCounts[cell] += 1;
+                const angle = Math.atan2(gy, gx);
+                const axis = ((Math.round((((angle % TAU) + TAU) % TAU) / TAU * 7) % 7) + 7) % 7;
+                axisBias[axis] += mag;
+                const dx = x - cx;
+                const dy = y - cy;
+                const radius = Math.hypot(dx, dy);
+                if (radius > 1e-6) {
+                    const radialX = dx / radius;
+                    const radialY = dy / radius;
+                    const radialComponent = gx * radialX + gy * radialY;
+                    radialSum += radialComponent;
+                    radialAbsSum += Math.abs(radialComponent);
+                }
+            }
+        }
+    }
+    for (let i = 0; i < gridCounts.length; i++) {
+        const count = gridCounts[i];
+        if (count > 0) {
+            const inv = 1 / count;
+            gridVectors[i * 2] *= inv;
+            gridVectors[i * 2 + 1] *= inv;
+        }
+    }
+    let flowContext = null;
+    if (samples > 0) {
+        const meanMag = magSum / samples;
+        const variance = Math.max(0, magSqSum / samples - meanMag * meanMag);
+        const coherence = meanMag > 1e-6 ? Math.exp(-variance / (meanMag * meanMag + 1e-6)) : 0;
+        const axisBiasNorm = new Float32Array(7);
+        let maxBias = 0;
+        for (let i = 0; i < 7; i++) {
+            if (axisBias[i] > maxBias) {
+                maxBias = axisBias[i];
+            }
+        }
+        const denom = maxBias > 1e-6 ? maxBias : 1;
+        for (let i = 0; i < 7; i++) {
+            axisBiasNorm[i] = axisBias[i] / denom;
+        }
+        flowContext = {
+            angle: Math.atan2(sumGy, sumGx),
+            magnitude: meanMag,
+            coherence,
+            axisBias: axisBiasNorm,
+            gridSize,
+            gridVectors
+        };
+    }
+    let volumeCoverage = 0;
+    if (volume?.depth) {
+        const depth = volume.depth;
+        let sum = 0;
+        let count = 0;
+        for (let y = 0; y < height; y += stride) {
+            for (let x = 0; x < width; x += stride) {
+                const idx = y * width + x;
+                const value = Number.isFinite(depth[idx]) ? Math.abs(depth[idx]) : 0;
+                sum += value;
+                count++;
+            }
+        }
+        volumeCoverage = count > 0 ? Math.tanh(sum / count) : 0;
+    }
+    const parallaxRadial = radialAbsSum > 1e-6 ? clamp(radialSum / radialAbsSum, -1, 1) : 0;
+    return {
+        dmt: clamp01(dmt),
+        arousal: clamp01(arousal),
+        flow: flowContext,
+        curvatureStrength,
+        parallaxRadial,
+        volumeCoverage
+    };
+};
 const createBranchAccumulators = (count) => Array.from({ length: count }, () => ({
     phaseCos: 0,
     phaseSin: 0,
     parallaxSum: 0,
+    magnitudeSum: 0,
+    hyperbolicSum: 0,
     count: 0
 }));
 const computeMotionEnergyFromBranches = (branches, source) => {
@@ -163,14 +295,60 @@ const computeMotionEnergyFromBranches = (branches, source) => {
         source
     };
 };
-const computeHyperbolicFactor = (radiusNorm, kNorm, transparency) => {
-    const strength = clamp01(0.45 + 0.4 * transparency);
-    if (strength <= 1e-6 || kNorm <= 1e-6)
+const finalizeBranchAttentionSummary = (branches, kind) => {
+    if (!branches)
+        return null;
+    const entries = [];
+    for (let index = 0; index < branches.length; index++) {
+        const branch = branches[index];
+        if (branch.count <= 0)
+            continue;
+        const inv = 1 / branch.count;
+        const meanCos = branch.phaseCos * inv;
+        const meanSin = branch.phaseSin * inv;
+        const coherence = Math.min(1, Math.hypot(meanCos, meanSin));
+        const meanPhase = Math.atan2(meanSin, meanCos);
+        const meanParallax = clamp(branch.parallaxSum * inv, -1, 1);
+        const hyperbolicGain = branch.hyperbolicSum > 0 ? Math.max(branch.hyperbolicSum * inv, 0) : 1;
+        const magnitude = Math.max(branch.magnitudeSum * inv, 0);
+        entries.push({
+            index,
+            sampleCount: branch.count,
+            meanPhase,
+            coherence,
+            meanParallax,
+            hyperbolicGain,
+            magnitude
+        });
+    }
+    if (!entries.length)
+        return null;
+    return {
+        kind,
+        entries
+    };
+};
+export const computeHyperbolicFlowScale = (hyperRadius, curvatureStrength) => {
+    const strength = clamp01(curvatureStrength);
+    if (strength <= 1e-6)
         return 1;
-    const denom = Math.max(1 - radiusNorm * radiusNorm, 0.2);
-    const boost = 1 / denom - 1;
-    const factor = 1 + strength * kNorm * boost;
-    return clamp(factor, 1, 1 + strength * 3);
+    const limitedRadius = Math.min(Math.abs(hyperRadius), 6);
+    if (limitedRadius <= 1e-6)
+        return 1;
+    const base = Math.sinh(limitedRadius) / limitedRadius;
+    if (!Number.isFinite(base))
+        return 1;
+    return Math.max(1, 1 + (base - 1) * strength);
+};
+const computeHyperbolicTransparencyBoost = (hyperScale, radiusNorm, tagAbs, kNorm, transparency) => {
+    if (hyperScale <= 1 + 1e-6 || kNorm <= 1e-6)
+        return 1;
+    const strength = clamp01(0.45 + 0.4 * transparency);
+    if (strength <= 1e-6)
+        return 1;
+    const weight = clamp01(radiusNorm) * clamp01(kNorm) * clamp01(tagAbs);
+    const boost = 1 + (hyperScale - 1) * strength * weight;
+    return clamp(boost, 0.4, 2.8);
 };
 export const hash2 = (x, y) => {
     const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
@@ -182,83 +360,153 @@ export const kEff = (k, d) => ({
     Q: k.Q * (1 + DMT_SENS.q1 * d),
     anisotropy: k.anisotropy + DMT_SENS.a1 * d,
     chirality: k.chirality + DMT_SENS.c1 * d,
-    transparency: k.transparency + DMT_SENS.t1 * d
+    transparency: k.transparency + DMT_SENS.t1 * d,
+    couplingPreset: k.couplingPreset
 });
 export const groupOps = (kind) => {
+    const HALF = 0.5;
+    const THIRD = 1 / 3;
+    const rot = (angle, tx = 0, ty = 0) => ({
+        kind: "rot",
+        angle,
+        tx,
+        ty
+    });
+    const id = (tx = 0, ty = 0) => rot(0, tx, ty);
+    const mirrorX = (tx = 0, ty = 0) => ({ kind: "mirrorX", tx, ty });
+    const mirrorY = (tx = 0, ty = 0) => ({ kind: "mirrorY", tx, ty });
+    const diag1 = (tx = 0, ty = 0) => ({ kind: "diag1", tx, ty });
+    const diag2 = (tx = 0, ty = 0) => ({ kind: "diag2", tx, ty });
     switch (kind) {
+        case "p1":
+            return [id(), id(HALF, 0), id(0, HALF), id(HALF, HALF)];
         case "p2":
-            return [
-                { kind: "rot", angle: 0 },
-                { kind: "rot", angle: Math.PI }
-            ];
-        case "p4":
-            return [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2].map((angle) => ({
-                kind: "rot",
-                angle
-            }));
-        case "p6":
-            return Array.from({ length: 6 }, (_, j) => ({
-                kind: "rot",
-                angle: (j * Math.PI) / 3
-            }));
+            return [rot(0), rot(Math.PI), rot(0, HALF, HALF), rot(Math.PI, HALF, HALF)];
+        case "pm":
+            return [id(), mirrorX(), id(HALF, 0), mirrorX(HALF, 0)];
+        case "pg":
+            return [id(), mirrorX(HALF, 0), id(0, HALF), mirrorX(HALF, HALF)];
+        case "cm":
+            return [id(), mirrorY(0, HALF), mirrorX(HALF, 0), mirrorY(HALF, HALF)];
         case "pmm":
-            return [
-                { kind: "rot", angle: 0 },
-                { kind: "rot", angle: Math.PI },
-                { kind: "mirrorX" },
-                { kind: "mirrorY" }
-            ];
+            return [rot(0), rot(Math.PI), mirrorX(), mirrorY()];
+        case "pmg":
+            return [rot(0), mirrorX(), mirrorY(HALF, 0), rot(Math.PI, HALF, 0)];
+        case "pgg":
+            return [rot(0), rot(Math.PI), mirrorX(HALF, 0), mirrorY(0, HALF)];
+        case "cmm":
+            return [rot(0), mirrorX(), mirrorY(), diag1(), diag2(), rot(Math.PI, HALF, HALF)];
+        case "p4":
+            return [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2].map((angle) => rot(angle));
         case "p4m":
             return [
-                { kind: "rot", angle: 0 },
-                { kind: "rot", angle: Math.PI / 2 },
-                { kind: "rot", angle: Math.PI },
-                { kind: "rot", angle: (3 * Math.PI) / 2 },
-                { kind: "mirrorX" },
-                { kind: "mirrorY" },
-                { kind: "diag1" },
-                { kind: "diag2" }
+                rot(0),
+                rot(Math.PI / 2),
+                rot(Math.PI),
+                rot((3 * Math.PI) / 2),
+                mirrorX(),
+                mirrorY(),
+                diag1(),
+                diag2()
+            ];
+        case "p4g":
+            return [
+                rot(0),
+                rot(Math.PI / 2),
+                rot(Math.PI),
+                rot((3 * Math.PI) / 2),
+                mirrorX(HALF, 0),
+                mirrorY(0, HALF),
+                diag1(HALF, 0),
+                diag2(0, HALF)
+            ];
+        case "p3":
+            return [0, (2 * Math.PI) / 3, (4 * Math.PI) / 3].map((angle) => rot(angle));
+        case "p3m1":
+            return [
+                rot(0),
+                rot((2 * Math.PI) / 3),
+                rot((4 * Math.PI) / 3),
+                mirrorX(),
+                diag1(THIRD, 0),
+                diag2(0, THIRD)
+            ];
+        case "p31m":
+            return [
+                rot(0),
+                rot((2 * Math.PI) / 3),
+                rot((4 * Math.PI) / 3),
+                mirrorY(),
+                diag1(2 * THIRD, THIRD),
+                diag2(THIRD, 2 * THIRD)
+            ];
+        case "p6":
+            return Array.from({ length: 6 }, (_, j) => rot((j * Math.PI) / 3));
+        case "p6m":
+            return [
+                ...Array.from({ length: 6 }, (_, j) => rot((j * Math.PI) / 3)),
+                mirrorX(),
+                mirrorY()
             ];
         default:
-            return [{ kind: "rot", angle: 0 }];
+            return [rot(0)];
     }
 };
 export const toGpuOps = (ops) => ops.map((op) => {
+    const tx = op.tx ?? 0;
+    const ty = op.ty ?? 0;
     switch (op.kind) {
         case "rot":
-            return { kind: 0, angle: op.angle };
+            return { kind: 0, angle: op.angle, tx, ty };
         case "mirrorX":
-            return { kind: 1, angle: 0 };
+            return { kind: 1, angle: 0, tx, ty };
         case "mirrorY":
-            return { kind: 2, angle: 0 };
+            return { kind: 2, angle: 0, tx, ty };
         case "diag1":
-            return { kind: 3, angle: 0 };
+            return { kind: 3, angle: 0, tx, ty };
         case "diag2":
-            return { kind: 4, angle: 0 };
+            return { kind: 4, angle: 0, tx, ty };
         default:
-            return { kind: 0, angle: 0 };
+            return { kind: 0, angle: 0, tx, ty };
     }
 });
 export const applyOp = (op, x, y, cx, cy) => {
     const dx = x - cx;
     const dy = y - cy;
+    let px = dx;
+    let py = dy;
     switch (op.kind) {
         case "rot": {
             const c = Math.cos(op.angle);
             const s = Math.sin(op.angle);
-            return { x: cx + c * dx - s * dy, y: cy + s * dx + c * dy };
+            px = c * dx - s * dy;
+            py = s * dx + c * dy;
+            break;
         }
         case "mirrorX":
-            return { x: 2 * cx - x, y };
+            px = -dx;
+            py = dy;
+            break;
         case "mirrorY":
-            return { x, y: 2 * cy - y };
+            px = dx;
+            py = -dy;
+            break;
         case "diag1":
-            return { x: cx + dy, y: cy + dx };
+            px = dy;
+            py = dx;
+            break;
         case "diag2":
-            return { x: cx - dy, y: cy - dx };
+            px = -dy;
+            py = -dx;
+            break;
         default:
-            return { x, y };
+            break;
     }
+    const width = cx * 2;
+    const height = cy * 2;
+    const tx = (op.tx ?? 0) * width;
+    const ty = (op.ty ?? 0) * height;
+    return { x: cx + px + tx, y: cy + py + ty };
 };
 export const sampleScalar = (arr, x, y, W, H) => {
     const xx = clamp(x, 0, W - 1.001);
@@ -335,7 +583,7 @@ const CRYSTAL_BEAT_SCALE = 12;
 const RIM_ENERGY_HIST_SCALE = 4;
 const SURFACE_HIST_BINS = 32;
 export const renderRainbowFrame = (input) => {
-    const { width, height, timeSeconds, out, surface, rim, phase, volume, kernel, dmt, blend, normPin, normTarget, lastObs, lambdaRef, lambdas, beta2, microsaccade, alive, phasePin, edgeThreshold, wallpaperGroup, surfEnabled, orientationAngles, thetaMode, thetaGlobal, polBins, jitter, coupling, sigma, contrast, rimAlpha, rimEnabled, displayMode, surfaceBlend, surfaceRegion, warpAmp, kurEnabled, debug, composer } = input;
+    const { width, height, timeSeconds, out, surface, rim, phase, volume, kernel, dmt, arousal, blend, normPin, normTarget, lastObs, lambdaRef, lambdas, beta2, microsaccade, alive, phasePin, edgeThreshold, wallpaperGroup, surfEnabled, orientationAngles, thetaMode, thetaGlobal, polBins, jitter, coupling, sigma, contrast, rimAlpha, rimEnabled, displayMode, surfaceBlend, surfaceRegion, warpAmp, curvatureStrength, curvatureMode, kurEnabled, debug, su7, composer, attentionHooks } = input;
     const rimDebug = debug?.rim ?? null;
     const surfaceDebug = debug?.surface ?? null;
     if (rimDebug) {
@@ -372,6 +620,38 @@ export const renderRainbowFrame = (input) => {
             scale: 1
         }
     };
+    const su7Params = su7 ?? createDefaultSu7RuntimeParams();
+    let surfaceFieldActive = surface;
+    const surfaceData = surface?.rgba ?? null;
+    const rimField = rim ?? null;
+    const phaseField = phase ?? null;
+    const volumeField = volume ?? null;
+    let volumePhase = volumeField?.phase ?? null;
+    let volumeDepth = volumeField?.depth ?? null;
+    let volumeIntensity = volumeField?.intensity ?? null;
+    let volumeDepthGrad = null;
+    let volPhaseSum = 0;
+    let volPhaseSumSq = 0;
+    let volDepthSum = 0;
+    let volDepthSumSq = 0;
+    let volIntensitySum = 0;
+    let volIntensitySumSq = 0;
+    let volGradSum = 0;
+    let volGradSumSq = 0;
+    let volSampleCount = 0;
+    const su7Context = su7Params.enabled && su7Params.gain > 1e-4
+        ? deriveSu7ScheduleContext({
+            width,
+            height,
+            phase: phaseField,
+            rim: rimField,
+            volume: volumeField,
+            dmt,
+            arousal,
+            curvatureStrength
+        })
+        : null;
+    const su7Telemetry = computeSu7Telemetry(su7Params, su7Context ?? undefined);
     const metrics = {
         rim: { mean: 0, max: 0, std: 0, count: 0 },
         warp: { mean: 0, std: 0, dominantAngle: 0, count: 0 },
@@ -467,7 +747,8 @@ export const renderRainbowFrame = (input) => {
                 resonanceRate: 0,
                 sampleCount: 0
             }
-        }
+        },
+        su7: su7Telemetry
     };
     if (input.kurTelemetry) {
         const tele = input.kurTelemetry;
@@ -515,58 +796,9 @@ export const renderRainbowFrame = (input) => {
         kur: 0,
         volume: 0
     };
-    const surfaceData = surface?.rgba ?? null;
-    const rimField = rim ?? null;
-    const phaseField = phase ?? null;
-    const volumeField = volume ?? null;
-    const volumePhase = volumeField?.phase ?? null;
-    const volumeDepth = volumeField?.depth ?? null;
-    const volumeIntensity = volumeField?.intensity ?? null;
     const { rimToSurfaceBlend, rimToSurfaceAlign, surfaceToRimOffset, surfaceToRimSigma, surfaceToRimHue, kurToTransparency, kurToOrientation, kurToChirality, volumePhaseToHue, volumeDepthToWarp } = coupling;
-    let volumeDepthGrad = null;
-    let volPhaseSum = 0;
-    let volPhaseSumSq = 0;
-    let volDepthSum = 0;
-    let volDepthSumSq = 0;
-    let volIntensitySum = 0;
-    let volIntensitySumSq = 0;
-    let volGradSum = 0;
-    let volGradSumSq = 0;
-    let volSampleCount = 0;
-    if (volumePhase && volumeDepth && volumeIntensity) {
-        volumeDepthGrad = new Float32Array(width * height);
-        for (let y = 0; y < height; y++) {
-            const upY = y > 0 ? y - 1 : y;
-            const downY = y + 1 < height ? y + 1 : y;
-            for (let x = 0; x < width; x++) {
-                const leftX = x > 0 ? x - 1 : x;
-                const rightX = x + 1 < width ? x + 1 : x;
-                const idx = y * width + x;
-                const idxLeft = y * width + leftX;
-                const idxRight = y * width + rightX;
-                const idxUp = upY * width + x;
-                const idxDown = downY * width + x;
-                const phaseVal = volumePhase[idx];
-                const depthVal = volumeDepth[idx];
-                const intensityVal = volumeIntensity[idx];
-                volPhaseSum += phaseVal;
-                volPhaseSumSq += phaseVal * phaseVal;
-                volDepthSum += depthVal;
-                volDepthSumSq += depthVal * depthVal;
-                volIntensitySum += intensityVal;
-                volIntensitySumSq += intensityVal * intensityVal;
-                const dx = (volumeDepth[idxRight] - volumeDepth[idxLeft]) * 0.5;
-                const dy = (volumeDepth[idxDown] - volumeDepth[idxUp]) * 0.5;
-                const gradVal = Math.hypot(dx, dy);
-                volumeDepthGrad[idx] = gradVal;
-                volGradSum += gradVal;
-                volGradSumSq += gradVal * gradVal;
-                volSampleCount++;
-            }
-        }
-    }
     const coupleVolumePhase = volumePhase != null && volumePhaseToHue > 1e-4;
-    const coupleVolumeWarp = volumeDepthGrad != null && volumeDepthToWarp > 1e-4;
+    let coupleVolumeWarp = false;
     const coupleRimSurface = rimToSurfaceBlend > 1e-4 || rimToSurfaceAlign > 1e-4;
     const coupleSurfaceRim = surfaceToRimOffset > 1e-4 ||
         surfaceToRimSigma > 1e-4 ||
@@ -605,13 +837,61 @@ export const renderRainbowFrame = (input) => {
         }
         return { metrics, obsAverage: null };
     }
-    const { gx, gy, mag } = rimField;
-    const baseData = surfaceData;
-    const gradX = phaseField?.gradX ?? null;
-    const gradY = phaseField?.gradY ?? null;
-    const vort = phaseField?.vort ?? null;
-    const coh = phaseField?.coh ?? null;
-    const amp = phaseField?.amp ?? null;
+    let baseData = surfaceData;
+    let gx = rimField.gx;
+    let gy = rimField.gy;
+    let mag = rimField.mag;
+    let gradX = phaseField?.gradX ?? null;
+    let gradY = phaseField?.gradY ?? null;
+    let vort = phaseField?.vort ?? null;
+    let coh = phaseField?.coh ?? null;
+    let amp = phaseField?.amp ?? null;
+    let su7Vectors = null;
+    let su7Norms = null;
+    let su7Unitary = null;
+    const su7Projector = su7Params.projector;
+    const su7Active = su7Params.enabled &&
+        su7Params.gain > 1e-4;
+    if (su7Active) {
+        const embedResult = embedToC7({
+            surface,
+            rim: rimField,
+            phase: phaseField,
+            volume,
+            width,
+            height,
+            gauge: "rim"
+        });
+        if (embedResult.vectors.length === width * height) {
+            su7Vectors = embedResult.vectors;
+            su7Norms = embedResult.norms;
+            su7Unitary = buildScheduledUnitary(su7Params, su7Context ?? undefined);
+        }
+    }
+    let su7DecimationStride = 1;
+    let su7DecimationMode = "hybrid";
+    if (su7Active) {
+        const rawParams = su7Params;
+        const strideCandidate = rawParams["decimationStride"];
+        if (typeof strideCandidate === "number" && Number.isFinite(strideCandidate) && strideCandidate >= 1) {
+            su7DecimationStride = Math.max(1, Math.floor(strideCandidate));
+        }
+        else {
+            su7DecimationStride = 2;
+        }
+        const modeCandidate = rawParams["decimationMode"];
+        if (modeCandidate === "stride" || modeCandidate === "edges" || modeCandidate === "hybrid") {
+            su7DecimationMode = modeCandidate;
+        }
+        else {
+            su7DecimationMode = "hybrid";
+        }
+    }
+    let su7NormDeltaSum = 0;
+    let su7NormDeltaMax = 0;
+    let su7NormSampleCount = 0;
+    let su7EnergySum = 0;
+    let su7EnergySampleCount = 0;
     const ke = clampKernelSpec(kEff(kernelSpec, dmt));
     const effectiveBlend = clamp01(blend + ke.transparency * 0.5);
     const eps = 1e-6;
@@ -631,6 +911,7 @@ export const renderRainbowFrame = (input) => {
     const useWallpaper = surfEnabled || coupleSurfaceRim;
     const cx = width * 0.5;
     const cy = height * 0.5;
+    const maxRadius = Math.hypot(cx, cy) || 1;
     const cosA = orientationAngles.map((a) => Math.cos(a));
     const sinA = orientationAngles.map((a) => Math.sin(a));
     const orientationCount = cosA.length;
@@ -642,7 +923,172 @@ export const renderRainbowFrame = (input) => {
     let crystalBeatSumSq = 0;
     let crystalResonance = 0;
     let crystalSamples = 0;
-    const textureDiag = computeTextureDiagnostics(surface, {
+    const curvatureStrengthClamped = clamp(Math.abs(curvatureStrength), 0, 0.95);
+    const curvatureActive = curvatureStrengthClamped > 1e-4;
+    const atlas = curvatureActive
+        ? input.hyperbolicAtlas ??
+            createHyperbolicAtlas({
+                width,
+                height,
+                curvatureStrength: curvatureStrengthClamped,
+                mode: curvatureMode
+            })
+        : null;
+    const atlasCoords = atlas?.coords ?? null;
+    const atlasJacobians = atlas?.jacobians ?? null;
+    const atlasAreaWeights = atlas?.areaWeights ?? null;
+    const atlasPolar = atlas?.polar ?? null;
+    const atlasMetadata = atlas?.metadata ?? null;
+    const atlasSampleScale = atlasMetadata?.maxRadius ?? 1;
+    const maxHyperRadius = curvatureActive && atlasMetadata
+        ? 2 *
+            atlasMetadata.curvatureScale *
+            Math.atanh(Math.min(0.999999, atlasMetadata.diskLimit))
+        : maxRadius;
+    if (curvatureActive && atlas && atlasCoords) {
+        const sampleScalar = (buffer, sx, sy) => {
+            const xClamped = Math.min(Math.max(sx, 0), width - 1);
+            const yClamped = Math.min(Math.max(sy, 0), height - 1);
+            const x0 = Math.floor(xClamped);
+            const y0 = Math.floor(yClamped);
+            const x1 = Math.min(x0 + 1, width - 1);
+            const y1 = Math.min(y0 + 1, height - 1);
+            const tx = xClamped - x0;
+            const ty = yClamped - y0;
+            const idx00 = y0 * width + x0;
+            const idx10 = y0 * width + x1;
+            const idx01 = y1 * width + x0;
+            const idx11 = y1 * width + x1;
+            const v00 = buffer[idx00];
+            const v10 = buffer[idx10];
+            const v01 = buffer[idx01];
+            const v11 = buffer[idx11];
+            const v0 = v00 + (v10 - v00) * tx;
+            const v1 = v01 + (v11 - v01) * tx;
+            return v0 + (v1 - v0) * ty;
+        };
+        const sampleRgba = (buffer, sx, sy, target, offset) => {
+            const xClamped = Math.min(Math.max(sx, 0), width - 1);
+            const yClamped = Math.min(Math.max(sy, 0), height - 1);
+            const x0 = Math.floor(xClamped);
+            const y0 = Math.floor(yClamped);
+            const x1 = Math.min(x0 + 1, width - 1);
+            const y1 = Math.min(y0 + 1, height - 1);
+            const tx = xClamped - x0;
+            const ty = yClamped - y0;
+            const idx00 = (y0 * width + x0) * 4;
+            const idx10 = (y0 * width + x1) * 4;
+            const idx01 = (y1 * width + x0) * 4;
+            const idx11 = (y1 * width + x1) * 4;
+            for (let c = 0; c < 4; c++) {
+                const v00 = buffer[idx00 + c];
+                const v10 = buffer[idx10 + c];
+                const v01 = buffer[idx01 + c];
+                const v11 = buffer[idx11 + c];
+                const v0 = v00 + (v10 - v00) * tx;
+                const v1 = v01 + (v11 - v01) * tx;
+                const value = v0 + (v1 - v0) * ty;
+                target[offset + c] = Math.round(Math.min(Math.max(value, 0), 255));
+            }
+        };
+        const baseResampled = new Uint8ClampedArray(baseData.length);
+        const gxResampled = new Float32Array(gx.length);
+        const gyResampled = new Float32Array(gy.length);
+        const magResampled = new Float32Array(mag.length);
+        const gradXResampled = gradX ? new Float32Array(gradX.length) : null;
+        const gradYResampled = gradY ? new Float32Array(gradY.length) : null;
+        const vortResampled = vort ? new Float32Array(vort.length) : null;
+        const cohResampled = coh ? new Float32Array(coh.length) : null;
+        const ampResampled = amp ? new Float32Array(amp.length) : null;
+        const volumePhaseResampled = volumePhase ? new Float32Array(volumePhase.length) : null;
+        const volumeDepthResampled = volumeDepth ? new Float32Array(volumeDepth.length) : null;
+        const volumeIntensityResampled = volumeIntensity ? new Float32Array(volumeIntensity.length) : null;
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = y * width + x;
+                const coordOffset = idx * 2;
+                const sx = atlasCoords[coordOffset];
+                const sy = atlasCoords[coordOffset + 1];
+                const rgbaIdx = idx * 4;
+                sampleRgba(baseData, sx, sy, baseResampled, rgbaIdx);
+                gxResampled[idx] = sampleScalar(gx, sx, sy);
+                gyResampled[idx] = sampleScalar(gy, sx, sy);
+                magResampled[idx] = sampleScalar(mag, sx, sy);
+                if (gradXResampled && gradX) {
+                    gradXResampled[idx] = sampleScalar(gradX, sx, sy);
+                }
+                if (gradYResampled && gradY) {
+                    gradYResampled[idx] = sampleScalar(gradY, sx, sy);
+                }
+                if (vortResampled && vort) {
+                    vortResampled[idx] = sampleScalar(vort, sx, sy);
+                }
+                if (cohResampled && coh) {
+                    cohResampled[idx] = sampleScalar(coh, sx, sy);
+                }
+                if (ampResampled && amp) {
+                    ampResampled[idx] = sampleScalar(amp, sx, sy);
+                }
+                if (volumePhaseResampled && volumePhase) {
+                    volumePhaseResampled[idx] = sampleScalar(volumePhase, sx, sy);
+                }
+                if (volumeDepthResampled && volumeDepth) {
+                    volumeDepthResampled[idx] = sampleScalar(volumeDepth, sx, sy);
+                }
+                if (volumeIntensityResampled && volumeIntensity) {
+                    volumeIntensityResampled[idx] = sampleScalar(volumeIntensity, sx, sy);
+                }
+            }
+        }
+        if (atlasJacobians) {
+            const texels = width * height;
+            const jacobians = atlasJacobians;
+            for (let idx = 0; idx < texels; idx++) {
+                const jacOffset = idx * 4;
+                const j11 = jacobians[jacOffset] * atlasSampleScale;
+                const j12 = jacobians[jacOffset + 1] * atlasSampleScale;
+                const j21 = jacobians[jacOffset + 2] * atlasSampleScale;
+                const j22 = jacobians[jacOffset + 3] * atlasSampleScale;
+                const gradSampleX = gxResampled[idx];
+                const gradSampleY = gyResampled[idx];
+                const pullbackX = gradSampleX * j11 + gradSampleY * j21;
+                const pullbackY = gradSampleX * j12 + gradSampleY * j22;
+                gxResampled[idx] = pullbackX;
+                gyResampled[idx] = pullbackY;
+                magResampled[idx] = Math.hypot(pullbackX, pullbackY);
+                if (gradXResampled && gradYResampled) {
+                    const phaseSampleX = gradXResampled[idx];
+                    const phaseSampleY = gradYResampled[idx];
+                    gradXResampled[idx] = phaseSampleX * j11 + phaseSampleY * j21;
+                    gradYResampled[idx] = phaseSampleX * j12 + phaseSampleY * j22;
+                }
+            }
+        }
+        baseData = baseResampled;
+        gx = gxResampled;
+        gy = gyResampled;
+        mag = magResampled;
+        if (gradXResampled)
+            gradX = gradXResampled;
+        if (gradYResampled)
+            gradY = gradYResampled;
+        if (vortResampled)
+            vort = vortResampled;
+        if (cohResampled)
+            coh = cohResampled;
+        if (ampResampled)
+            amp = ampResampled;
+        if (volumePhaseResampled)
+            volumePhase = volumePhaseResampled;
+        if (volumeDepthResampled)
+            volumeDepth = volumeDepthResampled;
+        if (volumeIntensityResampled)
+            volumeIntensity = volumeIntensityResampled;
+        surfaceFieldActive = surface
+            ? { kind: "surface", resolution: surface.resolution, rgba: baseResampled }
+            : surfaceFieldActive;
+    }
+    const textureDiag = computeTextureDiagnostics(surfaceFieldActive ?? surface, {
         orientations: orientationAngles
     });
     metrics.texture.earlyVision = {
@@ -660,7 +1106,52 @@ export const renderRainbowFrame = (input) => {
         divisiveStd: textureDiag.divisiveStd
     };
     const crystalBeatWeight = Math.min(textureDiag.beatEnergyMean * CRYSTAL_BEAT_SCALE, 1);
-    const maxRadius = Math.hypot(cx, cy) || 1;
+    if (volumePhase && volumeDepth && volumeIntensity) {
+        volumeDepthGrad = new Float32Array(width * height);
+        for (let y = 0; y < height; y++) {
+            const upY = y > 0 ? y - 1 : y;
+            const downY = y + 1 < height ? y + 1 : y;
+            for (let x = 0; x < width; x++) {
+                const leftX = x > 0 ? x - 1 : x;
+                const rightX = x + 1 < width ? x + 1 : x;
+                const idx = y * width + x;
+                const idxLeft = y * width + leftX;
+                const idxRight = y * width + rightX;
+                const idxUp = upY * width + x;
+                const idxDown = downY * width + x;
+                const phaseVal = volumePhase[idx];
+                const depthVal = volumeDepth[idx];
+                const intensityVal = volumeIntensity[idx];
+                volPhaseSum += phaseVal;
+                volPhaseSumSq += phaseVal * phaseVal;
+                volDepthSum += depthVal;
+                volDepthSumSq += depthVal * depthVal;
+                volIntensitySum += intensityVal;
+                volIntensitySumSq += intensityVal * intensityVal;
+                let basisX = 1;
+                let basisY = 1;
+                if (curvatureActive && atlasJacobians) {
+                    const jacOffset = idx * 4;
+                    const j11 = atlasJacobians[jacOffset] * atlasSampleScale;
+                    const j12 = atlasJacobians[jacOffset + 1] * atlasSampleScale;
+                    const j21 = atlasJacobians[jacOffset + 2] * atlasSampleScale;
+                    const j22 = atlasJacobians[jacOffset + 3] * atlasSampleScale;
+                    basisX = Math.hypot(j11, j21);
+                    basisY = Math.hypot(j12, j22);
+                }
+                const scaleX = basisX > 1e-6 ? basisX : 1;
+                const scaleY = basisY > 1e-6 ? basisY : 1;
+                const dx = ((volumeDepth[idxRight] - volumeDepth[idxLeft]) * 0.5) / scaleX;
+                const dy = ((volumeDepth[idxDown] - volumeDepth[idxUp]) * 0.5) / scaleY;
+                const gradVal = Math.hypot(dx, dy);
+                volumeDepthGrad[idx] = gradVal;
+                volGradSum += gradVal;
+                volGradSumSq += gradVal * gradVal;
+                volSampleCount++;
+            }
+        }
+    }
+    coupleVolumeWarp = volumeDepthGrad != null && volumeDepthToWarp > 1e-4;
     const orientationBranches = orientationCount > 1 ? createBranchAccumulators(orientationCount) : null;
     const wallpaperBranches = opsCount > 1 ? createBranchAccumulators(opsCount) : null;
     let parallaxRadiusSum = 0;
@@ -708,24 +1199,28 @@ export const renderRainbowFrame = (input) => {
         let cohSum = 0;
         let cohSumSq = 0;
         const total = gradX.length;
+        let weightSum = 0;
         for (let i = 0; i < total; i++) {
+            const weight = curvatureActive && atlasAreaWeights ? atlasAreaWeights[i] : 1;
             const gMag = Math.hypot(gradX[i], gradY[i]);
-            gradSum += gMag;
-            gradSumSq += gMag * gMag;
+            gradSum += gMag * weight;
+            gradSumSq += gMag * gMag * weight;
             const v = vort ? vort[i] : 0;
-            vortSum += v;
-            vortSumSq += v * v;
+            vortSum += v * weight;
+            vortSumSq += v * v * weight;
             const c = coh ? coh[i] : 0;
-            cohSum += c;
-            cohSumSq += c * c;
+            cohSum += c * weight;
+            cohSumSq += c * c * weight;
+            weightSum += weight;
         }
-        metrics.gradient.gradMean = gradSum / total;
-        metrics.gradient.gradStd = finalizeStats(gradSum, gradSumSq, total).std;
-        metrics.gradient.vortMean = vortSum / total;
-        metrics.gradient.vortStd = finalizeStats(vortSum, vortSumSq, total).std;
-        metrics.gradient.cohMean = cohSum / total;
-        metrics.gradient.cohStd = finalizeStats(cohSum, cohSumSq, total).std;
-        metrics.gradient.sampleCount = total;
+        const effectiveCount = weightSum > 1e-9 ? weightSum : total;
+        metrics.gradient.gradMean = gradSum / effectiveCount;
+        metrics.gradient.gradStd = finalizeStats(gradSum, gradSumSq, effectiveCount).std;
+        metrics.gradient.vortMean = vortSum / effectiveCount;
+        metrics.gradient.vortStd = finalizeStats(vortSum, vortSumSq, effectiveCount).std;
+        metrics.gradient.cohMean = cohSum / effectiveCount;
+        metrics.gradient.cohStd = finalizeStats(cohSum, cohSumSq, effectiveCount).std;
+        metrics.gradient.sampleCount = effectiveCount;
     }
     let muJ = 0;
     let cnt = 0;
@@ -735,7 +1230,10 @@ export const renderRainbowFrame = (input) => {
             for (let xx = 0; xx < width; xx += stride) {
                 const idx = yy * width + xx;
                 if (mag[idx] >= edgeThreshold) {
-                    muJ += Math.sin(jitterPhase + hash2(xx, yy) * Math.PI * 2);
+                    const coordOffset = idx * 2;
+                    const seedX = curvatureActive && atlasCoords ? atlasCoords[coordOffset] : xx;
+                    const seedY = curvatureActive && atlasCoords ? atlasCoords[coordOffset + 1] : yy;
+                    muJ += Math.sin(jitterPhase + hash2(seedX, seedY) * Math.PI * 2);
                     cnt++;
                 }
             }
@@ -765,12 +1263,25 @@ export const renderRainbowFrame = (input) => {
         for (let x = 0; x < width; x++) {
             const p = y * width + x;
             const i = p * 4;
-            const dx = x - cx;
-            const dy = y - cy;
-            const radius = Math.hypot(dx, dy);
-            const radiusNorm = maxRadius > 0 ? radius / maxRadius : 0;
-            const radialX = radius > 1e-6 ? dx / radius : 0;
-            const radialY = radius > 1e-6 ? dy / radius : 0;
+            const coordOffset = p * 2;
+            const posX = curvatureActive && atlasCoords ? atlasCoords[coordOffset] : x;
+            const posY = curvatureActive && atlasCoords ? atlasCoords[coordOffset + 1] : y;
+            const sampleDx = posX - cx;
+            const sampleDy = posY - cy;
+            const sampleRadius = Math.hypot(sampleDx, sampleDy);
+            const sampleRadiusNorm = maxRadius > 0 ? sampleRadius / maxRadius : 0;
+            const hyperRadius = curvatureActive && atlasPolar ? atlasPolar[coordOffset] : sampleRadius;
+            const hyperTheta = curvatureActive && atlasPolar
+                ? atlasPolar[coordOffset + 1]
+                : Math.atan2(sampleDy, sampleDx);
+            const radiusNorm = maxHyperRadius > 1e-6
+                ? clamp(hyperRadius / maxHyperRadius, 0, 0.999999)
+                : sampleRadiusNorm;
+            const hyperFlowScale = curvatureActive && curvatureStrengthClamped > 1e-6
+                ? computeHyperbolicFlowScale(hyperRadius, curvatureStrengthClamped)
+                : 1;
+            const radialX = Math.cos(hyperTheta);
+            const radialY = Math.sin(hyperTheta);
             out[i + 0] = baseData[i + 0];
             out[i + 1] = baseData[i + 1];
             out[i + 2] = baseData[i + 2];
@@ -782,6 +1293,76 @@ export const renderRainbowFrame = (input) => {
                 out[i + 1] = yb;
                 out[i + 2] = yb;
             }
+            const baseColorSrgb = [
+                clamp01(baseData[i + 0] / 255),
+                clamp01(baseData[i + 1] / 255),
+                clamp01(baseData[i + 2] / 255)
+            ];
+            const magVal = mag[p];
+            let composerWeightRim = composerFields.rim.weight;
+            let composerWeightSurface = composerFields.surface.weight;
+            let composerWeightKur = composerFields.kur.weight;
+            let composerWeightVolume = composerFields.volume.weight;
+            let su7Projection = null;
+            if (su7Unitary && su7Vectors && su7Norms) {
+                const baseVector = su7Vectors[p];
+                const baseNorm = su7Norms[p] ?? 0;
+                if (baseVector && baseNorm > 0) {
+                    const strideEligible = su7DecimationStride <= 1 ||
+                        ((x % su7DecimationStride === 0) && (y % su7DecimationStride === 0));
+                    const rimEligible = magVal >= edgeThreshold;
+                    let shouldProject = false;
+                    if (su7DecimationStride <= 1) {
+                        shouldProject = true;
+                    }
+                    else if (su7DecimationMode === "stride") {
+                        shouldProject = strideEligible;
+                    }
+                    else if (su7DecimationMode === "edges") {
+                        shouldProject = rimEligible;
+                    }
+                    else {
+                        shouldProject = strideEligible || rimEligible;
+                    }
+                    if (shouldProject) {
+                        const transformed = applySU7(su7Unitary, baseVector);
+                        const transformedNorm = computeC7Norm(transformed);
+                        const normDelta = Math.abs(transformedNorm - baseNorm);
+                        su7NormDeltaSum += normDelta;
+                        if (normDelta > su7NormDeltaMax) {
+                            su7NormDeltaMax = normDelta;
+                        }
+                        su7NormSampleCount += 1;
+                        su7Projection = projectSu7Vector({
+                            vector: transformed,
+                            norm: baseNorm,
+                            projector: su7Projector,
+                            gain: su7Params.gain,
+                            frameGain,
+                            baseColor: baseColorSrgb
+                        });
+                        if (su7Projection) {
+                            su7EnergySum += su7Projection.energy;
+                            su7EnergySampleCount += 1;
+                        }
+                    }
+                    if (su7Projection?.composerWeights) {
+                        const weights = su7Projection.composerWeights;
+                        if (weights.rim != null) {
+                            composerWeightRim = clamp(composerWeightRim * weights.rim, 0.05, 3);
+                        }
+                        if (weights.surface != null) {
+                            composerWeightSurface = clamp(composerWeightSurface * weights.surface, 0.05, 3);
+                        }
+                        if (weights.kur != null) {
+                            composerWeightKur = clamp(composerWeightKur * weights.kur, 0.05, 3);
+                        }
+                        if (weights.volume != null) {
+                            composerWeightVolume = clamp(composerWeightVolume * weights.volume, 0.05, 3);
+                        }
+                    }
+                }
+            }
             let baseGradX = 0;
             let baseGradY = 0;
             if (kurEnabled && gradX && gradY) {
@@ -790,12 +1371,13 @@ export const renderRainbowFrame = (input) => {
             }
             let flowX = 0;
             let flowY = 0;
+            let projectionStretch = 1;
             const debugOrientationCap = surfaceDebug ? Math.min(surfaceDebug.orientationCount, orientationCount) : 0;
             if (orientationCount > 0) {
                 const latticeFreq = 0.015 + 0.004 * orientationCount;
                 const timeShift = timeSeconds * 0.6 + dmt * 0.3;
                 for (let k = 0; k < orientationCount; k++) {
-                    const proj = (x - cx) * cosA[k] + (y - cy) * sinA[k];
+                    const proj = sampleDx * cosA[k] + sampleDy * sinA[k];
                     const phaseVal = proj * latticeFreq + timeShift + k * 0.35;
                     const magnitude = 0.5 + 0.5 * Math.sin(phaseVal + beta2 * 0.25);
                     const wrappedPhase = ((phaseVal % TAU) + TAU) % TAU;
@@ -808,6 +1390,8 @@ export const renderRainbowFrame = (input) => {
                             const invMag = 1 / branchMag;
                             branch.phaseCos += branchVecX * invMag;
                             branch.phaseSin += branchVecY * invMag;
+                            branch.magnitudeSum += magnitude;
+                            branch.hyperbolicSum += hyperFlowScale;
                             const tag = clamp((branchVecX * radialX + branchVecY * radialY) * invMag, -1, 1);
                             branch.parallaxSum += tag;
                             branch.count += 1;
@@ -837,7 +1421,7 @@ export const renderRainbowFrame = (input) => {
             }
             else if (useWallpaper) {
                 for (let k = 0; k < opsCount; k++) {
-                    const pt = applyOp(ops[k], x, y, cx, cy);
+                    const pt = applyOp(ops[k], posX, posY, cx, cy);
                     const r = wallpaperAt(pt.x - cx, pt.y - cy, cosA, sinA, ke, timeSeconds, alive);
                     if (wallpaperBranches) {
                         const branch = wallpaperBranches[k];
@@ -848,6 +1432,8 @@ export const renderRainbowFrame = (input) => {
                             const invMag = 1 / branchMag;
                             branch.phaseCos += branchVecX * invMag;
                             branch.phaseSin += branchVecY * invMag;
+                            branch.magnitudeSum += branchMag;
+                            branch.hyperbolicSum += hyperFlowScale;
                             const tag = clamp((branchVecX * radialX + branchVecY * radialY) * invMag, -1, 1);
                             branch.parallaxSum += tag;
                             branch.count += 1;
@@ -880,33 +1466,75 @@ export const renderRainbowFrame = (input) => {
                     couplingDmtScale *
                         volumeDepthToWarp *
                         gradSignal *
-                        composerFields.volume.weight;
+                        composerWeightVolume;
                 flowX *= boost;
                 flowY *= boost;
+            }
+            if (curvatureActive && atlasJacobians) {
+                const jacOffset = p * 4;
+                const j11 = atlasJacobians[jacOffset] * atlasSampleScale;
+                const j12 = atlasJacobians[jacOffset + 1] * atlasSampleScale;
+                const j21 = atlasJacobians[jacOffset + 2] * atlasSampleScale;
+                const j22 = atlasJacobians[jacOffset + 3] * atlasSampleScale;
+                const stretchX = Math.hypot(j11, j21);
+                const stretchY = Math.hypot(j12, j22);
+                projectionStretch = (stretchX + stretchY) * 0.5;
+                if (!Number.isFinite(projectionStretch) || projectionStretch <= 0) {
+                    projectionStretch = 1;
+                }
+                const det = j11 * j22 - j12 * j21;
+                if (Math.abs(det) > 1e-9) {
+                    const invDet = 1 / det;
+                    const flowHyperX = (j22 * flowX - j12 * flowY) * invDet;
+                    const flowHyperY = (-j21 * flowX + j11 * flowY) * invDet;
+                    const gradHyperX = (j22 * baseGradX - j12 * baseGradY) * invDet;
+                    const gradHyperY = (-j21 * baseGradX + j11 * baseGradY) * invDet;
+                    flowX = flowHyperX;
+                    flowY = flowHyperY;
+                    baseGradX = gradHyperX;
+                    baseGradY = gradHyperY;
+                }
+                else {
+                    flowX = 0;
+                    flowY = 0;
+                    baseGradX = 0;
+                    baseGradY = 0;
+                    projectionStretch = 0;
+                }
+            }
+            if (hyperFlowScale !== 1) {
+                flowX *= hyperFlowScale;
+                flowY *= hyperFlowScale;
+                baseGradX *= hyperFlowScale;
+                baseGradY *= hyperFlowScale;
             }
             let sharedGX = baseGradX + flowX;
             let sharedGY = baseGradY + flowY;
             let sharedMag = Math.hypot(sharedGX, sharedGY);
             let parallaxTransparencyBoost = 1;
+            const normDenom = Math.max(0.12 + 0.85 * ke.k0, 1e-3);
+            const kNorm = sharedMag > 1e-6 ? Math.min(sharedMag / normDenom, 1) : 0;
             if (sharedMag > 1e-6) {
-                const normDenom = Math.max(0.12 + 0.85 * ke.k0, 1e-3);
-                const kNorm = Math.min(sharedMag / normDenom, 1);
-                const hyperFactor = computeHyperbolicFactor(radiusNorm, kNorm, ke.transparency);
-                sharedGX *= hyperFactor;
-                sharedGY *= hyperFactor;
-                sharedMag = Math.hypot(sharedGX, sharedGY);
-                if (sharedMag > 1e-6) {
-                    const tag = clamp((sharedGX * radialX + sharedGY * radialY) / sharedMag, -1, 1);
-                    const kScaledNorm = Math.min(sharedMag / normDenom, 1);
-                    const transparencyBase = Math.abs(tag) * kScaledNorm;
-                    parallaxTransparencyBoost = clamp(1 + (hyperFactor - 1) * transparencyBase, 0.4, 2.8);
-                    parallaxRadiusSum += radiusNorm;
-                    parallaxRadiusSqSum += radiusNorm * radiusNorm;
-                    parallaxKSum += sharedMag;
-                    parallaxKSumSq += sharedMag * sharedMag;
-                    parallaxRadiusKSum += radiusNorm * sharedMag;
-                    parallaxTagAbsSum += Math.abs(tag);
-                    parallaxSamples++;
+                const tag = clamp((sharedGX * radialX + sharedGY * radialY) / sharedMag, -1, 1);
+                parallaxTransparencyBoost = computeHyperbolicTransparencyBoost(hyperFlowScale, radiusNorm, Math.abs(tag), kNorm, ke.transparency);
+                parallaxRadiusSum += radiusNorm;
+                parallaxRadiusSqSum += radiusNorm * radiusNorm;
+                parallaxKSum += sharedMag;
+                parallaxKSumSq += sharedMag * sharedMag;
+                parallaxRadiusKSum += radiusNorm * sharedMag;
+                parallaxTagAbsSum += Math.abs(tag);
+                parallaxSamples++;
+            }
+            if (surfaceDebug?.flowVectors) {
+                surfaceDebug.flowVectors.x[p] = sharedGX;
+                surfaceDebug.flowVectors.y[p] = sharedGY;
+                if (surfaceDebug.flowVectors.hyperbolicScale) {
+                    const hyperDebugScale = curvatureActive && curvatureMode === "klein" && atlasJacobians
+                        ? hyperFlowScale * projectionStretch
+                        : curvatureActive
+                            ? hyperFlowScale
+                            : 0;
+                    surfaceDebug.flowVectors.hyperbolicScale[p] = hyperDebugScale;
                 }
             }
             const gxT0 = sharedGX;
@@ -919,7 +1547,6 @@ export const renderRainbowFrame = (input) => {
                 warpSin += gyT0 / warpMag;
                 warpCount++;
             }
-            const magVal = mag[p];
             let rimEnergy = 0;
             if (rimEnabled && magVal >= edgeThreshold) {
                 let nx = gx[p];
@@ -944,7 +1571,7 @@ export const renderRainbowFrame = (input) => {
                         const ey = Math.sin(thetaUse);
                         const kx = baseGradX / kurNorm;
                         const ky = baseGradY / kurNorm;
-                        const mixW = clamp01(kurToOrientation * couplingDmtScale * composerFields.kur.weight);
+                        const mixW = clamp01(kurToOrientation * couplingDmtScale * composerWeightKur);
                         const vx = mixScalar(ex, kx, mixW);
                         const vy = mixScalar(ey, ky, mixW);
                         thetaUse = Math.atan2(vy, vx);
@@ -962,7 +1589,7 @@ export const renderRainbowFrame = (input) => {
                     (1 + Math.cos(delta) * Math.cos(2 * (thetaEff + 0.3)));
                 const polS = 0.5 *
                     (1 + Math.cos(delta) * Math.cos(2 * (thetaEff + 0.6)));
-                const rawJ = Math.sin(jitterPhase + hash2(x, y) * Math.PI * 2);
+                const rawJ = Math.sin(jitterPhase + hash2(posX, posY) * Math.PI * 2);
                 const localJ = jitter *
                     (microsaccade ? (phasePin ? rawJ - muJ : rawJ) : 0);
                 const warpNorm = Math.hypot(flowX, flowY);
@@ -974,7 +1601,7 @@ export const renderRainbowFrame = (input) => {
                     bias = clamp(0.65 *
                         couplingDmtScale *
                         surfaceToRimOffset *
-                        composerFields.surface.weight *
+                        composerWeightSurface *
                         signed, -0.9, 0.9);
                 }
                 let sigmaEff = sigma;
@@ -983,7 +1610,7 @@ export const renderRainbowFrame = (input) => {
                     const drop = clamp01(0.75 *
                         couplingDmtScale *
                         surfaceToRimSigma *
-                        composerFields.surface.weight *
+                        composerWeightSurface *
                         sharpness);
                     const sigmaFloor = Math.min(sigma, sigmaFloorBase);
                     sigmaEff = clamp(sigma * (1 - drop), sigmaFloor, sigma);
@@ -999,7 +1626,7 @@ export const renderRainbowFrame = (input) => {
                     const signedPhase = phaseNorm < 0 ? -phaseMag : phaseMag;
                     const volHue = clamp(couplingDmtScale *
                         volumePhaseToHue *
-                        composerFields.volume.weight *
+                        composerWeightVolume *
                         signedPhase *
                         0.6, -1.5, 1.5);
                     hueShift += volHue;
@@ -1017,7 +1644,7 @@ export const renderRainbowFrame = (input) => {
                     const signed = (deltaAngle === 0 ? 0 : Math.sign(deltaAngle)) * hueSignal;
                     hueShift = clamp(couplingDmtScale *
                         surfaceToRimHue *
-                        composerFields.surface.weight *
+                        composerWeightSurface *
                         signed *
                         0.9, -1.4, 1.4);
                 }
@@ -1035,7 +1662,7 @@ export const renderRainbowFrame = (input) => {
                 let chBase = ke.chirality;
                 if (coupleKurChirality && vort) {
                     const vortVal = clamp(vort[p], -1, 1);
-                    const vortScaled = 0.5 * couplingDmtScale * kurToChirality * composerFields.kur.weight * vortVal;
+                    const vortScaled = 0.5 * couplingDmtScale * kurToChirality * composerWeightKur * vortVal;
                     chBase = clamp(chBase + vortScaled, -3, 3);
                 }
                 const chiL = 0.5 + 0.5 * Math.sin(chiPhase) * chBase;
@@ -1120,7 +1747,7 @@ export const renderRainbowFrame = (input) => {
                     const boost = clamp(1 +
                         couplingDmtScale *
                             kurToTransparency *
-                            composerFields.kur.weight *
+                            composerWeightKur *
                             (kurMeasure - 0.5) *
                             1.5, 0.1, 2.5);
                     pixelBlend = clamp01(pixelBlend * boost);
@@ -1128,7 +1755,7 @@ export const renderRainbowFrame = (input) => {
                     composerBlend.kur += kurMeasure;
                     composerSamples.kur += 1;
                 }
-                pixelBlend = clamp01(pixelBlend * composerFields.rim.weight);
+                pixelBlend = clamp01(pixelBlend * composerWeightRim);
                 out[i + 0] = Math.floor(out[i + 0] * (1 - pixelBlend) + R * 255 * pixelBlend);
                 out[i + 1] = Math.floor(out[i + 1] * (1 - pixelBlend) + G * 255 * pixelBlend);
                 out[i + 2] = Math.floor(out[i + 2] * (1 - pixelBlend) + B * 255 * pixelBlend);
@@ -1152,7 +1779,12 @@ export const renderRainbowFrame = (input) => {
             if (surfEnabled) {
                 let mask = 1.0;
                 if (surfaceRegion === "surfaces") {
-                    mask = clamp01((edgeThreshold - magVal) / Math.max(1e-6, edgeThreshold));
+                    if (edgeThreshold <= 1e-6) {
+                        mask = 1;
+                    }
+                    else {
+                        mask = clamp01((edgeThreshold - magVal) / edgeThreshold);
+                    }
                 }
                 else if (surfaceRegion === "edges") {
                     mask = clamp01((magVal - edgeThreshold) / Math.max(1e-6, 1 - edgeThreshold));
@@ -1170,7 +1802,7 @@ export const renderRainbowFrame = (input) => {
                             const alignment = responsePow((dot + 1) * 0.5, rimToSurfaceAlign);
                             const alignWeight = clamp01(rimToSurfaceAlign *
                                 couplingDmtScale *
-                                composerFields.surface.weight *
+                                composerWeightSurface *
                                 alignment);
                             const targetX = tx * surfLen;
                             const targetY = ty * surfLen;
@@ -1185,7 +1817,7 @@ export const renderRainbowFrame = (input) => {
                             if (surfLen > 1e-6) {
                                 const targetX = (baseGradX / kurNorm) * surfLen;
                                 const targetY = (baseGradY / kurNorm) * surfLen;
-                                const weight = clamp01(kurToOrientation * couplingDmtScale * composerFields.kur.weight * 0.75);
+                                const weight = clamp01(kurToOrientation * couplingDmtScale * composerWeightKur * 0.75);
                                 gxSurf = mixScalar(gxSurf, targetX, weight);
                                 gySurf = mixScalar(gySurf, targetY, weight);
                             }
@@ -1219,7 +1851,7 @@ export const renderRainbowFrame = (input) => {
                         const rimBoost = clamp(1 +
                             couplingDmtScale *
                                 rimToSurfaceBlend *
-                                composerFields.rim.weight *
+                                composerWeightRim *
                                 energy, 0.2, 3);
                         sb *= rimBoost;
                     }
@@ -1231,7 +1863,7 @@ export const renderRainbowFrame = (input) => {
                         const boost = clamp(1 +
                             couplingDmtScale *
                                 kurToTransparency *
-                                composerFields.kur.weight *
+                                composerWeightKur *
                                 (kurMeasure - 0.5) *
                                 1.5, 0.1, 3);
                         sb *= boost;
@@ -1239,7 +1871,7 @@ export const renderRainbowFrame = (input) => {
                         composerBlend.kur += kurMeasure;
                         composerSamples.kur += 1;
                     }
-                    sb = clamp01(sb * composerFields.surface.weight);
+                    sb = clamp01(sb * composerWeightSurface);
                     out[i + 0] = Math.floor(out[i + 0] * (1 - sb) + rW * 255 * sb);
                     out[i + 1] = Math.floor(out[i + 1] * (1 - sb) + gW * 255 * sb);
                     out[i + 2] = Math.floor(out[i + 2] * (1 - sb) + bW * 255 * sb);
@@ -1251,6 +1883,38 @@ export const renderRainbowFrame = (input) => {
                     if (sb > surfaceMax)
                         surfaceMax = sb;
                     surfaceCount++;
+                }
+            }
+            if (su7Projection) {
+                const mix = clamp01(su7Projection.mix);
+                if (mix > 1e-6) {
+                    const currentR = out[i + 0] / 255;
+                    const currentG = out[i + 1] / 255;
+                    const currentB = out[i + 2] / 255;
+                    const su7Rgb = su7Projection.rgb;
+                    const blendedR = clamp01(currentR * (1 - mix) + su7Rgb[0] * mix);
+                    const blendedG = clamp01(currentG * (1 - mix) + su7Rgb[1] * mix);
+                    const blendedB = clamp01(currentB * (1 - mix) + su7Rgb[2] * mix);
+                    out[i + 0] = Math.round(blendedR * 255);
+                    out[i + 1] = Math.round(blendedG * 255);
+                    out[i + 2] = Math.round(blendedB * 255);
+                }
+                if (su7Projection.overlays) {
+                    for (const overlay of su7Projection.overlays) {
+                        const overlayMix = clamp01(overlay.mix);
+                        if (overlayMix <= 1e-6)
+                            continue;
+                        const currentR = out[i + 0] / 255;
+                        const currentG = out[i + 1] / 255;
+                        const currentB = out[i + 2] / 255;
+                        const overlayRgb = overlay.rgb;
+                        const blendedR = clamp01(currentR * (1 - overlayMix) + overlayRgb[0] * overlayMix);
+                        const blendedG = clamp01(currentG * (1 - overlayMix) + overlayRgb[1] * overlayMix);
+                        const blendedB = clamp01(currentB * (1 - overlayMix) + overlayRgb[2] * overlayMix);
+                        out[i + 0] = Math.round(blendedR * 255);
+                        out[i + 1] = Math.round(blendedG * 255);
+                        out[i + 2] = Math.round(blendedB * 255);
+                    }
                 }
             }
         }
@@ -1312,6 +1976,16 @@ export const renderRainbowFrame = (input) => {
     };
     const motionOrientation = computeMotionEnergyFromBranches(orientationBranches, "orientation");
     const motionWallpaper = computeMotionEnergyFromBranches(wallpaperBranches, "wallpaper");
+    if (attentionHooks) {
+        const orientationSummary = finalizeBranchAttentionSummary(orientationBranches, "orientation");
+        if (orientationSummary) {
+            attentionHooks.onOrientation?.(orientationSummary);
+        }
+        const wallpaperSummary = finalizeBranchAttentionSummary(wallpaperBranches, "wallpaper");
+        if (wallpaperSummary) {
+            attentionHooks.onWallpaper?.(wallpaperSummary);
+        }
+    }
     metrics.motionEnergy =
         motionOrientation ??
             motionWallpaper ??
@@ -1361,6 +2035,27 @@ export const renderRainbowFrame = (input) => {
             totalComposerEnergy > 1e-6 ? energyTotal / totalComposerEnergy : 0;
     });
     metrics.compositor.effectiveBlend = clamp01(effectiveBlend * rimComposerGain * composerFields.rim.weight);
+    if (su7Active && su7Unitary && su7Vectors && su7Norms) {
+        metrics.su7.normDeltaMean =
+            su7NormSampleCount > 0
+                ? su7NormDeltaSum / su7NormSampleCount
+                : su7Telemetry.normDeltaMean;
+        metrics.su7.normDeltaMax =
+            su7NormSampleCount > 0
+                ? su7NormDeltaMax
+                : su7Telemetry.normDeltaMax;
+        metrics.su7.projectorEnergy =
+            su7EnergySampleCount > 0
+                ? su7EnergySum / su7EnergySampleCount
+                : su7Telemetry.projectorEnergy;
+    }
+    else {
+        metrics.su7.unitaryError = 0;
+        metrics.su7.determinantDrift = 0;
+        metrics.su7.normDeltaMean = 0;
+        metrics.su7.normDeltaMax = 0;
+        metrics.su7.projectorEnergy = 0;
+    }
     const obs = obsCount > 0 ? clamp(obsSum / obsCount, 0.001, 10) : clamp(lastObs, 0.001, 10);
     let debugResult;
     if (rimDebug || surfaceDebug) {

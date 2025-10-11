@@ -1,4 +1,4 @@
-import { makeResolution, type RimField } from "../fields/contracts";
+import { makeResolution, type RimField } from '../fields/contracts';
 
 export type ImageBuffer = {
   data: Uint8ClampedArray;
@@ -13,8 +13,7 @@ export const computeEdgeField = (image: ImageBuffer): RimField => {
     for (let x = 0; x < width; x++) {
       const idx = (y * width + x) * 4;
       gray[y * width + x] =
-        (0.2126 * data[idx] + 0.7152 * data[idx + 1] + 0.0722 * data[idx + 2]) /
-        255;
+        (0.2126 * data[idx] + 0.7152 * data[idx + 1] + 0.0722 * data[idx + 2]) / 255;
     }
   }
 
@@ -54,10 +53,10 @@ export const computeEdgeField = (image: ImageBuffer): RimField => {
   }
 
   return {
-    kind: "rim",
+    kind: 'rim',
     resolution: makeResolution(width, height),
     gx,
     gy,
-    mag
+    mag,
   };
 };

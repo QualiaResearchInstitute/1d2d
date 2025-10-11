@@ -1,17 +1,15 @@
-import test from "node:test";
-import assert from "node:assert/strict";
+import test from 'node:test';
+import assert from 'node:assert/strict';
 
 import {
   makeResolution,
   type SurfaceField,
   type RimField,
-  type PhaseField
-} from "../src/fields/contracts.js";
-import {
-  renderRainbowFrame,
-  type CouplingConfig
-} from "../src/pipeline/rainbowFrame.js";
-import { createKernelSpec } from "../src/kernel/kernelSpec.js";
+  type PhaseField,
+} from '../src/fields/contracts.js';
+import { renderRainbowFrame, type CouplingConfig } from '../src/pipeline/rainbowFrame.js';
+import { createDefaultSu7RuntimeParams } from '../src/pipeline/su7/types.js';
+import { createKernelSpec } from '../src/kernel/kernelSpec.js';
 
 const createSurface = (width: number, height: number, value: number): SurfaceField => {
   const rgba = new Uint8ClampedArray(width * height * 4);
@@ -24,20 +22,20 @@ const createSurface = (width: number, height: number, value: number): SurfaceFie
     rgba[idx + 3] = 255;
   }
   return {
-    kind: "surface",
+    kind: 'surface',
     resolution: makeResolution(width, height),
-    rgba
+    rgba,
   };
 };
 
 const createRimField = (width: number, height: number): RimField => {
   const total = width * height;
   return {
-    kind: "rim",
+    kind: 'rim',
     resolution: makeResolution(width, height),
     gx: new Float32Array(total),
     gy: new Float32Array(total),
-    mag: new Float32Array(total)
+    mag: new Float32Array(total),
   };
 };
 
@@ -63,13 +61,13 @@ const createRadialPhaseField = (width: number, height: number): PhaseField => {
     }
   }
   return {
-    kind: "phase",
+    kind: 'phase',
     resolution: makeResolution(width, height),
     gradX,
     gradY,
     vort,
     coh,
-    amp
+    amp,
   };
 };
 
@@ -83,10 +81,10 @@ const zeroCoupling: CouplingConfig = {
   kurToOrientation: 0,
   kurToChirality: 0,
   volumePhaseToHue: 0,
-  volumeDepthToWarp: 0
+  volumeDepthToWarp: 0,
 };
 
-test("parallax metrics report positive radial slope for radial gradients", () => {
+test('parallax metrics report positive radial slope for radial gradients', () => {
   const width = 32;
   const height = 32;
   const surface = createSurface(width, height, 0.5);
@@ -109,9 +107,10 @@ test("parallax metrics report positive radial slope for radial gradients", () =>
       Q: 2.2,
       anisotropy: 0.5,
       chirality: 0.3,
-      transparency: 0.45
+      transparency: 0.45,
     }),
     dmt: 0,
+    arousal: 0,
     blend: 0.4,
     normPin: false,
     normTarget: 0.6,
@@ -123,10 +122,10 @@ test("parallax metrics report positive radial slope for radial gradients", () =>
     alive: false,
     phasePin: true,
     edgeThreshold: 1,
-    wallpaperGroup: "off",
+    wallpaperGroup: 'off',
     surfEnabled: false,
     orientationAngles: [],
-    thetaMode: "gradient",
+    thetaMode: 'gradient',
     thetaGlobal: 0,
     polBins: 0,
     jitter: 0,
@@ -135,22 +134,25 @@ test("parallax metrics report positive radial slope for radial gradients", () =>
     contrast: 1,
     rimAlpha: 1,
     rimEnabled: false,
-    displayMode: "color",
+    displayMode: 'color',
     surfaceBlend: 0,
-    surfaceRegion: "surfaces",
+    surfaceRegion: 'surfaces',
     warpAmp: 0,
+    curvatureStrength: 0,
+    curvatureMode: 'poincare',
     kurEnabled: true,
     debug: undefined,
-    composer: undefined
+    su7: createDefaultSu7RuntimeParams(),
+    composer: undefined,
   });
 
   const parallax = result.metrics.parallax;
-  assert.ok(parallax.sampleCount > 0, "expected parallax samples");
+  assert.ok(parallax.sampleCount > 0, 'expected parallax samples');
   assert.ok(parallax.radialSlope > 0.02, `radial slope too small (${parallax.radialSlope})`);
   assert.ok(parallax.tagConsistency > 0.7, `tag consistency low (${parallax.tagConsistency})`);
 });
 
-test("motion energy captures cross-branch phase shift for multi-orientation overlays", () => {
+test('motion energy captures cross-branch phase shift for multi-orientation overlays', () => {
   const width = 32;
   const height = 32;
   const surface = createSurface(width, height, 0.5);
@@ -172,9 +174,10 @@ test("motion energy captures cross-branch phase shift for multi-orientation over
       Q: 2.4,
       anisotropy: 0.4,
       chirality: 0.2,
-      transparency: 0.3
+      transparency: 0.3,
     }),
     dmt: 0.1,
+    arousal: 0,
     blend: 0.35,
     normPin: false,
     normTarget: 0.6,
@@ -186,10 +189,10 @@ test("motion energy captures cross-branch phase shift for multi-orientation over
     alive: false,
     phasePin: false,
     edgeThreshold: 1,
-    wallpaperGroup: "off",
+    wallpaperGroup: 'off',
     surfEnabled: true,
     orientationAngles: [0, Math.PI / 2],
-    thetaMode: "gradient",
+    thetaMode: 'gradient',
     thetaGlobal: 0,
     polBins: 0,
     jitter: 0,
@@ -198,21 +201,23 @@ test("motion energy captures cross-branch phase shift for multi-orientation over
     contrast: 1,
     rimAlpha: 1,
     rimEnabled: false,
-    displayMode: "color",
+    displayMode: 'color',
     surfaceBlend: 0.2,
-    surfaceRegion: "surfaces",
+    surfaceRegion: 'surfaces',
     warpAmp: 0.2,
+    curvatureStrength: 0,
+    curvatureMode: 'poincare',
     kurEnabled: false,
     debug: undefined,
-    composer: undefined
+    su7: createDefaultSu7RuntimeParams(),
+    composer: undefined,
   });
 
   const motionEnergy = result.metrics.motionEnergy;
-  assert.ok(motionEnergy.branchCount >= 2, "expected multiple motion branches");
-  assert.equal(motionEnergy.source, "orientation");
+  assert.ok(motionEnergy.branchCount >= 2, 'expected multiple motion branches');
+  assert.equal(motionEnergy.source, 'orientation');
   assert.ok(
     motionEnergy.phaseShiftMean > 0.05,
-    `phase shift too small (${motionEnergy.phaseShiftMean})`
+    `phase shift too small (${motionEnergy.phaseShiftMean})`,
   );
 });
-

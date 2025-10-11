@@ -1,5 +1,5 @@
-import test from "node:test";
-import assert from "node:assert/strict";
+import test from 'node:test';
+import assert from 'node:assert/strict';
 
 import {
   createKuramotoState,
@@ -10,9 +10,9 @@ import {
   getThinElementOperatorGains,
   initKuramotoState,
   stepKuramotoState,
-  type ThinElementSchedule
-} from "../src/kuramotoCore.js";
-import { clampKernelSpec, KERNEL_SPEC_DEFAULT } from "../src/kernel/kernelSpec.js";
+  type ThinElementSchedule,
+} from '../src/kuramotoCore.js';
+import { clampKernelSpec, KERNEL_SPEC_DEFAULT } from '../src/kernel/kernelSpec.js';
 
 const defaultParams = {
   alphaKur: 0.2,
@@ -21,17 +21,19 @@ const defaultParams = {
   K0: 0.6,
   epsKur: 0.001,
   fluxX: 0,
-  fluxY: 0
+  fluxY: 0,
+  smallWorldWeight: 0,
+  p_sw: 0,
 } as const;
 
-test("thin-element gains respond deterministically to DMT/arousal controls", () => {
+test('thin-element gains respond deterministically to DMT/arousal controls', () => {
   const kernel = clampKernelSpec({
     gain: 2.4,
     k0: 0.18,
     Q: 3.5,
     anisotropy: 1.1,
     chirality: 1.2,
-    transparency: 0.42
+    transparency: 0.42,
   });
 
   const baseGains = getThinElementOperatorGains(kernel);
@@ -39,12 +41,12 @@ test("thin-element gains respond deterministically to DMT/arousal controls", () 
   const arousalGains = getThinElementOperatorGains(kernel, { arousal: 0.8 });
   const combinedGains = getThinElementOperatorGains(kernel, { dmt: 0.5, arousal: 0.5 });
 
-  assert.ok(dmtGains.amplitude > baseGains.amplitude, "DMT should raise amplitude gain");
-  assert.ok(arousalGains.phase > baseGains.phase, "arousal should raise phase gain");
+  assert.ok(dmtGains.amplitude > baseGains.amplitude, 'DMT should raise amplitude gain');
+  assert.ok(arousalGains.phase > baseGains.phase, 'arousal should raise phase gain');
   assert.deepEqual(
     combinedGains,
     getThinElementOperatorGains(kernel, { dmt: 0.5, arousal: 0.5 }),
-    "gain mapping must be deterministic"
+    'gain mapping must be deterministic',
   );
 });
 
@@ -67,7 +69,7 @@ const computeRelativeAmpDelta = (baseline: Float32Array, variant: Float32Array) 
   return maxRelative;
 };
 
-test("beam-split schedule reproduces baseline thin-element chaining", () => {
+test('beam-split schedule reproduces baseline thin-element chaining', () => {
   const width = 12;
   const height = 10;
   const state = createKuramotoState(width, height);
@@ -86,15 +88,15 @@ test("beam-split schedule reproduces baseline thin-element chaining", () => {
   const scheduledDerived = createDerivedViews(bufferScheduled, width, height);
   const schedule: ThinElementSchedule = [
     {
-      kind: "beamSplit",
-      recombine: "average",
+      kind: 'beamSplit',
+      recombine: 'average',
       branches: [
         { weight: 1, steps: [] },
-        { weight: 1, steps: [] }
-      ]
+        { weight: 1, steps: [] },
+      ],
     },
-    { kind: "operator", operator: "amplitude" },
-    { kind: "operator", operator: "phase" }
+    { kind: 'operator', operator: 'amplitude' },
+    { kind: 'operator', operator: 'phase' },
   ];
   deriveKuramotoFields(state, scheduledDerived, { schedule });
 
@@ -103,7 +105,7 @@ test("beam-split schedule reproduces baseline thin-element chaining", () => {
     gradY: computeMaxDiff(baselineDerived.gradY, scheduledDerived.gradY),
     vort: computeMaxDiff(baselineDerived.vort, scheduledDerived.vort),
     coh: computeMaxDiff(baselineDerived.coh, scheduledDerived.coh),
-    amp: computeMaxDiff(baselineDerived.amp, scheduledDerived.amp)
+    amp: computeMaxDiff(baselineDerived.amp, scheduledDerived.amp),
   };
 
   Object.entries(metrics).forEach(([key, value]) => {
@@ -114,7 +116,7 @@ test("beam-split schedule reproduces baseline thin-element chaining", () => {
   assert.ok(relativeAmp <= 0.02, `amplitude should match within 2%, got ${relativeAmp}`);
 });
 
-test("DMT/arousal controls reshape derived amplitude deterministically", () => {
+test('DMT/arousal controls reshape derived amplitude deterministically', () => {
   const width = 16;
   const height = 12;
   const state = createKuramotoState(width, height);
@@ -132,7 +134,7 @@ test("DMT/arousal controls reshape derived amplitude deterministically", () => {
   const derivedMod = createDerivedViews(bufferMod, width, height);
   deriveKuramotoFields(state, derivedMod, {
     kernel: KERNEL_SPEC_DEFAULT,
-    controls: { dmt: 0.6, arousal: 0.4 }
+    controls: { dmt: 0.6, arousal: 0.4 },
   });
 
   let sumBase = 0;
@@ -142,10 +144,10 @@ test("DMT/arousal controls reshape derived amplitude deterministically", () => {
     sumMod += derivedMod.amp[i];
   }
 
-  assert.ok(sumMod > sumBase, "combined controls should raise average amplitude");
+  assert.ok(sumMod > sumBase, 'combined controls should raise average amplitude');
   assert.deepEqual(
     getThinElementOperatorGains(KERNEL_SPEC_DEFAULT, { dmt: 0.6, arousal: 0.4 }),
     getThinElementOperatorGains(KERNEL_SPEC_DEFAULT, { dmt: 0.6, arousal: 0.4 }),
-    "operator gains must stay deterministic across repeated queries"
+    'operator gains must stay deterministic across repeated queries',
   );
 });

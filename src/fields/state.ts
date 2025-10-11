@@ -1,4 +1,4 @@
-import { FIELD_CONTRACTS, FIELD_KINDS, type FieldKind, type FieldResolution } from "./contracts.js";
+import { FIELD_CONTRACTS, FIELD_KINDS, type FieldKind, type FieldResolution } from './contracts.js';
 
 export type FieldStatus = {
   kind: FieldKind;
@@ -19,7 +19,7 @@ const initialStatus = (kind: FieldKind): FieldStatus => ({
   updatedAt: null,
   stalenessMs: Number.POSITIVE_INFINITY,
   stale: false,
-  lastSource: null
+  lastSource: null,
 });
 
 export const createInitialStatuses = (): FieldStatusMap =>
@@ -33,7 +33,7 @@ export const markFieldUpdate = (
   kind: FieldKind,
   resolution: FieldResolution,
   source: string,
-  now: number
+  now: number,
 ): FieldStatusMap => {
   const nextStatus: FieldStatus = {
     ...prev[kind],
@@ -42,14 +42,14 @@ export const markFieldUpdate = (
     updatedAt: now,
     stalenessMs: 0,
     stale: false,
-    lastSource: source
+    lastSource: source,
   };
   if (prev[kind] === nextStatus) {
     return prev;
   }
   return {
     ...prev,
-    [kind]: nextStatus
+    [kind]: nextStatus,
   };
 };
 
@@ -57,7 +57,7 @@ export const markFieldUnavailable = (
   prev: FieldStatusMap,
   kind: FieldKind,
   source: string,
-  now: number
+  now: number,
 ): FieldStatusMap => {
   const status = prev[kind];
   if (!status.available && status.lastSource === source) {
@@ -70,11 +70,11 @@ export const markFieldUnavailable = (
     updatedAt: now,
     stalenessMs: Number.POSITIVE_INFINITY,
     stale: false,
-    lastSource: source
+    lastSource: source,
   };
   return {
     ...prev,
-    [kind]: nextStatus
+    [kind]: nextStatus,
   };
 };
 
@@ -87,7 +87,7 @@ export type FieldStalenessUpdate = {
 
 export const refreshFieldStaleness = (
   prev: FieldStatusMap,
-  now: number
+  now: number,
 ): { next: FieldStatusMap; changes: FieldStalenessUpdate[] } => {
   let changed = false;
   const updates: FieldStalenessUpdate[] = [];
@@ -96,30 +96,30 @@ export const refreshFieldStaleness = (
     const status = prev[kind];
     const contract = FIELD_CONTRACTS[kind];
     const updatedAt = status.updatedAt;
-    const stalenessMs = status.available && updatedAt != null ? Math.max(0, now - updatedAt) : Number.POSITIVE_INFINITY;
+    const stalenessMs =
+      status.available && updatedAt != null
+        ? Math.max(0, now - updatedAt)
+        : Number.POSITIVE_INFINITY;
     const staleThreshold = contract.lifetime.staleMs;
     const stale = status.available && updatedAt != null && stalenessMs > staleThreshold;
     const stableStaleness = status.available ? stalenessMs : Number.POSITIVE_INFINITY;
-    if (
-      Math.abs(status.stalenessMs - stableStaleness) > 0.5 ||
-      status.stale !== stale
-    ) {
+    if (Math.abs(status.stalenessMs - stableStaleness) > 0.5 || status.stale !== stale) {
       changed = true;
       next[kind] = {
         ...status,
         stalenessMs: stableStaleness,
-        stale
+        stale,
       };
       updates.push({
         kind,
         becameStale: !status.stale && stale,
         recovered: status.stale && !stale,
-        stalenessMs: stableStaleness
+        stalenessMs: stableStaleness,
       });
     }
   }
   return {
     next: changed ? next : prev,
-    changes: updates
+    changes: updates,
   };
 };

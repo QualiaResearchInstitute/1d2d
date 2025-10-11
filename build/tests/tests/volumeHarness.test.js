@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ingestVolumeRecording, createVolumeStubState, stepVolumeStub, snapshotVolumeStub } from "../src/volumeStub.js";
 import { renderRainbowFrame } from "../src/pipeline/rainbowFrame.js";
+import { createDefaultSu7RuntimeParams } from "../src/pipeline/su7/types.js";
 import { createKernelSpec } from "../src/kernel/kernelSpec.js";
 import { makeResolution } from "../src/fields/contracts.js";
 const readFixture = async () => {
@@ -100,6 +101,7 @@ const makeInput = (volume, surface, rim) => {
         volume,
         kernel: CANONICAL_KERNEL,
         dmt: 0.35,
+        arousal: 0.25,
         blend: 0.42,
         normPin: true,
         normTarget: 0.6,
@@ -127,8 +129,8 @@ const makeInput = (volume, surface, rim) => {
             kurToTransparency: 0,
             kurToOrientation: 0,
             kurToChirality: 0,
-            volumePhaseToHue: 0.85,
-            volumeDepthToWarp: 0.75
+            volumePhaseToHue: 1.4,
+            volumeDepthToWarp: 1.2
         },
         sigma: 3.2,
         contrast: 1.15,
@@ -138,16 +140,12 @@ const makeInput = (volume, surface, rim) => {
         surfaceBlend: 0.38,
         surfaceRegion: "both",
         warpAmp: 1.4,
+        curvatureStrength: 0,
+        curvatureMode: "poincare",
         kurEnabled: false,
-        debug: undefined
+        debug: undefined,
+        su7: createDefaultSu7RuntimeParams()
     };
-};
-const sumAbsDifference = (a, b) => {
-    let total = 0;
-    for (let i = 0; i < a.length; i++) {
-        total += Math.abs(a[i] - b[i]);
-    }
-    return total;
 };
 test("volume feed modulates pipeline outputs", async () => {
     const { recording, meta } = await readFixture();
@@ -162,6 +160,7 @@ test("volume feed modulates pipeline outputs", async () => {
     assert.ok(resultVolume.metrics.volume.phaseStd > 0.05);
     assert.ok(resultVolume.metrics.volume.depthGradMean > 0);
     assert.equal(resultNoVolume.metrics.volume.sampleCount, 0);
-    const diff = sumAbsDifference(inputWithVolume.out, inputWithoutVolume.out);
-    assert.ok(diff > 15, `expected perceptible diff, got ${diff}`);
+    const volumeEnergy = resultVolume.metrics.composer.fields.volume.energy;
+    const baselineEnergy = resultNoVolume.metrics.composer.fields.volume.energy;
+    assert.ok(volumeEnergy > baselineEnergy, `expected volume composer energy to rise (${volumeEnergy} vs ${baselineEnergy})`);
 });

@@ -1,4 +1,4 @@
-export type SyntheticCaseId = "circles" | "checkerboard" | "texturedPlane";
+export type SyntheticCaseId = 'circles' | 'checkerboard' | 'texturedPlane';
 
 export type SyntheticCase = {
   id: SyntheticCaseId;
@@ -82,8 +82,8 @@ const generateCheckerboard = (width: number, height: number): ImageData => {
 const generateTexturedPlane = (width: number, height: number): ImageData => {
   const image = createImage(width, height);
   const data = image.data;
-  const freqX = 2 * Math.PI / Math.max(1, width);
-  const freqY = 2 * Math.PI / Math.max(1, height);
+  const freqX = (2 * Math.PI) / Math.max(1, width);
+  const freqY = (2 * Math.PI) / Math.max(1, height);
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const idx = (y * width + x) * 4;
@@ -111,21 +111,21 @@ export const DEFAULT_SYNTHETIC_SIZE = { width: 512, height: 512 } as const;
 
 export const SYNTHETIC_CASES: SyntheticCase[] = [
   {
-    id: "circles",
-    label: "Concentric Circles",
-    description: "Radial rings with chromatic gradients for rim energy checks.",
-    generate: generateCircles
+    id: 'circles',
+    label: 'Concentric Circles',
+    description: 'Radial rings with chromatic gradients for rim energy checks.',
+    generate: generateCircles,
   },
   {
-    id: "checkerboard",
-    label: "High-Contrast Checkerboard",
-    description: "Binary checkerboard to stress edge detection and coupling deltas.",
-    generate: generateCheckerboard
+    id: 'checkerboard',
+    label: 'High-Contrast Checkerboard',
+    description: 'Binary checkerboard to stress edge detection and coupling deltas.',
+    generate: generateCheckerboard,
   },
   {
-    id: "texturedPlane",
-    label: "Textured Plane",
-    description: "Sinusoidal warp plane for surface morph and |Z| baselines.",
-    generate: generateTexturedPlane
-  }
+    id: 'texturedPlane',
+    label: 'Textured Plane',
+    description: 'Sinusoidal warp plane for surface morph and |Z| baselines.',
+    generate: generateTexturedPlane,
+  },
 ];

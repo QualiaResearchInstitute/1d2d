@@ -1,13 +1,13 @@
-import { join } from "node:path";
+import { join } from 'node:path';
 
-import {
-  computeEdgeField,
-  type ImageBuffer
-} from "../../src/pipeline/edgeDetection.js";
+import { computeEdgeField, type ImageBuffer } from '../../src/pipeline/edgeDetection.js';
 import {
   renderRainbowFrame,
-  type RainbowFrameMetrics
-} from "../../src/pipeline/rainbowFrame.js";
+  type RainbowFrameInput,
+  type RainbowFrameMetrics,
+  type CouplingConfig,
+} from '../../src/pipeline/rainbowFrame.js';
+import { createDefaultSu7RuntimeParams } from '../../src/pipeline/su7/types.js';
 import {
   createKuramotoState,
   createDerivedViews,
@@ -16,9 +16,11 @@ import {
   stepKuramotoState,
   deriveKuramotoFields,
   createNormalGenerator,
-  type KuramotoDerived,
-  type KuramotoParams
-} from "../../src/kuramotoCore.js";
+  snapshotVolumeField,
+  type KuramotoParams,
+} from '../../src/kuramotoCore.js';
+
+type KuramotoDerived = ReturnType<typeof createDerivedViews>;
 
 export const BASELINE_DIM = { width: 256, height: 256 } as const;
 
@@ -28,21 +30,22 @@ export const CANONICAL_KERNEL = {
   Q: 4.6,
   anisotropy: 0.95,
   chirality: 1.46,
-  transparency: 0.28
+  transparency: 0.28,
 } as const;
 
 export const CANONICAL_PARAMS = {
   edgeThreshold: 0.08,
   blend: 0.39,
   dmt: 0.2,
-  thetaMode: "gradient" as const,
+  arousal: 0.35,
+  thetaMode: 'gradient' as const,
   thetaGlobal: 0,
   beta2: 1.9,
   jitter: 1.16,
   sigma: 4,
   microsaccade: true,
   speed: 1.32,
-  contrast: 1.62
+  contrast: 1.62,
 };
 
 export const CANONICAL_KUR_PARAMS: KuramotoParams = {
@@ -52,7 +55,20 @@ export const CANONICAL_KUR_PARAMS: KuramotoParams = {
   K0: 0.6,
   epsKur: 0.002,
   fluxX: 0,
-  fluxY: 0
+  fluxY: 0,
+};
+
+const CANONICAL_COUPLING: CouplingConfig = {
+  rimToSurfaceBlend: 0.28,
+  rimToSurfaceAlign: 0.35,
+  surfaceToRimOffset: 0.28,
+  surfaceToRimSigma: 0.35,
+  surfaceToRimHue: 0.4,
+  kurToTransparency: 0.25,
+  kurToOrientation: 0.32,
+  kurToChirality: 0.35,
+  volumePhaseToHue: 0.52,
+  volumeDepthToWarp: 0.48,
 };
 
 const buildBaseImage = (width: number, height: number): ImageBuffer => {
@@ -91,7 +107,7 @@ const buildBaseImage = (width: number, height: number): ImageBuffer => {
     return {
       R: Math.round((r1 + m) * 255),
       G: Math.round((g1 + m) * 255),
-      B: Math.round((b1 + m) * 255)
+      B: Math.round((b1 + m) * 255),
     };
   };
 
@@ -115,8 +131,8 @@ const simulateKuramoto = (
   width: number,
   height: number,
   steps: number,
-  dt: number
-): KuramotoDerived => {
+  dt: number,
+): { phase: KuramotoDerived; volume: ReturnType<typeof snapshotVolumeField> } => {
   const state = createKuramotoState(width, height);
   const buffer = new ArrayBuffer(derivedBufferSize(width, height));
   const derived = createDerivedViews(buffer, width, height);
@@ -125,14 +141,15 @@ const simulateKuramoto = (
   for (let i = 0; i < steps; i++) {
     stepKuramotoState(state, CANONICAL_KUR_PARAMS, dt, randn, dt * (i + 1), {
       kernel: CANONICAL_KERNEL,
-      controls: { dmt: CANONICAL_PARAMS.dmt }
+      controls: { dmt: CANONICAL_PARAMS.dmt },
     });
   }
   deriveKuramotoFields(state, derived, {
     kernel: CANONICAL_KERNEL,
-    controls: { dmt: CANONICAL_PARAMS.dmt }
+    controls: { dmt: CANONICAL_PARAMS.dmt },
   });
-  return derived;
+  const volume = snapshotVolumeField(state);
+  return { phase: derived, volume };
 };
 
 export type BaselineResult = {
@@ -145,21 +162,27 @@ export const generateBaselineFrame = (timeSeconds = 0): BaselineResult => {
   const { width, height } = BASELINE_DIM;
   const baseImage = buildBaseImage(width, height);
   const edgeField = computeEdgeField(baseImage);
-  const derived = simulateKuramoto(width, height, 180, 0.016);
+  const { phase: phaseField, volume: volumeField } = simulateKuramoto(width, height, 180, 0.016);
 
   const out = new Uint8ClampedArray(width * height * 4);
   const orientations = Array.from({ length: 4 }, (_, j) => (j * 2 * Math.PI) / 4);
 
-  const result = renderRainbowFrame({
+  const frameInput = {
     width,
     height,
     timeSeconds,
     out,
-    base: baseImage.data,
-    edge: edgeField,
-    derived,
+    surface: {
+      kind: 'surface',
+      resolution: edgeField.resolution,
+      rgba: baseImage.data,
+    },
+    rim: edgeField,
+    phase: phaseField,
+    volume: volumeField,
     kernel: CANONICAL_KERNEL,
     dmt: CANONICAL_PARAMS.dmt,
+    arousal: CANONICAL_PARAMS.arousal,
     blend: CANONICAL_PARAMS.blend,
     normPin: true,
     normTarget: 0.6,
@@ -171,7 +194,7 @@ export const generateBaselineFrame = (timeSeconds = 0): BaselineResult => {
     alive: false,
     phasePin: true,
     edgeThreshold: CANONICAL_PARAMS.edgeThreshold,
-    wallpaperGroup: "p4",
+    wallpaperGroup: 'p4',
     surfEnabled: false,
     coupleS2E: true,
     coupleE2S: true,
@@ -186,26 +209,34 @@ export const generateBaselineFrame = (timeSeconds = 0): BaselineResult => {
     sigma: CANONICAL_PARAMS.sigma,
     contrast: CANONICAL_PARAMS.contrast,
     rimAlpha: 1,
-    displayMode: "color",
+    displayMode: 'color',
     surfaceBlend: 0.35,
-    surfaceRegion: "surfaces",
+    surfaceRegion: 'surfaces',
     warpAmp: 1,
+    curvatureStrength: 0,
+    curvatureMode: 'poincare',
     etaAmp: 0.6,
     kurEnabled: true,
-    alphaPol: 0.25
-  });
+    rimEnabled: true,
+    alphaPol: 0.25,
+    coupling: CANONICAL_COUPLING,
+    couplingBase: CANONICAL_COUPLING,
+    su7: createDefaultSu7RuntimeParams(),
+  } as unknown as RainbowFrameInput;
+
+  const result = renderRainbowFrame(frameInput);
 
   return {
     pixels: out,
     metrics: result.metrics,
-    obsAverage: result.obsAverage
+    obsAverage: result.obsAverage,
   };
 };
 
 export const encodePpm = (
   pixels: Uint8ClampedArray,
   width = BASELINE_DIM.width,
-  height = BASELINE_DIM.height
+  height = BASELINE_DIM.height,
 ) => {
   const header = `P6\n${width} ${height}\n255\n`;
   const headerBytes = new TextEncoder().encode(header);
@@ -222,6 +253,6 @@ export const encodePpm = (
 };
 
 export const baselinePaths = (root: string) => ({
-  metrics: join(root, "metrics", "canonical.json"),
-  render: join(root, "renders", "canonical.ppm")
+  metrics: join(root, 'metrics', 'canonical.json'),
+  render: join(root, 'renders', 'canonical.ppm'),
 });

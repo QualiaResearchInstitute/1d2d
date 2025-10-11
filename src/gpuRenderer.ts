@@ -6,9 +6,10 @@ import {
   assertVolumeField,
   type PhaseField,
   type RimField,
-  type VolumeField
-} from "./fields/contracts";
-import type { CouplingConfig } from "./pipeline/rainbowFrame";
+  type VolumeField,
+} from './fields/contracts';
+import type { CouplingConfig, CurvatureMode } from './pipeline/rainbowFrame';
+import type { HyperbolicAtlasGpuPackage } from './hyperbolic/atlas.js';
 
 const VERTEX_SRC = `#version 300 es
 precision highp float;
@@ -23,19 +24,38 @@ void main() {
 }
 `;
 
+const clampAtanhInput = (value: number) => Math.min(0.999999, Math.max(-0.999999, value));
+
+const safeAtanh = (value: number) => {
+  const clamped = clampAtanhInput(value);
+  return 0.5 * Math.log((1 + clamped) / (1 - clamped));
+};
+
 const FRAGMENT_SRC = `#version 300 es
 precision highp float;
 
 ${FIELD_STRUCTS_GLSL}
 
 in vec2 vUv;
-out vec4 fragColor;
+layout (location = 0) out vec4 fragColor;
+layout (location = 1) out vec4 tracerOut;
 
 uniform sampler2D uBaseTex;
 uniform sampler2D uEdgeTex;
 uniform sampler2D uKurTex;
 uniform sampler2D uKurAmpTex;
 uniform sampler2D uVolumeTex;
+uniform sampler2D uTracerState;
+uniform int uAtlasEnabled;
+uniform sampler2D uAtlasSampleTex;
+uniform sampler2D uAtlasJacobianTex;
+uniform float uAtlasSampleScale;
+uniform float uAtlasMaxHyperRadius;
+uniform sampler2D uSu7Tex0;
+uniform sampler2D uSu7Tex1;
+uniform sampler2D uSu7Tex2;
+uniform sampler2D uSu7Tex3;
+uniform sampler2D uSu7UnitaryTex;
 
 uniform vec2 uResolution;
 uniform float uTime;
@@ -76,6 +96,7 @@ uniform float uKernelK0;
 uniform float uKernelQ;
 uniform float uKernelAniso;
 uniform float uKernelChirality;
+uniform float uKernelTransparency;
 uniform float uAlive;
 uniform float uBeta2;
 uniform float uCouplingRimSurfaceBlend;
@@ -93,11 +114,40 @@ uniform float uComposerExposure[4];
 uniform float uComposerGamma[4];
 uniform float uComposerWeight[4];
 uniform vec2 uComposerBlendGain;
+uniform float uCurvatureStrength;
+uniform int uCurvatureMode;
+uniform int uTracerEnabled;
+uniform float uTracerGain;
+uniform float uTracerTau;
+uniform float uTracerModDepth;
+uniform float uTracerModFrequency;
+uniform float uTracerModPhase;
+uniform float uTracerDt;
+uniform int uSu7Enabled;
+uniform float uSu7Gain;
+uniform int uSu7DecimationStride;
+uniform int uSu7DecimationMode;
+uniform float uSu7ProjectorWeight;
+uniform int uSu7ProjectorMode;
+uniform vec3 uSu7ProjectorMatrix[7];
+uniform int uSu7TileCols;
+uniform int uSu7TileRows;
+uniform int uSu7TileSize;
+uniform int uSu7UnitaryTexWidth;
+uniform int uSu7UnitaryTexRowsPerTile;
 
 #define COMPOSER_FIELD_SURFACE 0
 #define COMPOSER_FIELD_RIM 1
 #define COMPOSER_FIELD_KUR 2
 #define COMPOSER_FIELD_VOLUME 3
+#define SU7_DECIMATION_HYBRID 0
+#define SU7_DECIMATION_STRIDE 1
+#define SU7_DECIMATION_EDGES 2
+#define SU7_PROJECTOR_IDENTITY 0
+#define SU7_PROJECTOR_COMPOSER_WEIGHTS 1
+#define SU7_PROJECTOR_OVERLAY_SPLIT 2
+#define SU7_PROJECTOR_DIRECT_RGB 3
+#define SU7_PROJECTOR_MATRIX 4
 
 const float TAU = 6.283185307179586;
 
@@ -125,15 +175,7 @@ vec3 applyComposerVec3(vec3 rgb, int fieldIndex) {
   );
 }
 
-vec4 fetchEdge(ivec2 coord) {
-  return texelFetch(uEdgeTex, coord, 0);
-}
-
-vec4 fetchKur(ivec2 coord) {
-  return texelFetch(uKurTex, coord, 0);
-}
-
-float sampleScalarTexture(sampler2D tex, vec2 coord, int component) {
+vec4 sampleVec4Texture(sampler2D tex, vec2 coord) {
   vec2 clamped = clamp(coord, vec2(0.0), uResolution - vec2(1.001));
   vec2 base = floor(clamped);
   vec2 frac = clamped - base;
@@ -152,32 +194,154 @@ float sampleScalarTexture(sampler2D tex, vec2 coord, int component) {
   vec4 v10 = texelFetch(tex, i10, 0);
   vec4 v01 = texelFetch(tex, i01, 0);
   vec4 v11 = texelFetch(tex, i11, 0);
-  float a = mix(v00[component], v10[component], frac.x);
-  float b = mix(v01[component], v11[component], frac.x);
+  vec4 a = mix(v00, v10, frac.x);
+  vec4 b = mix(v01, v11, frac.x);
   return mix(a, b, frac.y);
 }
 
+float sampleScalarTexture(sampler2D tex, vec2 coord, int component) {
+  return sampleVec4Texture(tex, coord)[component];
+}
+
 vec3 sampleRgbTexture(sampler2D tex, vec2 coord) {
-  vec2 clamped = clamp(coord, vec2(0.0), uResolution - vec2(1.001));
-  vec2 base = floor(clamped);
-  vec2 frac = clamped - base;
-  int width = int(uResolution.x);
-  int height = int(uResolution.y);
-  int x0 = int(base.x);
-int y0 = int(base.y);
-int x1 = min(x0 + 1, width - 1);
-int y1 = min(y0 + 1, height - 1);
-ivec2 i00 = ivec2(x0, y0);
-ivec2 i10 = ivec2(x1, y0);
-ivec2 i01 = ivec2(x0, y1);
-ivec2 i11 = ivec2(x1, y1);
-  vec4 v00 = texelFetch(tex, i00, 0);
-  vec4 v10 = texelFetch(tex, i10, 0);
-  vec4 v01 = texelFetch(tex, i01, 0);
-  vec4 v11 = texelFetch(tex, i11, 0);
-  vec3 a = mix(v00.rgb, v10.rgb, frac.x);
-  vec3 b = mix(v01.rgb, v11.rgb, frac.x);
-  return mix(a, b, frac.y);
+  return sampleVec4Texture(tex, coord).rgb;
+}
+
+float srgbToLinearChannel(float value) {
+  if (value <= 0.04045) {
+    return value / 12.92;
+  }
+  return pow((value + 0.055) / 1.055, 2.4);
+}
+
+float linearToSrgbChannel(float value) {
+  float clamped = clamp(value, 0.0, 1.0);
+  if (clamped <= 0.0031308) {
+    return clamped * 12.92;
+  }
+  return 1.055 * pow(clamped, 1.0 / 2.4) - 0.055;
+}
+
+vec3 srgbToLinearVec3(vec3 rgb) {
+  return vec3(
+    srgbToLinearChannel(rgb.r),
+    srgbToLinearChannel(rgb.g),
+    srgbToLinearChannel(rgb.b)
+  );
+}
+
+vec3 linearToSrgbVec3(vec3 rgb) {
+  return vec3(
+    linearToSrgbChannel(rgb.r),
+    linearToSrgbChannel(rgb.g),
+    linearToSrgbChannel(rgb.b)
+  );
+}
+
+vec3 rgbToLms(vec3 rgb) {
+  return vec3(
+    0.31399022 * rgb.r + 0.63951294 * rgb.g + 0.04649755 * rgb.b,
+    0.15537241 * rgb.r + 0.75789446 * rgb.g + 0.08670142 * rgb.b,
+    0.01775239 * rgb.r + 0.10944209 * rgb.g + 0.87256922 * rgb.b
+  );
+}
+
+vec3 lmsToRgb(vec3 lms) {
+  return vec3(
+    5.47221206 * lms.x - 4.6419601 * lms.y + 0.16963708 * lms.z,
+    -1.1252419 * lms.x + 2.29317094 * lms.y - 0.1678952 * lms.z,
+    0.02980165 * lms.x - 0.19318073 * lms.y + 1.16364789 * lms.z
+  );
+}
+
+float linearLuma(vec3 rgb) {
+  return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec2 complexMul(vec2 a, vec2 b) {
+  return vec2(
+    a.x * b.x - a.y * b.y,
+    a.x * b.y + a.y * b.x
+  );
+}
+
+vec2 complexAdd(vec2 a, vec2 b) {
+  return a + b;
+}
+
+float complexAbs(vec2 z) {
+  return length(z);
+}
+
+int computeSu7TileIndex(ivec2 pixelCoord) {
+  int cols = max(uSu7TileCols, 1);
+  int rows = max(uSu7TileRows, 1);
+  int size = max(uSu7TileSize, 1);
+  int tileX = clamp(pixelCoord.x / size, 0, cols - 1);
+  int tileY = clamp(pixelCoord.y / size, 0, rows - 1);
+  return tileY * cols + tileX;
+}
+
+vec2 fetchSu7Unitary(int tileIndex, int row, int col) {
+  int texWidth = max(uSu7UnitaryTexWidth, 1);
+  int rowsPerTile = max(uSu7UnitaryTexRowsPerTile, 1);
+  int complexIndex = row * 7 + col;
+  int texelIndex = complexIndex / 2;
+  int lane = complexIndex - texelIndex * 2;
+  int texX = texelIndex % texWidth;
+  int texY = tileIndex * rowsPerTile + texelIndex / texWidth;
+  vec4 texel = texelFetch(uSu7UnitaryTex, ivec2(texX, texY), 0);
+  return lane == 0 ? texel.xy : texel.zw;
+}
+
+vec3 su7TintColor(float share, vec3 tint) {
+  float scale = sqrt(clamp01(share));
+  vec3 colored = tint * scale;
+  return clamp(colored, vec3(0.0), vec3(1.0));
+}
+
+vec4 sampleAtlasSample(vec2 screenPos) {
+  return sampleVec4Texture(uAtlasSampleTex, screenPos);
+}
+
+vec4 sampleAtlasJacobian(vec2 screenPos) {
+  return sampleVec4Texture(uAtlasJacobianTex, screenPos);
+}
+
+vec2 applyCurvature(vec2 coord);
+
+vec2 mapScreenToSample(vec2 screenPos) {
+  if (uAtlasEnabled == 1) {
+    return sampleAtlasSample(screenPos).xy;
+  }
+  return applyCurvature(screenPos);
+}
+
+float sampleWarpedMagnitude(vec2 screenPos) {
+  vec2 coord = screenPos;
+  vec4 jac = vec4(1.0, 0.0, 0.0, 1.0);
+  if (uAtlasEnabled == 1) {
+    vec4 atlasSampleLocal = sampleAtlasSample(screenPos);
+    coord = atlasSampleLocal.xy;
+    jac = sampleAtlasJacobian(screenPos);
+  } else {
+    coord = applyCurvature(screenPos);
+  }
+  vec2 grad = vec2(
+    sampleScalarTexture(uEdgeTex, coord, 0),
+    sampleScalarTexture(uEdgeTex, coord, 1)
+  );
+  if (uAtlasEnabled == 1) {
+    float j11 = jac.x * uAtlasSampleScale;
+    float j12 = jac.y * uAtlasSampleScale;
+    float j21 = jac.z * uAtlasSampleScale;
+    float j22 = jac.w * uAtlasSampleScale;
+    grad = vec2(
+      grad.x * j11 + grad.y * j21,
+      grad.x * j12 + grad.y * j22
+    );
+  }
+  return length(grad);
 }
 
 vec2 computeLatticeFlow(vec2 coord) {
@@ -195,6 +359,80 @@ vec2 computeLatticeFlow(vec2 coord) {
     flow += vec2(uOrientCos[k], uOrientSin[k]) * magnitude;
   }
   return flow / max(float(uOrientCount), 1.0);
+}
+
+float safeAtanh(float x) {
+  float clamped = clamp(x, -0.999, 0.999);
+  return 0.5 * log((1.0 + clamped) / (1.0 - clamped));
+}
+
+float safeTanh(float x) {
+  float limited = clamp(x, -8.0, 8.0);
+  float e2 = exp(2.0 * limited);
+  return (e2 - 1.0) / (e2 + 1.0);
+}
+
+vec2 applyCurvature(vec2 coord) {
+  float strength = clamp(uCurvatureStrength, 0.0, 0.95);
+  vec2 clampedCoord = clamp(coord, vec2(0.0), uResolution - vec2(1.0));
+  if (strength <= 1e-5) {
+    return clampedCoord;
+  }
+  float maxRadius = length(uCanvasCenter);
+  if (maxRadius <= 1e-6) {
+    return clampedCoord;
+  }
+  vec2 centered = (coord - uCanvasCenter) / maxRadius;
+  float radius = length(centered);
+  if (radius <= 1e-6) {
+    return clampedCoord;
+  }
+  float clipped = min(radius, 0.999);
+  float rho = safeAtanh(clipped);
+  float scale = 1.0 + strength * 3.0;
+  float target = safeTanh(rho * scale);
+  float denom = clipped > 1e-6 ? clipped : 1.0;
+  vec2 disk = centered * (target / denom);
+  if (uCurvatureMode == 1) {
+    float denomK = 1.0 + dot(disk, disk);
+    if (denomK > 1e-6) {
+      disk = (2.0 * disk) / denomK;
+    }
+  }
+  vec2 mapped = uCanvasCenter + disk * maxRadius;
+  return clamp(mapped, vec2(0.0), uResolution - vec2(1.0));
+}
+
+float computeHyperbolicFlowScale(float hyperRadius) {
+  float strength = clamp(uCurvatureStrength, 0.0, 0.95);
+  if (strength <= 1e-5) {
+    return 1.0;
+  }
+  float limited = min(abs(hyperRadius), 6.0);
+  if (limited <= 1e-5) {
+    return 1.0;
+  }
+  float base = sinh(limited) / limited;
+  float factor = 1.0 + (base - 1.0) * strength;
+  return max(factor, 1.0);
+}
+
+float computeHyperbolicTransparencyBoost(
+  float hyperScale,
+  float radiusNorm,
+  float tagAbs,
+  float kNorm
+) {
+  if (hyperScale <= 1.000001 || kNorm <= 1e-6) {
+    return 1.0;
+  }
+  float strength = clamp(0.45 + 0.4 * uKernelTransparency, 0.0, 1.0);
+  if (strength <= 1e-6) {
+    return 1.0;
+  }
+  float weight = clamp(radiusNorm, 0.0, 1.0) * clamp(kNorm, 0.0, 1.0) * clamp(tagAbs, 0.0, 1.0);
+  float boost = 1.0 + (hyperScale - 1.0) * strength * weight;
+  return clamp(boost, 0.4, 2.8);
 }
 
 vec2 applyOp(vec4 op, vec2 point) {
@@ -270,17 +508,228 @@ float responsePow(float value, float shaping) {
 }
 
 void main() {
-  vec2 fragCoord = vec2(vUv.x * uResolution.x, vUv.y * uResolution.y);
-  vec2 fragClamped = clamp(fragCoord, vec2(0.0), uResolution - vec2(1.0));
-  int xPix = int(fragClamped.x);
-  int yPix = int(fragClamped.y);
-  ivec2 icoord = ivec2(xPix, yPix);
-  int width = int(uResolution.x);
-  int height = int(uResolution.y);
+  vec2 screenCoord = vec2(vUv.x * uResolution.x, vUv.y * uResolution.y);
+  bool atlasActive = (uAtlasEnabled == 1);
+  vec2 sampleCoord;
+  vec4 atlasSample = vec4(0.0);
+  vec4 atlasJacobian = vec4(1.0, 0.0, 0.0, 1.0);
+  if (atlasActive) {
+    atlasSample = sampleAtlasSample(screenCoord);
+    sampleCoord = atlasSample.xy;
+    atlasJacobian = sampleAtlasJacobian(screenCoord);
+  } else {
+    sampleCoord = applyCurvature(screenCoord);
+  }
+  vec2 fragCoord = sampleCoord;
+  vec2 pos = fragCoord;
 
-  vec4 edgeSample = fetchEdge(icoord);
-  vec3 baseRgb = texelFetch(uBaseTex, icoord, 0).rgb;
-  float magVal = edgeSample.b;
+  float hyperFlowScale = 1.0;
+  float radiusNorm = 0.0;
+  vec2 radialDir = vec2(1.0, 0.0);
+  if (atlasActive) {
+    float hyperRadius = atlasSample.z;
+    hyperFlowScale = computeHyperbolicFlowScale(hyperRadius);
+    if (uAtlasMaxHyperRadius > 1e-6) {
+      radiusNorm = clamp(hyperRadius / uAtlasMaxHyperRadius, 0.0, 0.999999);
+    }
+    radialDir = vec2(cos(atlasSample.w), sin(atlasSample.w));
+  } else {
+    vec2 centered = fragCoord - uCanvasCenter;
+    float radialLen = length(centered);
+    if (radialLen > 1e-6) {
+      radialDir = centered / radialLen;
+    }
+  }
+
+  vec3 baseRgb = sampleRgbTexture(uBaseTex, sampleCoord);
+  vec2 gradEdge = vec2(
+    sampleScalarTexture(uEdgeTex, sampleCoord, 0),
+    sampleScalarTexture(uEdgeTex, sampleCoord, 1)
+  );
+  float j11 = atlasJacobian.x * uAtlasSampleScale;
+  float j12 = atlasJacobian.y * uAtlasSampleScale;
+  float j21 = atlasJacobian.z * uAtlasSampleScale;
+  float j22 = atlasJacobian.w * uAtlasSampleScale;
+  if (atlasActive) {
+    gradEdge = vec2(
+      gradEdge.x * j11 + gradEdge.y * j21,
+      gradEdge.x * j12 + gradEdge.y * j22
+    );
+  }
+  float magVal = length(gradEdge);
+  float edgeLen = magVal;
+
+  float composerWeightSurface = uComposerWeight[COMPOSER_FIELD_SURFACE];
+  float composerWeightRim = uComposerWeight[COMPOSER_FIELD_RIM];
+  float composerWeightKur = uComposerWeight[COMPOSER_FIELD_KUR];
+  float composerWeightVolume = uComposerWeight[COMPOSER_FIELD_VOLUME];
+  vec3 baseSrgbOriginal = baseRgb;
+  vec3 su7ProjectedRgb = vec3(0.0);
+  float su7ProjectedMix = 0.0;
+  vec3 su7OverlayRgb[4];
+  float su7OverlayMix[4];
+  int su7OverlayCount = 0;
+
+  if (
+    uSu7Enabled == 1 &&
+    uSu7TileCols > 0 &&
+    uSu7TileRows > 0 &&
+    uSu7UnitaryTexWidth > 0 &&
+    uSu7UnitaryTexRowsPerTile > 0
+  ) {
+    ivec2 pixelCoord = ivec2(clamp(floor(screenCoord), vec2(0.0), uResolution - vec2(1.0)));
+    vec4 su7Tex0 = texelFetch(uSu7Tex0, pixelCoord, 0);
+    vec4 su7Tex1 = texelFetch(uSu7Tex1, pixelCoord, 0);
+    vec4 su7Tex2 = texelFetch(uSu7Tex2, pixelCoord, 0);
+    vec4 su7Tex3 = texelFetch(uSu7Tex3, pixelCoord, 0);
+    float su7Norm = su7Tex3.z;
+    float effectiveGain = abs(uSu7Gain);
+    int stride = max(uSu7DecimationStride, 1);
+    bool strideEligible = stride <= 1 || ((pixelCoord.x % stride == 0) && (pixelCoord.y % stride == 0));
+    bool rimEligible = magVal >= uEdgeThreshold;
+    bool shouldProject = false;
+    if (stride <= 1) {
+      shouldProject = true;
+    } else if (uSu7DecimationMode == SU7_DECIMATION_STRIDE) {
+      shouldProject = strideEligible;
+    } else if (uSu7DecimationMode == SU7_DECIMATION_EDGES) {
+      shouldProject = rimEligible;
+    } else {
+      shouldProject = strideEligible || rimEligible;
+    }
+    if (shouldProject && su7Norm > 1e-6 && effectiveGain > 1e-6) {
+      vec2 su7Vec[7];
+      su7Vec[0] = su7Tex0.xy;
+      su7Vec[1] = su7Tex0.zw;
+      su7Vec[2] = su7Tex1.xy;
+      su7Vec[3] = su7Tex1.zw;
+      su7Vec[4] = su7Tex2.xy;
+      su7Vec[5] = su7Tex2.zw;
+      su7Vec[6] = su7Tex3.xy;
+      int tileIndex = computeSu7TileIndex(pixelCoord);
+      vec2 su7Transformed[7];
+      for (int row = 0; row < 7; ++row) {
+        vec2 sum = vec2(0.0);
+        for (int col = 0; col < 7; ++col) {
+          vec2 coeff = fetchSu7Unitary(tileIndex, row, col);
+          sum = complexAdd(sum, complexMul(coeff, su7Vec[col]));
+        }
+        su7Transformed[row] = sum;
+      }
+      float scale = su7Norm * effectiveGain;
+      float toneScale = scale * (uSu7ProjectorWeight > 0.0 ? uSu7ProjectorWeight : 1.0);
+      float magnitude0 = complexAbs(su7Transformed[0]);
+      float magnitude1 = complexAbs(su7Transformed[1]);
+      float magnitude2 = complexAbs(su7Transformed[2]);
+      float magnitude3 = complexAbs(su7Transformed[3]);
+      float magnitude4 = complexAbs(su7Transformed[4]);
+      float magnitude5 = complexAbs(su7Transformed[5]);
+      float magnitude6 = complexAbs(su7Transformed[6]);
+
+      vec3 linearRgb;
+      if (uSu7ProjectorMode == SU7_PROJECTOR_DIRECT_RGB) {
+        linearRgb = vec3(
+          magnitude0 * toneScale,
+          magnitude1 * toneScale,
+          magnitude2 * toneScale
+        );
+      } else {
+        vec3 lms = vec3(
+          magnitude0 * toneScale,
+          magnitude1 * toneScale,
+          magnitude2 * toneScale
+        );
+        linearRgb = lmsToRgb(lms);
+      }
+      linearRgb = max(linearRgb * uFrameGain, vec3(0.0));
+      vec3 baseLinear = srgbToLinearVec3(baseSrgbOriginal);
+      float baseLuma = linearLuma(baseLinear);
+      float su7Luma = linearLuma(linearRgb);
+      if (su7Luma > 1e-6 && baseLuma > 1e-6) {
+        float lumaScale = clamp(baseLuma / su7Luma, 0.25, 4.0);
+        linearRgb *= lumaScale;
+        su7Luma = linearLuma(linearRgb);
+      }
+      vec3 su7Srgb = linearToSrgbVec3(linearRgb);
+      float mixAmount = clamp(
+        uSu7ProjectorWeight * clamp(effectiveGain, 0.0, 1.0),
+        0.0,
+        1.0
+      );
+
+      float rimEnergyShare = (magnitude0 + magnitude1 + magnitude2) / 3.0;
+      float surfaceEnergyShare = magnitude3;
+      float kurEnergyShare = 0.5 * (magnitude4 + magnitude5);
+      float volumeEnergyShare = magnitude6;
+      float totalEnergy = rimEnergyShare + surfaceEnergyShare + kurEnergyShare + volumeEnergyShare;
+      vec4 shareNorm = vec4(0.0);
+      if (totalEnergy > 1e-6) {
+        shareNorm = vec4(
+          rimEnergyShare,
+          surfaceEnergyShare,
+          kurEnergyShare,
+          volumeEnergyShare
+        ) / totalEnergy;
+      }
+
+      if (
+        (uSu7ProjectorMode == SU7_PROJECTOR_COMPOSER_WEIGHTS ||
+          uSu7ProjectorMode == SU7_PROJECTOR_OVERLAY_SPLIT) &&
+        totalEnergy > 1e-6
+      ) {
+        vec4 multipliers = vec4(
+          clamp(1.0 + (shareNorm.x - 0.25) * 2.0, 0.2, 2.5),
+          clamp(1.0 + (shareNorm.y - 0.25) * 2.0, 0.2, 2.5),
+          clamp(1.0 + (shareNorm.z - 0.25) * 2.0, 0.2, 2.5),
+          clamp(1.0 + (shareNorm.w - 0.25) * 2.0, 0.2, 2.5)
+        );
+        composerWeightRim = clamp(composerWeightRim * multipliers.x, 0.05, 3.0);
+        composerWeightSurface = clamp(composerWeightSurface * multipliers.y, 0.05, 3.0);
+        composerWeightKur = clamp(composerWeightKur * multipliers.z, 0.05, 3.0);
+        composerWeightVolume = clamp(composerWeightVolume * multipliers.w, 0.05, 3.0);
+      }
+
+      if (uSu7ProjectorMode == SU7_PROJECTOR_OVERLAY_SPLIT && totalEnergy > 1e-6) {
+        su7OverlayCount = 0;
+        float rimMix = clamp(shareNorm.x * mixAmount, 0.0, 1.0);
+        if (rimMix > 1e-6) {
+          su7OverlayRgb[su7OverlayCount] = clamp(su7Srgb, vec3(0.0), vec3(1.0));
+          su7OverlayMix[su7OverlayCount] = rimMix;
+          su7OverlayCount++;
+        }
+        float surfaceMix = clamp(shareNorm.y * mixAmount, 0.0, 1.0);
+        if (surfaceMix > 1e-6 && su7OverlayCount < 4) {
+          su7OverlayRgb[su7OverlayCount] = su7TintColor(shareNorm.y, vec3(0.95, 0.72, 0.33));
+          su7OverlayMix[su7OverlayCount] = surfaceMix;
+          su7OverlayCount++;
+        }
+        float kurMix = clamp(shareNorm.z * mixAmount, 0.0, 1.0);
+        if (kurMix > 1e-6 && su7OverlayCount < 4) {
+          su7OverlayRgb[su7OverlayCount] = su7TintColor(shareNorm.z, vec3(0.28, 0.78, 1.0));
+          su7OverlayMix[su7OverlayCount] = kurMix;
+          su7OverlayCount++;
+        }
+        float volumeMix = clamp(shareNorm.w * mixAmount, 0.0, 1.0);
+        if (volumeMix > 1e-6 && su7OverlayCount < 4) {
+          su7OverlayRgb[su7OverlayCount] = su7TintColor(shareNorm.w, vec3(0.42, 0.9, 0.56));
+          su7OverlayMix[su7OverlayCount] = volumeMix;
+          su7OverlayCount++;
+        }
+      } else {
+        su7OverlayCount = 0;
+      }
+
+      su7ProjectedRgb = clamp(su7Srgb, vec3(0.0), vec3(1.0));
+      su7ProjectedMix = mixAmount;
+    }
+  }
+
+  vec2 normal = vec2(0.0);
+  vec2 tangent = vec2(0.0);
+  if (magVal > 1e-8) {
+    normal = gradEdge / magVal;
+    tangent = vec2(-normal.y, normal.x);
+  }
 
   vec3 volumeSample = vec3(0.0);
   float volumePhaseVal = 0.0;
@@ -288,18 +737,19 @@ void main() {
   float volumeIntensityVal = 0.0;
   float volumeDepthGrad = 0.0;
   if (uVolumeEnabled == 1) {
-    volumeSample = texelFetch(uVolumeTex, icoord, 0).rgb;
-    volumePhaseVal = volumeSample.r;
-    volumeDepthVal = volumeSample.g;
-    volumeIntensityVal = volumeSample.b;
-    int leftX = max(xPix - 1, 0);
-    int rightX = min(xPix + 1, width - 1);
-    int upY = max(yPix - 1, 0);
-    int downY = min(yPix + 1, height - 1);
-    float depthLeft = texelFetch(uVolumeTex, ivec2(leftX, yPix), 0).g;
-    float depthRight = texelFetch(uVolumeTex, ivec2(rightX, yPix), 0).g;
-    float depthUp = texelFetch(uVolumeTex, ivec2(xPix, upY), 0).g;
-    float depthDown = texelFetch(uVolumeTex, ivec2(xPix, downY), 0).g;
+    vec4 volumeVec = sampleVec4Texture(uVolumeTex, sampleCoord);
+    volumeSample = volumeVec.rgb;
+    volumePhaseVal = volumeVec.r;
+    volumeDepthVal = volumeVec.g;
+    volumeIntensityVal = volumeVec.b;
+    vec2 leftScreen = vec2(max(screenCoord.x - 1.0, 0.0), screenCoord.y);
+    vec2 rightScreen = vec2(min(screenCoord.x + 1.0, uResolution.x - 1.0), screenCoord.y);
+    vec2 upScreen = vec2(screenCoord.x, max(screenCoord.y - 1.0, 0.0));
+    vec2 downScreen = vec2(screenCoord.x, min(screenCoord.y + 1.0, uResolution.y - 1.0));
+    float depthLeft = sampleScalarTexture(uVolumeTex, mapScreenToSample(leftScreen), 1);
+    float depthRight = sampleScalarTexture(uVolumeTex, mapScreenToSample(rightScreen), 1);
+    float depthUp = sampleScalarTexture(uVolumeTex, mapScreenToSample(upScreen), 1);
+    float depthDown = sampleScalarTexture(uVolumeTex, mapScreenToSample(downScreen), 1);
     float depthDx = (depthRight - depthLeft) * 0.5;
     float depthDy = (depthDown - depthUp) * 0.5;
     volumeDepthGrad = length(vec2(depthDx, depthDy));
@@ -335,38 +785,64 @@ void main() {
       uCouplingScale *
         uCouplingVolumeDepthWarp *
         gradSignal *
-        uComposerWeight[COMPOSER_FIELD_VOLUME];
+        composerWeightVolume;
     warpFlow *= boost;
   }
+
+  if (atlasActive) {
+    float det = j11 * j22 - j12 * j21;
+    if (abs(det) > 1e-6) {
+      float invDet = 1.0 / det;
+      warpFlow = vec2(
+        (j22 * warpFlow.x - j12 * warpFlow.y) * invDet,
+        (-j21 * warpFlow.x + j11 * warpFlow.y) * invDet
+      );
+    } else {
+      warpFlow = vec2(0.0);
+    }
+  }
+  warpFlow *= hyperFlowScale;
 
   vec2 kurGrad = vec2(0.0);
   float vortVal = 0.0;
   float cohVal = 0.0;
   float ampVal = 0.0;
   if (uKurEnabled == 1) {
-    vec4 kurSample = fetchKur(icoord);
+    vec4 kurSample = sampleVec4Texture(uKurTex, sampleCoord);
     kurGrad = kurSample.xy;
+    if (atlasActive) {
+      kurGrad = vec2(
+        kurGrad.x * j11 + kurGrad.y * j21,
+        kurGrad.x * j12 + kurGrad.y * j22
+      );
+    }
+    kurGrad *= hyperFlowScale;
     vortVal = kurSample.z;
     cohVal = clamp(kurSample.w, 0.0, 1.0);
-    ampVal = clamp(texelFetch(uKurAmpTex, icoord, 0).r, 0.0, 1.0);
+    ampVal = clamp(sampleScalarTexture(uKurAmpTex, sampleCoord, 0), 0.0, 1.0);
   }
 
   vec2 combinedFlow = warpFlow + kurGrad;
-  vec2 gradEdge = edgeSample.rg;
+
+  float sharedMag = length(combinedFlow);
+  float parallaxTransparencyBoost = 1.0;
+  if (sharedMag > 1e-6) {
+    float normDenom = max(0.12 + 0.85 * uKernelK0, 1e-3);
+    float kNorm = clamp(sharedMag / normDenom, 0.0, 1.0);
+    float tag = clamp(dot(combinedFlow, radialDir) / sharedMag, -1.0, 1.0);
+    parallaxTransparencyBoost = computeHyperbolicTransparencyBoost(
+      hyperFlowScale,
+      radiusNorm,
+      abs(tag),
+      kNorm
+    );
+  }
 
   vec3 resultRgb = baseRgb;
   float rimEnergy = 0.0;
 
   float couplingScale = uCouplingScale;
   float sigmaFloorBase = max(0.25, uSigma * 0.25);
-
-  vec2 normal = vec2(0.0);
-  vec2 tangent = vec2(0.0);
-  float edgeLen = length(gradEdge);
-  if (edgeLen > 1e-8) {
-    normal = gradEdge / edgeLen;
-    tangent = vec2(-normal.y, normal.x);
-  }
 
   if (uRimEnabled == 1 && magVal >= uEdgeThreshold) {
     float thetaRaw = atan(normal.y, normal.x);
@@ -384,7 +860,7 @@ void main() {
       if (kurNorm > 1e-6) {
         vec2 edgeDir = vec2(cos(thetaUse), sin(thetaUse));
         vec2 kurDir = kurGrad / kurNorm;
-        float mixW = clamp(uCouplingKurOrientation * couplingScale * uComposerWeight[COMPOSER_FIELD_KUR], 0.0, 1.0);
+        float mixW = clamp(uCouplingKurOrientation * couplingScale * composerWeightKur, 0.0, 1.0);
         vec2 blended = mix(edgeDir, kurDir, mixW);
         thetaUse = atan(blended.y, blended.x);
         if (uPolBins > 0) {
@@ -421,7 +897,7 @@ void main() {
         0.65 *
           couplingScale *
           uCouplingSurfaceRimOffset *
-          uComposerWeight[COMPOSER_FIELD_SURFACE] *
+          composerWeightSurface *
           signedVal,
         -0.9,
         0.9
@@ -439,7 +915,7 @@ void main() {
         0.75 *
           couplingScale *
           uCouplingSurfaceRimSigma *
-          uComposerWeight[COMPOSER_FIELD_SURFACE] *
+          composerWeightSurface *
           sharpnessAdjusted,
         0.0,
         1.0
@@ -460,7 +936,7 @@ void main() {
       float volHue = clamp(
         uCouplingScale *
           uCouplingVolumePhaseHue *
-          uComposerWeight[COMPOSER_FIELD_VOLUME] *
+          composerWeightVolume *
           signedPhase *
           0.6,
         -1.5,
@@ -486,7 +962,7 @@ void main() {
       hueShift = clamp(
         couplingScale *
           uCouplingSurfaceRimHue *
-          uComposerWeight[COMPOSER_FIELD_SURFACE] *
+          composerWeightSurface *
           signedMag *
           0.9,
         -1.4,
@@ -494,14 +970,13 @@ void main() {
       );
     }
 
-    vec2 pos = fragCoord;
-    vec2 samplePosL = pos + (offL + breath) * normal;
-    vec2 samplePosM = pos + (offM + breath) * normal;
-    vec2 samplePosS = pos + (offS + breath) * normal;
+    vec2 samplePosL = screenCoord + (offL + breath) * normal;
+    vec2 samplePosM = screenCoord + (offM + breath) * normal;
+    vec2 samplePosS = screenCoord + (offS + breath) * normal;
 
-    float pL = sampleScalarTexture(uEdgeTex, samplePosL, 2);
-    float pM = sampleScalarTexture(uEdgeTex, samplePosM, 2);
-    float pS = sampleScalarTexture(uEdgeTex, samplePosS, 2);
+    float pL = sampleWarpedMagnitude(samplePosL);
+    float pM = sampleWarpedMagnitude(samplePosM);
+    float pS = sampleWarpedMagnitude(samplePosS);
 
     float gL = gauss(offL, sigmaEff) * uKernelGain;
     float gM = gauss(offM, sigmaEff) * uKernelGain;
@@ -514,11 +989,11 @@ void main() {
 
     float chiPhase = TAU * uKernelK0 * dot(pos, tangent) * 0.002 + hueShift;
     float chBase = uKernelChirality;
-    if (uKurEnabled == 1 && uCouplingKurChirality > 0.0) {
-      float vortClamped = clamp(vortVal, -1.0, 1.0);
-      float vortScaled = 0.5 * couplingScale * uCouplingKurChirality * uComposerWeight[COMPOSER_FIELD_KUR] * vortClamped;
-      chBase = clamp(chBase + vortScaled, -3.0, 3.0);
-    }
+  if (uKurEnabled == 1 && uCouplingKurChirality > 0.0) {
+    float vortClamped = clamp(vortVal, -1.0, 1.0);
+    float vortScaled = 0.5 * couplingScale * uCouplingKurChirality * composerWeightKur * vortClamped;
+    chBase = clamp(chBase + vortScaled, -3.0, 3.0);
+  }
 
     float chiL = 0.5 + 0.5 * sin(chiPhase) * chBase;
     float chiM = 0.5 + 0.5 * sin(chiPhase + 0.8) * chBase;
@@ -560,13 +1035,14 @@ void main() {
     rimRgb = applyComposerVec3(rimRgb, COMPOSER_FIELD_RIM);
 
     float pixelBlend = clamp(uEffectiveBlend * uComposerBlendGain.x, 0.0, 1.0);
+    pixelBlend = clamp(pixelBlend * parallaxTransparencyBoost, 0.0, 1.0);
     if (uKurEnabled == 1 && uCouplingKurTransparency > 0.0) {
       float kurMeasure = applyComposerScalar(0.5 * (cohVal + ampVal), COMPOSER_FIELD_KUR);
       float boost = clamp(
         1.0 +
           couplingScale *
             uCouplingKurTransparency *
-            uComposerWeight[COMPOSER_FIELD_KUR] *
+            composerWeightKur *
             (kurMeasure - 0.5) *
             1.5,
         0.1,
@@ -574,7 +1050,7 @@ void main() {
       );
       pixelBlend = clamp(pixelBlend * boost, 0.0, 1.0);
     }
-    pixelBlend = clamp(pixelBlend * uComposerWeight[COMPOSER_FIELD_RIM], 0.0, 1.0);
+    pixelBlend = clamp(pixelBlend * composerWeightRim, 0.0, 1.0);
 
     resultRgb = mix(resultRgb, rimRgb, pixelBlend);
   }
@@ -605,7 +1081,7 @@ void main() {
             clamp(
               uCouplingRimSurfaceAlign *
                 couplingScale *
-                uComposerWeight[COMPOSER_FIELD_SURFACE] *
+                composerWeightSurface *
                 alignment,
               0.0,
               1.0
@@ -620,7 +1096,7 @@ void main() {
         if (kurNorm > 1e-6 && surfLen > 1e-6) {
           vec2 target = (kurGrad / kurNorm) * surfLen;
           float weight =
-            clamp(uCouplingKurOrientation * couplingScale * uComposerWeight[COMPOSER_FIELD_KUR] * 0.75, 0.0, 1.0);
+            clamp(uCouplingKurOrientation * couplingScale * composerWeightKur * 0.75, 0.0, 1.0);
           surfFlow = mix(surfFlow, target, weight);
         }
       }
@@ -641,13 +1117,14 @@ void main() {
       }
       warped = applyComposerVec3(warped, COMPOSER_FIELD_SURFACE);
       float sb = uSurfaceBlend * mask * uComposerBlendGain.y;
+      sb *= parallaxTransparencyBoost;
       if (uCouplingRimSurfaceBlend > 0.0) {
         float energy = responseSoft(
           rimEnergy / (0.75 + 0.25 * uKernelGain),
           uCouplingRimSurfaceBlend
         );
         float rimBoost = clamp(
-          1.0 + couplingScale * uCouplingRimSurfaceBlend * uComposerWeight[COMPOSER_FIELD_RIM] * energy,
+          1.0 + couplingScale * uCouplingRimSurfaceBlend * composerWeightRim * energy,
           0.2,
           3.0
         );
@@ -659,7 +1136,7 @@ void main() {
           1.0 +
             couplingScale *
               uCouplingKurTransparency *
-              uComposerWeight[COMPOSER_FIELD_KUR] *
+              composerWeightKur *
               (kurMeasure - 0.5) *
               1.5,
           0.1,
@@ -667,12 +1144,49 @@ void main() {
         );
         sb *= boost;
       }
-      sb = clamp(sb * uComposerWeight[COMPOSER_FIELD_SURFACE], 0.0, 1.0);
+      sb = clamp(sb * composerWeightSurface, 0.0, 1.0);
       resultRgb = mix(resultRgb, warped, sb);
     }
   }
 
-  fragColor = vec4(resultRgb, 1.0);
+  if (su7ProjectedMix > 1e-6) {
+    resultRgb = clamp(mix(resultRgb, su7ProjectedRgb, su7ProjectedMix), vec3(0.0), vec3(1.0));
+  }
+  for (int overlayIdx = 0; overlayIdx < 4; ++overlayIdx) {
+    if (overlayIdx >= su7OverlayCount) {
+      break;
+    }
+    float overlayMix = su7OverlayMix[overlayIdx];
+    if (overlayMix > 1e-6) {
+      resultRgb = clamp(mix(resultRgb, su7OverlayRgb[overlayIdx], overlayMix), vec3(0.0), vec3(1.0));
+    }
+  }
+
+  baseRgb = resultRgb;
+  vec3 finalRgb = baseRgb;
+  vec3 tracerNext = baseRgb;
+  if (uTracerEnabled == 1) {
+    vec3 prevTracer = texture(uTracerState, vUv).rgb;
+    float safeDt = clamp(uTracerDt, 1.0 / 480.0, 0.25);
+    float tau = max(uTracerTau, 0.05);
+    float decay = exp(-safeDt / tau);
+    float sineComponent = 0.0;
+    if (uTracerModDepth > 1e-6) {
+      float phase = uTracerModPhase;
+      if (uTracerModFrequency > 1e-6) {
+        phase = TAU * uTracerModFrequency * uTime + uTracerModPhase;
+      }
+      sineComponent = uTracerModDepth * sin(phase);
+    }
+    float gain = clamp(uTracerGain * (1.0 + sineComponent), 0.0, 1.2);
+    vec3 tail = max(prevTracer - baseRgb, vec3(0.0));
+    finalRgb = clamp(baseRgb + tail * gain, vec3(0.0), vec3(1.0));
+    vec3 decayed = prevTracer * decay;
+    tracerNext = max(baseRgb, decayed);
+  }
+
+  fragColor = vec4(finalRgb, 1.0);
+  tracerOut = vec4(tracerNext, 1.0);
 }
 `;
 
@@ -694,6 +1208,47 @@ export type KernelUniform = {
   Q: number;
   anisotropy: number;
   chirality: number;
+  transparency: number;
+};
+
+export type TracerUniforms = {
+  enabled: boolean;
+  gain: number;
+  tau: number;
+  modulationDepth: number;
+  modulationFrequency: number;
+  modulationPhase: number;
+  dt: number;
+  reset: boolean;
+};
+
+export type Su7ProjectorMode =
+  | 'identity'
+  | 'composerWeights'
+  | 'overlaySplit'
+  | 'directRgb'
+  | 'matrix';
+
+export type Su7Uniforms = {
+  enabled: boolean;
+  gain: number;
+  decimationStride: number;
+  decimationMode: 'hybrid' | 'stride' | 'edges';
+  projectorMode: Su7ProjectorMode;
+  projectorWeight: number;
+  projectorMatrix?: Float32Array | null;
+};
+
+export type Su7TexturePayload = {
+  width: number;
+  height: number;
+  vectors: [Float32Array, Float32Array, Float32Array, Float32Array];
+  tileData: Float32Array;
+  tileCols: number;
+  tileRows: number;
+  tileSize: number;
+  tileTexWidth: number;
+  tileTexRowsPerTile: number;
 };
 
 export type RenderUniforms = {
@@ -717,6 +1272,8 @@ export type RenderUniforms = {
   rimEnabled: boolean;
   rimAlpha: number;
   warpAmp: number;
+  curvatureStrength: number;
+  curvatureMode: CurvatureMode;
   surfaceBlend: number;
   surfaceRegion: number;
   surfEnabled: boolean;
@@ -732,6 +1289,8 @@ export type RenderUniforms = {
   composerGamma: Float32Array;
   composerWeight: Float32Array;
   composerBlendGain: [number, number];
+  tracer: TracerUniforms;
+  su7: Su7Uniforms;
 };
 
 export type RenderInputs = {
@@ -748,6 +1307,9 @@ export type GpuRenderer = {
   uploadRim(field: RimField | null): void;
   uploadPhase(field: PhaseField | null): void;
   uploadVolume(field: VolumeField | null): void;
+  uploadSu7(data: Su7TexturePayload | null): void;
+  setHyperbolicAtlas(atlas: HyperbolicAtlasGpuPackage | null): void;
+  getHyperbolicAtlas(): HyperbolicAtlasGpuPackage | null;
   render(options: RenderOptions): void;
   readPixels(target: Uint8Array): void;
   dispose(): void;
@@ -757,20 +1319,21 @@ type TextureInfo = {
   texture: WebGLTexture;
   width: number;
   height: number;
+  format: number;
+  internalFormat: number;
+  type: number;
 };
 
-const quadBufferData = new Float32Array([
-  -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1
-]);
+const quadBufferData = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]);
 
 export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
   const program = createProgram(gl, VERTEX_SRC, FRAGMENT_SRC);
-  const attribLoc = gl.getAttribLocation(program, "aPosition");
+  const attribLoc = gl.getAttribLocation(program, 'aPosition');
 
   const vao = gl.createVertexArray();
   const vbo = gl.createBuffer();
   if (!vao || !vbo) {
-    throw new Error("Failed to allocate buffers for GPU renderer");
+    throw new Error('Failed to allocate buffers for GPU renderer');
   }
 
   gl.bindVertexArray(vao);
@@ -781,32 +1344,88 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
   gl.bindVertexArray(null);
 
   const uniforms = locateUniforms(gl, program);
+  const zeroSu7ProjectorMatrix = new Float32Array(21);
+  let hyperbolicAtlasPackage: HyperbolicAtlasGpuPackage | null = null;
 
   const baseTex = createTexture(gl, {
     format: gl.RGBA,
     internalFormat: gl.RGBA8,
-    type: gl.UNSIGNED_BYTE
+    type: gl.UNSIGNED_BYTE,
   });
   const edgeTex = createTexture(gl, {
     format: gl.RGBA,
     internalFormat: gl.RGBA32F,
-    type: gl.FLOAT
+    type: gl.FLOAT,
   });
   const kurTex = createTexture(gl, {
     format: gl.RGBA,
     internalFormat: gl.RGBA32F,
-    type: gl.FLOAT
+    type: gl.FLOAT,
   });
   const ampTex = createTexture(gl, {
     format: gl.RED,
     internalFormat: gl.R32F,
-    type: gl.FLOAT
+    type: gl.FLOAT,
   });
   const volumeTex = createTexture(gl, {
     format: gl.RGBA,
     internalFormat: gl.RGBA32F,
-    type: gl.FLOAT
+    type: gl.FLOAT,
   });
+  const tracerTexA = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA8,
+    type: gl.UNSIGNED_BYTE,
+  });
+  const tracerTexB = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA8,
+    type: gl.UNSIGNED_BYTE,
+  });
+  const tracerColorTex = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA8,
+    type: gl.UNSIGNED_BYTE,
+  });
+  const atlasSampleTex = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA32F,
+    type: gl.FLOAT,
+  });
+  const atlasJacobianTex = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA32F,
+    type: gl.FLOAT,
+  });
+  const su7Tex0 = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA32F,
+    type: gl.FLOAT,
+  });
+  const su7Tex1 = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA32F,
+    type: gl.FLOAT,
+  });
+  const su7Tex2 = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA32F,
+    type: gl.FLOAT,
+  });
+  const su7Tex3 = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA32F,
+    type: gl.FLOAT,
+  });
+  const su7UnitaryTex = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA32F,
+    type: gl.FLOAT,
+  });
+  const tracerFramebuffer = gl.createFramebuffer();
+  if (!tracerFramebuffer) {
+    throw new Error('Failed to allocate tracer framebuffer');
+  }
 
   const state = {
     width: 1,
@@ -818,9 +1437,27 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       edge: edgeTex,
       kur: kurTex,
       amp: ampTex,
-      volume: volumeTex
+      volume: volumeTex,
+      tracer: [tracerTexA, tracerTexB] as [TextureInfo, TextureInfo],
+      composite: tracerColorTex,
+      atlasSample: atlasSampleTex,
+      atlasJacobian: atlasJacobianTex,
+      su7: [su7Tex0, su7Tex1, su7Tex2, su7Tex3] as [
+        TextureInfo,
+        TextureInfo,
+        TextureInfo,
+        TextureInfo,
+      ],
+      su7Unitary: su7UnitaryTex,
     },
-    gl
+    framebuffers: {
+      tracer: tracerFramebuffer,
+    },
+    tracerState: {
+      readIndex: 0,
+      needsClear: true,
+    },
+    gl,
   };
 
   const opsUniform = new Float32Array(32);
@@ -829,9 +1466,25 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
   let edgeBuffer: Float32Array | null = null;
   let phaseBuffer: Float32Array | null = null;
   let ampBuffer: Float32Array | null = null;
-  let phaseFillState: "empty" | "zeros" | "data" = "empty";
+  let phaseFillState: 'empty' | 'zeros' | 'data' = 'empty';
   let volumeBuffer: Float32Array | null = null;
-  let volumeFillState: "empty" | "zeros" | "data" = "empty";
+  let volumeFillState: 'empty' | 'zeros' | 'data' = 'empty';
+  let atlasState: {
+    width: number;
+    height: number;
+    sample: Float32Array;
+    jacobian: Float32Array;
+    sampleScale: number;
+    maxHyperRadius: number;
+  } | null = null;
+  let atlasDirty = false;
+  let su7State: {
+    tileCols: number;
+    tileRows: number;
+    tileSize: number;
+    tileTexWidth: number;
+    tileTexRowsPerTile: number;
+  } | null = null;
 
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.CULL_FACE);
@@ -846,9 +1499,20 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       edgeBuffer = null;
       phaseBuffer = null;
       ampBuffer = null;
-      phaseFillState = "empty";
+      phaseFillState = 'empty';
       volumeBuffer = null;
-      volumeFillState = "empty";
+      volumeFillState = 'empty';
+      ensureTextureStorage(gl, state.textures.tracer[0], width, height);
+      ensureTextureStorage(gl, state.textures.tracer[1], width, height);
+      ensureTextureStorage(gl, state.textures.composite, width, height);
+      ensureTextureStorage(gl, state.textures.su7[0], width, height);
+      ensureTextureStorage(gl, state.textures.su7[1], width, height);
+      ensureTextureStorage(gl, state.textures.su7[2], width, height);
+      ensureTextureStorage(gl, state.textures.su7[3], width, height);
+      state.tracerState.readIndex = 0;
+      state.tracerState.needsClear = true;
+      atlasDirty = atlasState !== null;
+      su7State = null;
     },
     uploadBase(image) {
       uploadImageData(gl, state.textures.base.texture, image);
@@ -862,10 +1526,10 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       if (!field) {
         edgeBuffer.fill(0);
       } else {
-        assertRimField(field, "gpu:rim");
+        assertRimField(field, 'gpu:rim');
         if (field.resolution.width !== state.width || field.resolution.height !== state.height) {
           throw new Error(
-            `[gpuRenderer] rim field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`
+            `[gpuRenderer] rim field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`,
           );
         }
         for (let i = 0; i < total; i++) {
@@ -882,26 +1546,38 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       const needed = total * 4;
       if (!phaseBuffer || phaseBuffer.length !== needed) {
         phaseBuffer = new Float32Array(needed);
-        phaseFillState = "empty";
+        phaseFillState = 'empty';
       }
       if (!ampBuffer || ampBuffer.length !== total) {
         ampBuffer = new Float32Array(total);
-        phaseFillState = "empty";
+        phaseFillState = 'empty';
       }
       if (!field) {
-        if (phaseFillState !== "zeros") {
+        if (phaseFillState !== 'zeros') {
           phaseBuffer!.fill(0);
           ampBuffer!.fill(0);
-          uploadFloatTexture(gl, state.textures.kur.texture, phaseBuffer!, state.width, state.height);
-          uploadScalarTexture(gl, state.textures.amp.texture, ampBuffer!, state.width, state.height);
-          phaseFillState = "zeros";
+          uploadFloatTexture(
+            gl,
+            state.textures.kur.texture,
+            phaseBuffer!,
+            state.width,
+            state.height,
+          );
+          uploadScalarTexture(
+            gl,
+            state.textures.amp.texture,
+            ampBuffer!,
+            state.width,
+            state.height,
+          );
+          phaseFillState = 'zeros';
         }
         return;
       }
-      assertPhaseField(field, "gpu:phase");
+      assertPhaseField(field, 'gpu:phase');
       if (field.resolution.width !== state.width || field.resolution.height !== state.height) {
         throw new Error(
-          `[gpuRenderer] phase field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`
+          `[gpuRenderer] phase field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`,
         );
       }
       for (let i = 0; i < total; i++) {
@@ -913,27 +1589,33 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       }
       uploadFloatTexture(gl, state.textures.kur.texture, phaseBuffer!, state.width, state.height);
       uploadScalarTexture(gl, state.textures.amp.texture, ampBuffer!, state.width, state.height);
-      phaseFillState = "data";
+      phaseFillState = 'data';
     },
     uploadVolume(field) {
       const total = state.width * state.height;
       const needed = total * 4;
       if (!volumeBuffer || volumeBuffer.length !== needed) {
         volumeBuffer = new Float32Array(needed);
-        volumeFillState = "empty";
+        volumeFillState = 'empty';
       }
       if (!field) {
-        if (volumeFillState !== "zeros") {
+        if (volumeFillState !== 'zeros') {
           volumeBuffer!.fill(0);
-          uploadFloatTexture(gl, state.textures.volume.texture, volumeBuffer!, state.width, state.height);
-          volumeFillState = "zeros";
+          uploadFloatTexture(
+            gl,
+            state.textures.volume.texture,
+            volumeBuffer!,
+            state.width,
+            state.height,
+          );
+          volumeFillState = 'zeros';
         }
         return;
       }
-      assertVolumeField(field, "gpu:volume");
+      assertVolumeField(field, 'gpu:volume');
       if (field.resolution.width !== state.width || field.resolution.height !== state.height) {
         throw new Error(
-          `[gpuRenderer] volume field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`
+          `[gpuRenderer] volume field resolution ${field.resolution.width}x${field.resolution.height} mismatch renderer ${state.width}x${state.height}`,
         );
       }
       for (let i = 0; i < total; i++) {
@@ -942,24 +1624,239 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
         volumeBuffer![i * 4 + 2] = field.intensity[i];
         volumeBuffer![i * 4 + 3] = 0;
       }
-      uploadFloatTexture(gl, state.textures.volume.texture, volumeBuffer!, state.width, state.height);
-      volumeFillState = "data";
+      uploadFloatTexture(
+        gl,
+        state.textures.volume.texture,
+        volumeBuffer!,
+        state.width,
+        state.height,
+      );
+      volumeFillState = 'data';
+    },
+    uploadSu7(payload) {
+      if (!payload) {
+        su7State = null;
+        return;
+      }
+      const {
+        width,
+        height,
+        vectors,
+        tileData,
+        tileCols,
+        tileRows,
+        tileSize,
+        tileTexWidth,
+        tileTexRowsPerTile,
+      } = payload;
+      if (width !== state.width || height !== state.height) {
+        throw new Error(
+          `[gpuRenderer] su7 vector resolution ${width}x${height} mismatch renderer ${state.width}x${state.height}`,
+        );
+      }
+      for (let i = 0; i < vectors.length; i++) {
+        const buffer = vectors[i];
+        if (buffer.length !== width * height * 4) {
+          throw new Error(
+            `[gpuRenderer] su7 vector buffer ${i} length ${buffer.length} expected ${width * height * 4}`,
+          );
+        }
+        uploadFloatTexture(gl, state.textures.su7[i].texture, buffer, width, height);
+      }
+      const tileTexHeight = tileRows * tileTexRowsPerTile;
+      const expectedTileLength = tileTexWidth * tileTexHeight * 4;
+      if (tileData.length !== expectedTileLength) {
+        throw new Error(
+          `[gpuRenderer] su7 unitary tile buffer length ${tileData.length} expected ${expectedTileLength}`,
+        );
+      }
+      ensureTextureStorage(gl, state.textures.su7Unitary, tileTexWidth, tileTexHeight);
+      uploadFloatTexture(
+        gl,
+        state.textures.su7Unitary.texture,
+        tileData,
+        tileTexWidth,
+        tileTexHeight,
+      );
+      su7State = {
+        tileCols,
+        tileRows,
+        tileSize,
+        tileTexWidth,
+        tileTexRowsPerTile,
+      };
+    },
+    setHyperbolicAtlas(atlas) {
+      hyperbolicAtlasPackage = atlas;
+      if (!atlas) {
+        atlasState = null;
+        atlasDirty = false;
+        return;
+      }
+      const { width, height, buffer, layout, metadata } = atlas;
+      const texels = width * height;
+      const stride = layout.stride;
+      if (buffer.length !== texels * stride) {
+        throw new Error(
+          `[gpuRenderer] hyperbolic atlas buffer length ${buffer.length} does not match expected ${texels * stride}`,
+        );
+      }
+      const sample = new Float32Array(texels * 4);
+      const jacobian = new Float32Array(texels * 4);
+      for (let i = 0; i < texels; i++) {
+        const src = i * stride;
+        const dst = i * 4;
+        sample[dst + 0] = buffer[src + 0];
+        sample[dst + 1] = buffer[src + 1];
+        sample[dst + 2] = buffer[src + 2];
+        sample[dst + 3] = buffer[src + 3];
+        jacobian[dst + 0] = buffer[src + 4];
+        jacobian[dst + 1] = buffer[src + 5];
+        jacobian[dst + 2] = buffer[src + 6];
+        jacobian[dst + 3] = buffer[src + 7];
+      }
+      const maxHyperRadius = 2 * metadata.curvatureScale * safeAtanh(metadata.diskLimit);
+      atlasState = {
+        width,
+        height,
+        sample,
+        jacobian,
+        sampleScale: metadata.maxRadius,
+        maxHyperRadius,
+      };
+      atlasDirty = true;
+    },
+    getHyperbolicAtlas() {
+      return hyperbolicAtlasPackage;
     },
     render(options) {
       gl.useProgram(program);
+
+      ensureTextureStorage(gl, state.textures.tracer[0], state.width, state.height);
+      ensureTextureStorage(gl, state.textures.tracer[1], state.width, state.height);
+      ensureTextureStorage(gl, state.textures.composite, state.width, state.height);
+      if (state.tracerState.needsClear || options.tracer.reset) {
+        clearTexture(gl, state.framebuffers.tracer, state.textures.tracer[0]);
+        clearTexture(gl, state.framebuffers.tracer, state.textures.tracer[1]);
+        clearTexture(gl, state.framebuffers.tracer, state.textures.composite);
+        state.tracerState.readIndex = 0;
+        state.tracerState.needsClear = false;
+      }
+      const tracerReadIndex = state.tracerState.readIndex;
+      const tracerRead = state.textures.tracer[tracerReadIndex];
+      const tracerWrite = state.textures.tracer[1 - tracerReadIndex];
 
       bindTexture(gl, state.textures.base.texture, 0, uniforms.baseTex);
       bindTexture(gl, state.textures.edge.texture, 1, uniforms.edgeTex);
       bindTexture(gl, state.textures.kur.texture, 2, uniforms.kurTex);
       bindTexture(gl, state.textures.amp.texture, 3, uniforms.kurAmpTex);
       bindTexture(gl, state.textures.volume.texture, 4, uniforms.volumeTex);
+      bindTexture(gl, tracerRead.texture, 5, uniforms.tracerTex);
+
+      const su7Options = options.su7;
+      const su7Active = Boolean(su7Options.enabled && su7State);
+      if (su7Active && su7State) {
+        bindTexture(gl, state.textures.su7[0].texture, 8, uniforms.su7Tex0);
+        bindTexture(gl, state.textures.su7[1].texture, 9, uniforms.su7Tex1);
+        bindTexture(gl, state.textures.su7[2].texture, 10, uniforms.su7Tex2);
+        bindTexture(gl, state.textures.su7[3].texture, 11, uniforms.su7Tex3);
+        bindTexture(gl, state.textures.su7Unitary.texture, 12, uniforms.su7UnitaryTex);
+        gl.uniform1i(uniforms.su7Enabled, 1);
+        gl.uniform1f(uniforms.su7Gain, su7Options.gain);
+        gl.uniform1i(uniforms.su7DecimationStride, Math.max(1, su7Options.decimationStride));
+        const su7ModeEnum =
+          su7Options.decimationMode === 'stride'
+            ? 1
+            : su7Options.decimationMode === 'edges'
+              ? 2
+              : 0;
+        const projectorModeEnum =
+          su7Options.projectorMode === 'composerWeights'
+            ? 1
+            : su7Options.projectorMode === 'overlaySplit'
+              ? 2
+              : su7Options.projectorMode === 'directRgb'
+                ? 3
+                : su7Options.projectorMode === 'matrix'
+                  ? 4
+                  : 0;
+        gl.uniform1i(uniforms.su7DecimationMode, su7ModeEnum);
+        gl.uniform1f(uniforms.su7ProjectorWeight, su7Options.projectorWeight);
+        gl.uniform1i(uniforms.su7ProjectorMode, projectorModeEnum);
+        gl.uniform1i(uniforms.su7TileCols, su7State.tileCols);
+        gl.uniform1i(uniforms.su7TileRows, su7State.tileRows);
+        gl.uniform1i(uniforms.su7TileSize, su7State.tileSize);
+        gl.uniform1i(uniforms.su7UnitaryTexWidth, su7State.tileTexWidth);
+        gl.uniform1i(uniforms.su7UnitaryTexRowsPerTile, su7State.tileTexRowsPerTile);
+        if (uniforms.su7ProjectorMatrix) {
+          if (su7Options.projectorMatrix && su7Options.projectorMatrix.length >= 21) {
+            gl.uniform3fv(uniforms.su7ProjectorMatrix, su7Options.projectorMatrix);
+          } else {
+            gl.uniform3fv(uniforms.su7ProjectorMatrix, zeroSu7ProjectorMatrix);
+          }
+        }
+      } else {
+        gl.uniform1i(uniforms.su7Enabled, 0);
+        gl.uniform1f(uniforms.su7Gain, su7Options.gain);
+        gl.uniform1i(uniforms.su7DecimationStride, Math.max(1, su7Options.decimationStride));
+        gl.uniform1i(uniforms.su7DecimationMode, 0);
+        gl.uniform1f(uniforms.su7ProjectorWeight, su7Options.projectorWeight);
+        gl.uniform1i(uniforms.su7ProjectorMode, 0);
+        gl.uniform1i(uniforms.su7TileCols, su7State ? su7State.tileCols : 0);
+        gl.uniform1i(uniforms.su7TileRows, su7State ? su7State.tileRows : 0);
+        gl.uniform1i(uniforms.su7TileSize, su7State ? su7State.tileSize : 32);
+        gl.uniform1i(uniforms.su7UnitaryTexWidth, su7State ? su7State.tileTexWidth : 1);
+        gl.uniform1i(uniforms.su7UnitaryTexRowsPerTile, su7State ? su7State.tileTexRowsPerTile : 1);
+        if (uniforms.su7ProjectorMatrix) {
+          gl.uniform3fv(uniforms.su7ProjectorMatrix, zeroSu7ProjectorMatrix);
+        }
+      }
+      const atlasAvailable =
+        atlasState && atlasState.width === state.width && atlasState.height === state.height;
+      const atlasEnabled = atlasAvailable && Math.abs(options.curvatureStrength) > 1e-4;
+      if (atlasAvailable) {
+        const { width, height, sample, jacobian, sampleScale, maxHyperRadius } = atlasState!;
+        if (
+          state.textures.atlasSample.width !== width ||
+          state.textures.atlasSample.height !== height
+        ) {
+          ensureTextureStorage(gl, state.textures.atlasSample, width, height);
+          ensureTextureStorage(gl, state.textures.atlasJacobian, width, height);
+          atlasDirty = true;
+        }
+        if (atlasDirty) {
+          uploadFloatTexture(gl, state.textures.atlasSample.texture, sample, width, height);
+          uploadFloatTexture(gl, state.textures.atlasJacobian.texture, jacobian, width, height);
+          atlasDirty = false;
+        }
+        if (atlasEnabled) {
+          bindTexture(gl, state.textures.atlasSample.texture, 6, uniforms.atlasSampleTex);
+          bindTexture(gl, state.textures.atlasJacobian.texture, 7, uniforms.atlasJacobianTex);
+          gl.uniform1i(uniforms.atlasEnabled, 1);
+          gl.uniform1f(uniforms.atlasSampleScale, sampleScale);
+          gl.uniform1f(uniforms.atlasMaxHyperRadius, maxHyperRadius);
+        } else {
+          gl.uniform1i(uniforms.atlasEnabled, 0);
+          gl.uniform1f(uniforms.atlasSampleScale, sampleScale);
+          gl.uniform1f(uniforms.atlasMaxHyperRadius, maxHyperRadius);
+        }
+      } else {
+        gl.uniform1i(uniforms.atlasEnabled, 0);
+        gl.uniform1f(uniforms.atlasSampleScale, 1);
+        gl.uniform1f(uniforms.atlasMaxHyperRadius, 0);
+      }
 
       gl.uniform2f(uniforms.resolution, state.width, state.height);
       gl.uniform1f(uniforms.time, options.time);
       gl.uniform1f(uniforms.edgeThreshold, options.edgeThreshold);
       gl.uniform1f(uniforms.effectiveBlend, options.effectiveBlend);
       gl.uniform1i(uniforms.displayMode, options.displayMode);
-      gl.uniform3f(uniforms.baseOffsets, options.baseOffsets[0], options.baseOffsets[1], options.baseOffsets[2]);
+      gl.uniform3f(
+        uniforms.baseOffsets,
+        options.baseOffsets[0],
+        options.baseOffsets[1],
+        options.baseOffsets[2],
+      );
       gl.uniform1f(uniforms.sigma, options.sigma);
       gl.uniform1f(uniforms.jitter, options.jitter);
       gl.uniform1f(uniforms.jitterPhase, options.jitterPhase);
@@ -982,11 +1879,14 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.uniform1i(uniforms.volumeEnabled, options.volumeEnabled ? 1 : 0);
       gl.uniform1i(uniforms.useWallpaper, options.useWallpaper ? 1 : 0);
       gl.uniform2f(uniforms.canvasCenter, options.center[0], options.center[1]);
+      gl.uniform1f(uniforms.curvatureStrength, options.curvatureStrength);
+      gl.uniform1i(uniforms.curvatureMode, options.curvatureMode === 'klein' ? 1 : 0);
       gl.uniform1f(uniforms.kernelGain, options.kernel.gain);
       gl.uniform1f(uniforms.kernelK0, options.kernel.k0);
       gl.uniform1f(uniforms.kernelQ, options.kernel.Q);
       gl.uniform1f(uniforms.kernelAniso, options.kernel.anisotropy);
       gl.uniform1f(uniforms.kernelChirality, options.kernel.chirality);
+      gl.uniform1f(uniforms.kernelTransparency, options.kernel.transparency);
       gl.uniform1f(uniforms.alive, options.alive ? 1 : 0);
       gl.uniform1f(uniforms.beta2, options.beta2);
       gl.uniform1f(uniforms.couplingRimSurfaceBlend, options.coupling.rimToSurfaceBlend);
@@ -1003,7 +1903,18 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.uniform1fv(uniforms.composerExposure, options.composerExposure);
       gl.uniform1fv(uniforms.composerGamma, options.composerGamma);
       gl.uniform1fv(uniforms.composerWeight, options.composerWeight);
-      gl.uniform2f(uniforms.composerBlendGain, options.composerBlendGain[0], options.composerBlendGain[1]);
+      gl.uniform2f(
+        uniforms.composerBlendGain,
+        options.composerBlendGain[0],
+        options.composerBlendGain[1],
+      );
+      gl.uniform1i(uniforms.tracerEnabled, options.tracer.enabled ? 1 : 0);
+      gl.uniform1f(uniforms.tracerGain, options.tracer.gain);
+      gl.uniform1f(uniforms.tracerTau, options.tracer.tau);
+      gl.uniform1f(uniforms.tracerModDepth, options.tracer.modulationDepth);
+      gl.uniform1f(uniforms.tracerModFrequency, options.tracer.modulationFrequency);
+      gl.uniform1f(uniforms.tracerModPhase, options.tracer.modulationPhase);
+      gl.uniform1f(uniforms.tracerDt, options.tracer.dt);
 
       const ops = options.ops;
       gl.uniform1i(uniforms.opsCount, ops.length);
@@ -1026,20 +1937,71 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
 
       gl.uniform1i(uniforms.orientCount, options.orientations.cos.length);
       orientCosBuffer.fill(0);
-      orientCosBuffer.set(options.orientations.cos.subarray(0, Math.min(8, options.orientations.cos.length)));
+      orientCosBuffer.set(
+        options.orientations.cos.subarray(0, Math.min(8, options.orientations.cos.length)),
+      );
       gl.uniform1fv(uniforms.orientCos, orientCosBuffer);
       orientSinBuffer.fill(0);
-      orientSinBuffer.set(options.orientations.sin.subarray(0, Math.min(8, options.orientations.sin.length)));
+      orientSinBuffer.set(
+        options.orientations.sin.subarray(0, Math.min(8, options.orientations.sin.length)),
+      );
       gl.uniform1fv(uniforms.orientSin, orientSinBuffer);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, state.framebuffers.tracer);
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D,
+        state.textures.composite.texture,
+        0,
+      );
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT1,
+        gl.TEXTURE_2D,
+        tracerWrite.texture,
+        0,
+      );
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        throw new Error(`[gpuRenderer] framebuffer incomplete: 0x${status.toString(16)}`);
+      }
 
       gl.viewport(0, 0, state.width, state.height);
       gl.bindVertexArray(vao);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       gl.bindVertexArray(null);
+
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, state.framebuffers.tracer);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+      gl.blitFramebuffer(
+        0,
+        0,
+        state.width,
+        state.height,
+        0,
+        0,
+        state.width,
+        state.height,
+        gl.COLOR_BUFFER_BIT,
+        gl.LINEAR,
+      );
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, state.framebuffers.tracer);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, null, 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.readBuffer(gl.BACK);
+
+      state.tracerState.readIndex = 1 - tracerReadIndex;
     },
     readPixels(target) {
       if (target.length < state.width * state.height * 4) {
-        throw new Error("readPixels target buffer too small");
+        throw new Error('readPixels target buffer too small');
       }
       gl.readPixels(0, 0, state.width, state.height, gl.RGBA, gl.UNSIGNED_BYTE, target);
     },
@@ -1052,7 +2014,22 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.deleteTexture(state.textures.kur.texture);
       gl.deleteTexture(state.textures.amp.texture);
       gl.deleteTexture(state.textures.volume.texture);
-    }
+      gl.deleteTexture(state.textures.tracer[0].texture);
+      gl.deleteTexture(state.textures.tracer[1].texture);
+      gl.deleteTexture(state.textures.composite.texture);
+      gl.deleteTexture(state.textures.atlasSample.texture);
+      gl.deleteTexture(state.textures.atlasJacobian.texture);
+      gl.deleteTexture(state.textures.su7[0].texture);
+      gl.deleteTexture(state.textures.su7[1].texture);
+      gl.deleteTexture(state.textures.su7[2].texture);
+      gl.deleteTexture(state.textures.su7[3].texture);
+      gl.deleteTexture(state.textures.su7Unitary.texture);
+      gl.deleteFramebuffer(state.framebuffers.tracer);
+      hyperbolicAtlasPackage = null;
+      atlasState = null;
+      atlasDirty = false;
+      su7State = null;
+    },
   };
 
   return renderer;
@@ -1062,14 +2039,14 @@ function createProgram(gl: WebGL2RenderingContext, vsSource: string, fsSource: s
   const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vsSource);
   const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
   const program = gl.createProgram();
-  if (!program) throw new Error("Failed to create program");
+  if (!program) throw new Error('Failed to create program');
   gl.attachShader(program, vertexShader);
   gl.attachShader(program, fragmentShader);
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
     const info = gl.getProgramInfoLog(program);
     gl.deleteProgram(program);
-    throw new Error(`Program link failed: ${info ?? "unknown error"}`);
+    throw new Error(`Program link failed: ${info ?? 'unknown error'}`);
   }
   gl.detachShader(program, vertexShader);
   gl.detachShader(program, fragmentShader);
@@ -1080,24 +2057,24 @@ function createProgram(gl: WebGL2RenderingContext, vsSource: string, fsSource: s
 
 function compileShader(gl: WebGL2RenderingContext, type: number, source: string) {
   const shader = gl.createShader(type);
-  if (!shader) throw new Error("Failed to create shader");
+  if (!shader) throw new Error('Failed to create shader');
   gl.shaderSource(shader, source);
   gl.compileShader(shader);
   if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
     const info = gl.getShaderInfoLog(shader);
     gl.deleteShader(shader);
-    throw new Error(`Shader compile failed: ${info ?? "unknown error"}`);
+    throw new Error(`Shader compile failed: ${info ?? 'unknown error'}`);
   }
   return shader;
 }
 
 function createTexture(
   gl: WebGL2RenderingContext,
-  opts: { format: number; internalFormat: number; type: number }
+  opts: { format: number; internalFormat: number; type: number },
 ): TextureInfo {
   const texture = gl.createTexture();
   if (!texture) {
-    throw new Error("Failed to create texture");
+    throw new Error('Failed to create texture');
   }
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -1105,7 +2082,54 @@ function createTexture(
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.bindTexture(gl.TEXTURE_2D, null);
-  return { texture, width: 1, height: 1 };
+  return {
+    texture,
+    width: 0,
+    height: 0,
+    format: opts.format,
+    internalFormat: opts.internalFormat,
+    type: opts.type,
+  };
+}
+
+function ensureTextureStorage(
+  gl: WebGL2RenderingContext,
+  info: TextureInfo,
+  width: number,
+  height: number,
+) {
+  if (info.width === width && info.height === height) {
+    return;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, info.texture);
+  gl.texImage2D(
+    gl.TEXTURE_2D,
+    0,
+    info.internalFormat,
+    width,
+    height,
+    0,
+    info.format,
+    info.type,
+    null,
+  );
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  info.width = width;
+  info.height = height;
+}
+
+function clearTexture(
+  gl: WebGL2RenderingContext,
+  framebuffer: WebGLFramebuffer,
+  info: TextureInfo,
+) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, info.texture, 0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
 function uploadImageData(gl: WebGL2RenderingContext, texture: WebGLTexture, image: ImageData) {
@@ -1120,7 +2144,7 @@ function uploadImageData(gl: WebGL2RenderingContext, texture: WebGLTexture, imag
     0,
     gl.RGBA,
     gl.UNSIGNED_BYTE,
-    image.data
+    image.data,
   );
   gl.bindTexture(gl.TEXTURE_2D, null);
 }
@@ -1130,7 +2154,7 @@ function uploadFloatTexture(
   texture: WebGLTexture,
   data: Float32Array,
   width: number,
-  height: number
+  height: number,
 ) {
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -1143,7 +2167,7 @@ function uploadScalarTexture(
   texture: WebGLTexture,
   data: Float32Array,
   width: number,
-  height: number
+  height: number,
 ) {
   gl.bindTexture(gl.TEXTURE_2D, texture);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -1155,7 +2179,7 @@ function bindTexture(
   gl: WebGL2RenderingContext,
   texture: WebGLTexture,
   unit: number,
-  location: WebGLUniformLocation
+  location: WebGLUniformLocation,
 ) {
   gl.activeTexture(gl.TEXTURE0 + unit);
   gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -1164,66 +2188,99 @@ function bindTexture(
 
 function locateUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
   return {
-    baseTex: getUniform(gl, program, "uBaseTex"),
-    edgeTex: getUniform(gl, program, "uEdgeTex"),
-    kurTex: getUniform(gl, program, "uKurTex"),
-    kurAmpTex: getUniform(gl, program, "uKurAmpTex"),
-    volumeTex: getUniform(gl, program, "uVolumeTex"),
-    resolution: getUniform(gl, program, "uResolution"),
-    time: getUniform(gl, program, "uTime"),
-    edgeThreshold: getUniform(gl, program, "uEdgeThreshold"),
-    effectiveBlend: getUniform(gl, program, "uEffectiveBlend"),
-    displayMode: getUniform(gl, program, "uDisplayMode"),
-    baseOffsets: getUniform(gl, program, "uBaseOffsets"),
-    sigma: getUniform(gl, program, "uSigma"),
-    jitter: getUniform(gl, program, "uJitter"),
-    jitterPhase: getUniform(gl, program, "uJitterPhase"),
-    breath: getUniform(gl, program, "uBreath"),
-    muJ: getUniform(gl, program, "uMuJ"),
-    phasePin: getUniform(gl, program, "uPhasePin"),
-    microsaccade: getUniform(gl, program, "uMicrosaccade"),
-    polBins: getUniform(gl, program, "uPolBins"),
-    thetaMode: getUniform(gl, program, "uThetaMode"),
-    thetaGlobal: getUniform(gl, program, "uThetaGlobal"),
-    contrast: getUniform(gl, program, "uContrast"),
-    frameGain: getUniform(gl, program, "uFrameGain"),
-    rimEnabled: getUniform(gl, program, "uRimEnabled"),
-    rimAlpha: getUniform(gl, program, "uRimAlpha"),
-    warpAmp: getUniform(gl, program, "uWarpAmp"),
-    surfaceBlend: getUniform(gl, program, "uSurfaceBlend"),
-    surfaceRegion: getUniform(gl, program, "uSurfaceRegion"),
-    surfEnabled: getUniform(gl, program, "uSurfEnabled"),
-    kurEnabled: getUniform(gl, program, "uKurEnabled"),
-    volumeEnabled: getUniform(gl, program, "uVolumeEnabled"),
-    useWallpaper: getUniform(gl, program, "uUseWallpaper"),
-    opsCount: getUniform(gl, program, "uOpsCount"),
-    ops: getUniform(gl, program, "uOps"),
-    orientCount: getUniform(gl, program, "uOrientCount"),
-    orientCos: getUniform(gl, program, "uOrientCos"),
-    orientSin: getUniform(gl, program, "uOrientSin"),
-    canvasCenter: getUniform(gl, program, "uCanvasCenter"),
-    kernelGain: getUniform(gl, program, "uKernelGain"),
-    kernelK0: getUniform(gl, program, "uKernelK0"),
-    kernelQ: getUniform(gl, program, "uKernelQ"),
-    kernelAniso: getUniform(gl, program, "uKernelAniso"),
-    kernelChirality: getUniform(gl, program, "uKernelChirality"),
-    alive: getUniform(gl, program, "uAlive"),
-    beta2: getUniform(gl, program, "uBeta2"),
-    couplingRimSurfaceBlend: getUniform(gl, program, "uCouplingRimSurfaceBlend"),
-    couplingRimSurfaceAlign: getUniform(gl, program, "uCouplingRimSurfaceAlign"),
-    couplingSurfaceRimOffset: getUniform(gl, program, "uCouplingSurfaceRimOffset"),
-    couplingSurfaceRimSigma: getUniform(gl, program, "uCouplingSurfaceRimSigma"),
-    couplingSurfaceRimHue: getUniform(gl, program, "uCouplingSurfaceRimHue"),
-    couplingKurTransparency: getUniform(gl, program, "uCouplingKurTransparency"),
-    couplingKurOrientation: getUniform(gl, program, "uCouplingKurOrientation"),
-    couplingKurChirality: getUniform(gl, program, "uCouplingKurChirality"),
-    couplingScale: getUniform(gl, program, "uCouplingScale"),
-    couplingVolumePhaseHue: getUniform(gl, program, "uCouplingVolumePhaseHue"),
-    couplingVolumeDepthWarp: getUniform(gl, program, "uCouplingVolumeDepthWarp"),
-    composerExposure: getUniform(gl, program, "uComposerExposure"),
-    composerGamma: getUniform(gl, program, "uComposerGamma"),
-    composerWeight: getUniform(gl, program, "uComposerWeight"),
-    composerBlendGain: getUniform(gl, program, "uComposerBlendGain")
+    baseTex: getUniform(gl, program, 'uBaseTex'),
+    edgeTex: getUniform(gl, program, 'uEdgeTex'),
+    kurTex: getUniform(gl, program, 'uKurTex'),
+    kurAmpTex: getUniform(gl, program, 'uKurAmpTex'),
+    volumeTex: getUniform(gl, program, 'uVolumeTex'),
+    tracerTex: getUniform(gl, program, 'uTracerState'),
+    atlasSampleTex: getUniform(gl, program, 'uAtlasSampleTex'),
+    atlasJacobianTex: getUniform(gl, program, 'uAtlasJacobianTex'),
+    su7Tex0: getUniform(gl, program, 'uSu7Tex0'),
+    su7Tex1: getUniform(gl, program, 'uSu7Tex1'),
+    su7Tex2: getUniform(gl, program, 'uSu7Tex2'),
+    su7Tex3: getUniform(gl, program, 'uSu7Tex3'),
+    su7UnitaryTex: getUniform(gl, program, 'uSu7UnitaryTex'),
+    resolution: getUniform(gl, program, 'uResolution'),
+    time: getUniform(gl, program, 'uTime'),
+    edgeThreshold: getUniform(gl, program, 'uEdgeThreshold'),
+    effectiveBlend: getUniform(gl, program, 'uEffectiveBlend'),
+    displayMode: getUniform(gl, program, 'uDisplayMode'),
+    baseOffsets: getUniform(gl, program, 'uBaseOffsets'),
+    sigma: getUniform(gl, program, 'uSigma'),
+    jitter: getUniform(gl, program, 'uJitter'),
+    jitterPhase: getUniform(gl, program, 'uJitterPhase'),
+    breath: getUniform(gl, program, 'uBreath'),
+    muJ: getUniform(gl, program, 'uMuJ'),
+    phasePin: getUniform(gl, program, 'uPhasePin'),
+    microsaccade: getUniform(gl, program, 'uMicrosaccade'),
+    polBins: getUniform(gl, program, 'uPolBins'),
+    thetaMode: getUniform(gl, program, 'uThetaMode'),
+    thetaGlobal: getUniform(gl, program, 'uThetaGlobal'),
+    contrast: getUniform(gl, program, 'uContrast'),
+    frameGain: getUniform(gl, program, 'uFrameGain'),
+    rimEnabled: getUniform(gl, program, 'uRimEnabled'),
+    rimAlpha: getUniform(gl, program, 'uRimAlpha'),
+    warpAmp: getUniform(gl, program, 'uWarpAmp'),
+    surfaceBlend: getUniform(gl, program, 'uSurfaceBlend'),
+    surfaceRegion: getUniform(gl, program, 'uSurfaceRegion'),
+    surfEnabled: getUniform(gl, program, 'uSurfEnabled'),
+    kurEnabled: getUniform(gl, program, 'uKurEnabled'),
+    volumeEnabled: getUniform(gl, program, 'uVolumeEnabled'),
+    useWallpaper: getUniform(gl, program, 'uUseWallpaper'),
+    opsCount: getUniform(gl, program, 'uOpsCount'),
+    ops: getUniform(gl, program, 'uOps'),
+    orientCount: getUniform(gl, program, 'uOrientCount'),
+    orientCos: getUniform(gl, program, 'uOrientCos'),
+    orientSin: getUniform(gl, program, 'uOrientSin'),
+    canvasCenter: getUniform(gl, program, 'uCanvasCenter'),
+    curvatureStrength: getUniform(gl, program, 'uCurvatureStrength'),
+    curvatureMode: getUniform(gl, program, 'uCurvatureMode'),
+    atlasEnabled: getUniform(gl, program, 'uAtlasEnabled'),
+    atlasSampleScale: getUniform(gl, program, 'uAtlasSampleScale'),
+    atlasMaxHyperRadius: getUniform(gl, program, 'uAtlasMaxHyperRadius'),
+    kernelGain: getUniform(gl, program, 'uKernelGain'),
+    kernelK0: getUniform(gl, program, 'uKernelK0'),
+    kernelQ: getUniform(gl, program, 'uKernelQ'),
+    kernelAniso: getUniform(gl, program, 'uKernelAniso'),
+    kernelChirality: getUniform(gl, program, 'uKernelChirality'),
+    kernelTransparency: getUniform(gl, program, 'uKernelTransparency'),
+    alive: getUniform(gl, program, 'uAlive'),
+    beta2: getUniform(gl, program, 'uBeta2'),
+    couplingRimSurfaceBlend: getUniform(gl, program, 'uCouplingRimSurfaceBlend'),
+    couplingRimSurfaceAlign: getUniform(gl, program, 'uCouplingRimSurfaceAlign'),
+    couplingSurfaceRimOffset: getUniform(gl, program, 'uCouplingSurfaceRimOffset'),
+    couplingSurfaceRimSigma: getUniform(gl, program, 'uCouplingSurfaceRimSigma'),
+    couplingSurfaceRimHue: getUniform(gl, program, 'uCouplingSurfaceRimHue'),
+    couplingKurTransparency: getUniform(gl, program, 'uCouplingKurTransparency'),
+    couplingKurOrientation: getUniform(gl, program, 'uCouplingKurOrientation'),
+    couplingKurChirality: getUniform(gl, program, 'uCouplingKurChirality'),
+    couplingScale: getUniform(gl, program, 'uCouplingScale'),
+    couplingVolumePhaseHue: getUniform(gl, program, 'uCouplingVolumePhaseHue'),
+    couplingVolumeDepthWarp: getUniform(gl, program, 'uCouplingVolumeDepthWarp'),
+    composerExposure: getUniform(gl, program, 'uComposerExposure'),
+    composerGamma: getUniform(gl, program, 'uComposerGamma'),
+    composerWeight: getUniform(gl, program, 'uComposerWeight'),
+    composerBlendGain: getUniform(gl, program, 'uComposerBlendGain'),
+    tracerEnabled: getUniform(gl, program, 'uTracerEnabled'),
+    tracerGain: getUniform(gl, program, 'uTracerGain'),
+    tracerTau: getUniform(gl, program, 'uTracerTau'),
+    tracerModDepth: getUniform(gl, program, 'uTracerModDepth'),
+    tracerModFrequency: getUniform(gl, program, 'uTracerModFrequency'),
+    tracerModPhase: getUniform(gl, program, 'uTracerModPhase'),
+    tracerDt: getUniform(gl, program, 'uTracerDt'),
+    su7Enabled: getUniform(gl, program, 'uSu7Enabled'),
+    su7Gain: getUniform(gl, program, 'uSu7Gain'),
+    su7DecimationStride: getUniform(gl, program, 'uSu7DecimationStride'),
+    su7DecimationMode: getUniform(gl, program, 'uSu7DecimationMode'),
+    su7ProjectorWeight: getUniform(gl, program, 'uSu7ProjectorWeight'),
+    su7ProjectorMode: getUniform(gl, program, 'uSu7ProjectorMode'),
+    su7TileCols: getUniform(gl, program, 'uSu7TileCols'),
+    su7TileRows: getUniform(gl, program, 'uSu7TileRows'),
+    su7TileSize: getUniform(gl, program, 'uSu7TileSize'),
+    su7UnitaryTexWidth: getUniform(gl, program, 'uSu7UnitaryTexWidth'),
+    su7UnitaryTexRowsPerTile: getUniform(gl, program, 'uSu7UnitaryTexRowsPerTile'),
+    su7ProjectorMatrix: getOptionalUniform(gl, program, 'uSu7ProjectorMatrix'),
   };
 }
 
@@ -1233,4 +2290,8 @@ function getUniform(gl: WebGL2RenderingContext, program: WebGLProgram, name: str
     throw new Error(`Uniform ${name} not found`);
   }
   return location;
+}
+
+function getOptionalUniform(gl: WebGL2RenderingContext, program: WebGLProgram, name: string) {
+  return gl.getUniformLocation(program, name);
 }

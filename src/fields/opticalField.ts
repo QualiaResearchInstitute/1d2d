@@ -1,12 +1,12 @@
-import { makeResolution, type FieldResolution } from "./contracts.js";
+import { makeResolution, type FieldResolution } from './contracts.js';
 
 export const OPTICAL_FIELD_SCHEMA_VERSION = 2 as const;
 
-export type OpticalSpace = "screen" | "pupil" | "volumeSlice";
+export type OpticalSpace = 'screen' | 'pupil' | 'volumeSlice';
 
-export type OpticalSolverId = "kuramoto" | "angularSpectrum" | "volumeStub" | "dispatcher" | string;
+export type OpticalSolverId = 'kuramoto' | 'angularSpectrum' | 'volumeStub' | 'dispatcher' | string;
 
-export type PhaseReferenceKind = "wrapped" | "aligned";
+export type PhaseReferenceKind = 'wrapped' | 'aligned';
 
 export type OpticalFieldMetadata = {
   schemaVersion: number;
@@ -85,15 +85,15 @@ export class OpticalFieldFrame {
     this.imag = this.view.subarray(texels, texels * 2);
     this.metadata = {
       schemaVersion: OPTICAL_FIELD_SCHEMA_VERSION,
-      solver: "dispatcher",
-      solverInstanceId: "unassigned",
+      solver: 'dispatcher',
+      solverInstanceId: 'unassigned',
       frameId: -1,
       timestamp: 0,
       dt: 0,
       wavelengthNm: 550,
       pixelPitchMeters: 1e-6,
-      space: "screen",
-      phaseReference: "wrapped"
+      space: 'screen',
+      phaseReference: 'wrapped',
     };
   }
 
@@ -115,7 +115,7 @@ export class OpticalFieldFrame {
       ...this.metadata,
       ...update,
       phaseOrigin: update.phaseOrigin ?? this.metadata.phaseOrigin,
-      userTags: update.userTags ?? this.metadata.userTags
+      userTags: update.userTags ?? this.metadata.userTags,
     };
   }
 
@@ -140,7 +140,7 @@ export class OpticalFieldFrame {
 }
 
 const defaultTimestamp = () => {
-  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
     return performance.now();
   }
   return Date.now();
@@ -177,17 +177,14 @@ export class OpticalFieldManager {
   constructor(options: OpticalFieldManagerOptions) {
     this.solver = options.solver;
     this.solverInstanceId = options.solverInstanceId ?? `${options.solver}-default`;
-    this.resolution = makeResolution(
-      options.resolution.width,
-      options.resolution.height
-    );
+    this.resolution = makeResolution(options.resolution.width, options.resolution.height);
     this.capacity = Math.max(1, options.capacity ?? 4);
     this.nextFrameId = options.initialFrameId ?? 0;
     this.defaults = {
       dt: options.defaultDt ?? 0,
       wavelengthNm: options.defaultWavelengthNm ?? 550,
       pixelPitchMeters: options.defaultPixelPitchMeters ?? 1e-6,
-      space: options.defaultSpace ?? "screen"
+      space: options.defaultSpace ?? 'screen',
     };
   }
 
@@ -204,7 +201,7 @@ export class OpticalFieldManager {
 
   releaseFrame(frame: OpticalFieldFrame) {
     if (!this.live.has(frame)) {
-      throw new Error("[opticalField] attempt to release frame not owned by manager");
+      throw new Error('[opticalField] attempt to release frame not owned by manager');
     }
     this.live.delete(frame);
     frame.markReleased();
@@ -215,12 +212,12 @@ export class OpticalFieldManager {
 
   alignPhase(frame: OpticalFieldFrame, request: PhaseAlignmentRequest): number {
     if (!this.live.has(frame)) {
-      throw new Error("[opticalField] cannot align phase for unmanaged frame");
+      throw new Error('[opticalField] cannot align phase for unmanaged frame');
     }
     const { anchorIndex, referencePhase } = request;
     if (anchorIndex < 0 || anchorIndex >= frame.real.length) {
       throw new Error(
-        `[opticalField] anchor index ${anchorIndex} out of bounds for ${frame.real.length} samples`
+        `[opticalField] anchor index ${anchorIndex} out of bounds for ${frame.real.length} samples`,
       );
     }
     const tolerance = request.tolerance ?? 1e-6;
@@ -233,18 +230,18 @@ export class OpticalFieldManager {
       frame.applyPhaseRotation(delta);
     }
     frame.updateMeta({
-      phaseReference: "aligned",
+      phaseReference: 'aligned',
       phaseOrigin: {
         anchorIndex,
         referencePhase,
-        appliedDelta: delta
-      }
+        appliedDelta: delta,
+      },
     });
     for (const hook of this.hooks) {
       hook({
         field: frame,
         request,
-        phaseDelta: delta
+        phaseDelta: delta,
       });
     }
     return delta;
@@ -252,7 +249,7 @@ export class OpticalFieldManager {
 
   stampFrame(frame: OpticalFieldFrame, options?: OpticalFieldAcquireOptions): OpticalFieldMetadata {
     if (!this.live.has(frame)) {
-      throw new Error("[opticalField] cannot stamp metadata for unmanaged frame");
+      throw new Error('[opticalField] cannot stamp metadata for unmanaged frame');
     }
     const prev = frame.getMeta();
     const frameId = this.allocateFrameId(options?.frameId);
@@ -265,14 +262,14 @@ export class OpticalFieldManager {
       pixelPitchMeters:
         options?.pixelPitchMeters ?? prev.pixelPitchMeters ?? this.defaults.pixelPitchMeters,
       space: options?.space ?? prev.space ?? this.defaults.space,
-      phaseReference: options?.phaseReference ?? "wrapped",
+      phaseReference: options?.phaseReference ?? 'wrapped',
       phaseOrigin: undefined,
       notes: options?.notes ?? prev.notes,
       userTags: options?.userTags
         ? { ...options.userTags }
         : prev.userTags
-        ? { ...prev.userTags }
-        : undefined
+          ? { ...prev.userTags }
+          : undefined,
     };
     frame.markAcquired(meta);
     return meta;
@@ -307,7 +304,7 @@ export class OpticalFieldManager {
 
   private makeMetadata(
     options?: OpticalFieldAcquireOptions,
-    prev?: OpticalFieldMetadata
+    prev?: OpticalFieldMetadata,
   ): OpticalFieldMetadata {
     const userTags = options?.userTags ?? prev?.userTags;
     return {
@@ -321,10 +318,10 @@ export class OpticalFieldManager {
       pixelPitchMeters:
         options?.pixelPitchMeters ?? prev?.pixelPitchMeters ?? this.defaults.pixelPitchMeters,
       space: options?.space ?? prev?.space ?? this.defaults.space,
-      phaseReference: options?.phaseReference ?? prev?.phaseReference ?? "wrapped",
+      phaseReference: options?.phaseReference ?? prev?.phaseReference ?? 'wrapped',
       phaseOrigin: prev?.phaseOrigin,
       notes: options?.notes ?? prev?.notes,
-      userTags: userTags ? { ...userTags } : undefined
+      userTags: userTags ? { ...userTags } : undefined,
     };
   }
 }

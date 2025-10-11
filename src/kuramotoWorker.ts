@@ -11,14 +11,14 @@ import {
   createKuramotoInstrumentationSnapshot,
   type KuramotoParams,
   type KuramotoState,
-  type KuramotoInstrumentationSnapshot
-} from "./kuramotoCore";
-import { assertPhaseField } from "./fields/contracts.js";
-import { clampKernelSpec, KERNEL_SPEC_DEFAULT, type KernelSpec } from "./kernel/kernelSpec";
-import type { OpticalFieldMetadata } from "./fields/opticalField.js";
+  type KuramotoInstrumentationSnapshot,
+} from './kuramotoCore';
+import { assertPhaseField } from './fields/contracts.js';
+import { clampKernelSpec, KERNEL_SPEC_DEFAULT, type KernelSpec } from './kernel/kernelSpec';
+import type { OpticalFieldMetadata } from './fields/opticalField.js';
 
 type InitMessage = {
-  kind: "init";
+  kind: 'init';
   width: number;
   height: number;
   params: KuramotoParams;
@@ -28,36 +28,36 @@ type InitMessage = {
 };
 
 type TickMessage = {
-  kind: "tick";
+  kind: 'tick';
   dt: number;
   timestamp: number;
   frameId: number;
 };
 
 type UpdateParamsMessage = {
-  kind: "updateParams";
+  kind: 'updateParams';
   params: KuramotoParams;
 };
 
 type KernelSpecMessage = {
-  kind: "kernelSpec";
+  kind: 'kernelSpec';
   spec: KernelSpec;
   version: number;
 };
 
 type ResetMessage = {
-  kind: "reset";
+  kind: 'reset';
   qInit: number;
   seed?: number;
 };
 
 type ReturnBufferMessage = {
-  kind: "returnBuffer";
+  kind: 'returnBuffer';
   buffer: ArrayBuffer;
 };
 
 type SimulateMessage = {
-  kind: "simulate";
+  kind: 'simulate';
   frameCount: number;
   dt: number;
   params: KuramotoParams;
@@ -77,7 +77,7 @@ type IncomingMessage =
   | SimulateMessage;
 
 type FrameMessage = {
-  kind: "frame";
+  kind: 'frame';
   buffer: ArrayBuffer;
   timestamp: number;
   frameId: number;
@@ -87,10 +87,10 @@ type FrameMessage = {
   instrumentation: KuramotoInstrumentationSnapshot;
 };
 
-type ReadyMessage = { kind: "ready"; width: number; height: number };
-type LogMessage = { kind: "log"; message: string };
+type ReadyMessage = { kind: 'ready'; width: number; height: number };
+type LogMessage = { kind: 'log'; message: string };
 type SimulateResultMessage = {
-  kind: "simulateResult";
+  kind: 'simulateResult';
   buffers: ArrayBuffer[];
   width: number;
   height: number;
@@ -108,7 +108,10 @@ let height = 0;
 let kernelSpec: KernelSpec | null = null;
 let kernelSpecVersion = 0;
 
-const post = (message: FrameMessage | ReadyMessage | LogMessage | SimulateResultMessage, transfer?: Transferable[]) => {
+const post = (
+  message: FrameMessage | ReadyMessage | LogMessage | SimulateResultMessage,
+  transfer?: Transferable[],
+) => {
   if (transfer) {
     ctx.postMessage(message, transfer);
   } else {
@@ -137,35 +140,35 @@ const handleTick = (msg: TickMessage) => {
   const buffer = acquireBuffer();
   if (!buffer) {
     post({
-      kind: "log",
-      message: "[kur-worker] dropping frame: buffer pool empty"
+      kind: 'log',
+      message: '[kur-worker] dropping frame: buffer pool empty',
     });
     return;
   }
   const activeKernel = kernelSpec ?? KERNEL_SPEC_DEFAULT;
   stepKuramotoState(state, params, msg.dt, randn, msg.timestamp, {
     kernel: activeKernel,
-    telemetry: { kernelVersion: kernelSpecVersion }
+    telemetry: { kernelVersion: kernelSpecVersion },
   });
   const meta = state.field.getMeta();
   const derived = createDerivedViews(buffer, state.width, state.height);
-  assertPhaseField(derived, "worker:tick");
+  assertPhaseField(derived, 'worker:tick');
   deriveKuramotoFields(state, derived, {
-    kernel: activeKernel
+    kernel: activeKernel,
   });
   const instrumentation = createKuramotoInstrumentationSnapshot(state);
   post(
     {
-      kind: "frame",
+      kind: 'frame',
       buffer,
       timestamp: msg.timestamp,
       frameId: meta.frameId,
       queueDepth: bufferPool.length,
       kernelVersion: kernelSpecVersion,
       meta,
-      instrumentation
+      instrumentation,
     },
-    [buffer]
+    [buffer],
   );
 };
 
@@ -178,7 +181,7 @@ const handleInit = (msg: InitMessage) => {
   bufferPool = [...msg.buffers];
   if (!state) return;
   initKuramotoState(state, msg.qInit);
-  post({ kind: "ready", width: state.width, height: state.height });
+  post({ kind: 'ready', width: state.width, height: state.height });
 };
 
 const handleReset = (msg: ResetMessage) => {
@@ -197,57 +200,57 @@ const handleSimulate = (msg: SimulateMessage) => {
   const activeKernel = kernelSpec ?? KERNEL_SPEC_DEFAULT;
   for (let frame = 0; frame < msg.frameCount; frame++) {
     stepKuramotoState(simState, simParams, msg.dt, simRand, msg.dt * (frame + 1), {
-      kernel: activeKernel
+      kernel: activeKernel,
     });
     const out = new ArrayBuffer(size);
     const derived = createDerivedViews(out, msg.width, msg.height);
-    assertPhaseField(derived, "worker:simulate");
+    assertPhaseField(derived, 'worker:simulate');
     deriveKuramotoFields(simState, derived, {
-      kernel: activeKernel
+      kernel: activeKernel,
     });
     buffers.push(out);
   }
   post(
     {
-      kind: "simulateResult",
+      kind: 'simulateResult',
       buffers,
       width: msg.width,
       height: msg.height,
-      frameCount: msg.frameCount
+      frameCount: msg.frameCount,
     },
-    buffers
+    buffers,
   );
 };
 
 ctx.onmessage = (event: MessageEvent<IncomingMessage>) => {
   const msg = event.data;
   switch (msg.kind) {
-    case "init":
+    case 'init':
       handleInit(msg);
       break;
-    case "tick":
+    case 'tick':
       handleTick(msg);
       break;
-    case "updateParams":
+    case 'updateParams':
       params = { ...msg.params };
       break;
-    case "kernelSpec":
+    case 'kernelSpec':
       kernelSpec = clampKernelSpec(msg.spec);
       kernelSpecVersion = msg.version;
       break;
-    case "reset":
+    case 'reset':
       handleReset(msg);
       break;
-    case "returnBuffer":
+    case 'returnBuffer':
       releaseBuffer(msg.buffer);
       break;
-    case "simulate":
+    case 'simulate':
       handleSimulate(msg);
       break;
     default:
       post({
-        kind: "log",
-        message: `[kur-worker] unhandled message ${(msg as any)?.kind}`
+        kind: 'log',
+        message: `[kur-worker] unhandled message ${(msg as any)?.kind}`,
       });
       break;
   }

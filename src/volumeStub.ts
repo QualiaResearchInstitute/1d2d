@@ -1,4 +1,4 @@
-import { makeResolution, type VolumeField } from "./fields/contracts.js";
+import { makeResolution, type VolumeField } from './fields/contracts.js';
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
@@ -32,7 +32,7 @@ export type VolumeStubState = {
 export const createVolumeStubState = (
   width: number,
   height: number,
-  seed = 2024
+  seed = 2024,
 ): VolumeStubState => {
   const total = width * height;
   const basePhase = new Float32Array(total);
@@ -53,7 +53,7 @@ export const createVolumeStubState = (
     intensity: new Float32Array(total),
     basePhase,
     baseDepth,
-    baseIntensity
+    baseIntensity,
   };
   stepVolumeStub(state, 0);
   return state;
@@ -77,13 +77,13 @@ export const stepVolumeStub = (state: VolumeStubState, dt: number) => {
       depth[idx] = clamp(
         0.2 + 0.6 * baseDepth[idx] + 0.4 * envelope * (0.5 + 0.5 * Math.cos(swirl * 2.2 - t * 0.4)),
         0,
-        1
+        1,
       );
       intensity[idx] = clamp(
         baseIntensity[idx] *
           (0.55 + 0.45 * (0.5 + 0.5 * Math.sin(radial * 2.4 + swirl * 1.1 + t * 0.7))),
         0,
-        1.5
+        1.5,
       );
     }
   }
@@ -91,11 +91,11 @@ export const stepVolumeStub = (state: VolumeStubState, dt: number) => {
 };
 
 export const snapshotVolumeStub = (state: VolumeStubState): VolumeField => ({
-  kind: "volume",
+  kind: 'volume',
   resolution: makeResolution(state.width, state.height),
   phase: state.phase,
   depth: state.depth,
-  intensity: state.intensity
+  intensity: state.intensity,
 });
 
 export type VolumeRecording = {
@@ -111,14 +111,14 @@ export const ingestVolumeRecording = (recording: VolumeRecording): VolumeField =
   const total = width * height;
   if (phase.length !== total || depth.length !== total || intensity.length !== total) {
     throw new Error(
-      `[volumeStub] recording length mismatch (phase=${phase.length}, depth=${depth.length}, intensity=${intensity.length}, expected=${total})`
+      `[volumeStub] recording length mismatch (phase=${phase.length}, depth=${depth.length}, intensity=${intensity.length}, expected=${total})`,
     );
   }
   return {
-    kind: "volume",
+    kind: 'volume',
     resolution: makeResolution(width, height),
     phase: Float32Array.from(phase),
     depth: Float32Array.from(depth),
-    intensity: Float32Array.from(intensity)
+    intensity: Float32Array.from(intensity),
   };
 };

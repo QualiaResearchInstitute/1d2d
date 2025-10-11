@@ -3,6 +3,7 @@ import { clampKernelSpec, cloneKernelSpec, KERNEL_SPEC_DEFAULT } from "../kernel
 import { createVolumeStubState, snapshotVolumeStub, stepVolumeStub } from "../volumeStub.js";
 import { makeResolution } from "../fields/contracts.js";
 import { createDefaultComposerConfig, renderRainbowFrame } from "../pipeline/rainbowFrame.js";
+import { createDefaultSu7RuntimeParams } from "../pipeline/su7/types.js";
 const DEFAULT_HALF_LIVES = {
     rim1p5D: 0.65,
     surface2D: 1.0,
@@ -25,7 +26,10 @@ const DEFAULT_KURAMOTO_PARAMS = {
     K0: 0.6,
     epsKur: 0.0015,
     fluxX: 0,
-    fluxY: 0
+    fluxY: 0,
+    smallWorldWeight: 0,
+    p_sw: 0,
+    smallWorldEnabled: false
 };
 const pairKey = (a, b) => a < b ? `${a}~${b}` : `${b}~${a}`;
 const computeScale = (time, halfLife) => {
@@ -281,6 +285,7 @@ const simulateScenarioRun = (kernelInput, options, noise, seedOffset = 0) => {
             volume: volumeField,
             kernel,
             dmt,
+            arousal: 0,
             blend,
             normPin: true,
             normTarget: 0.6,
@@ -308,7 +313,10 @@ const simulateScenarioRun = (kernelInput, options, noise, seedOffset = 0) => {
             surfaceBlend: surfaceBlendBase * Math.max(0.2, surfaceScale),
             surfaceRegion: "both",
             warpAmp: 1.35,
+            curvatureStrength: 0,
+            curvatureMode: "poincare",
             kurEnabled: true,
+            su7: createDefaultSu7RuntimeParams(),
             composer: composerConfig
         });
         const rimMetricRaw = applyTierNoise(result.metrics.rim.mean, "rim1p5D", noise, noiseGenerator);

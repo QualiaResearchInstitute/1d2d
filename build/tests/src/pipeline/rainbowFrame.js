@@ -1,42 +1,111 @@
-import { createHyperbolicAtlas } from "../hyperbolic/atlas.js";
-import { clampKernelSpec, cloneKernelSpec } from "../kernel/kernelSpec.js";
-import { computeTextureDiagnostics } from "./textureDiagnostics.js";
-import { embedToC7 } from "./su7/embed.js";
-import { buildScheduledUnitary, computeSu7Telemetry } from "./su7/math.js";
-import { projectSu7Vector } from "./su7/projector.js";
-import { applySU7 } from "./su7/unitary.js";
-import { createDefaultSu7RuntimeParams } from "./su7/types.js";
+import { createHyperbolicAtlas } from '../hyperbolic/atlas.js';
+import { clampKernelSpec, cloneKernelSpec } from '../kernel/kernelSpec.js';
+import { computeTextureDiagnostics } from './textureDiagnostics.js';
+import { embedToC7 } from './su7/embed.js';
+import { compose_dense, computeNormDeltas, computeProjectorEnergy, createSu7GateList, enforceUnitaryGuardrail, phase_gate, } from './su7/math.js';
+import { projectSu7Vector } from './su7/projector.js';
+import { applySU7 } from './su7/unitary.js';
+import { DEFAULT_SU7_TELEMETRY, EMPTY_SU7_GUARDRAILS, createDefaultSu7RuntimeParams, mergeGateAppends, } from './su7/types.js';
+const SU7_VECTOR_DIM = 7;
+const createIdentity7 = () => {
+    const rows = [];
+    for (let row = 0; row < SU7_VECTOR_DIM; row++) {
+        const cells = [];
+        for (let col = 0; col < SU7_VECTOR_DIM; col++) {
+            cells.push({ re: row === col ? 1 : 0, im: 0 });
+        }
+        rows.push(cells);
+    }
+    return rows;
+};
+const createTwoPlanePulseMatrix = (axisA, axisB, theta, phase) => {
+    const result = createIdentity7();
+    const cos = Math.cos(theta);
+    const sin = Math.sin(theta);
+    const phaseCos = Math.cos(phase);
+    const phaseSin = Math.sin(phase);
+    result[axisA][axisA] = { re: cos, im: 0 };
+    result[axisB][axisB] = { re: cos, im: 0 };
+    result[axisA][axisB] = { re: -sin * phaseCos, im: -sin * phaseSin };
+    result[axisB][axisA] = { re: sin * phaseCos, im: -sin * phaseSin };
+    return result;
+};
+export const buildSu7UnitaryFromGains = (gains) => {
+    let current = phase_gate(gains.phaseAngles);
+    for (let axis = 0; axis < SU7_VECTOR_DIM; axis++) {
+        const theta = gains.pulseAngles[axis];
+        if (!Number.isFinite(theta) || Math.abs(theta) <= 1e-6)
+            continue;
+        const neighbor = (axis + 1) % SU7_VECTOR_DIM;
+        const rotation = createTwoPlanePulseMatrix(axis, neighbor, theta, gains.chiralityPhase);
+        current = compose_dense(rotation, current);
+    }
+    return current;
+};
+export const resolveSu7Runtime = (params, context, options) => {
+    const shouldEmitEvents = options?.emitGuardrailEvents !== false;
+    const guardrailEvents = [];
+    const baseGateList = createSu7GateList(params, context);
+    const gateList = params.gateAppends && params.gateAppends.length > 0
+        ? mergeGateAppends(baseGateList, params.gateAppends)
+        : mergeGateAppends(baseGateList, []);
+    const unitary = buildSu7UnitaryFromGains(gateList.gains);
+    if (!params.enabled || params.gain <= 1e-4) {
+        return {
+            gateList,
+            unitary,
+            telemetry: { ...DEFAULT_SU7_TELEMETRY },
+            guardrails: shouldEmitEvents ? { events: [] } : EMPTY_SU7_GUARDRAILS,
+        };
+    }
+    const enforcement = enforceUnitaryGuardrail(unitary, {
+        threshold: 1e-6,
+        force: options?.forceReorthon === true,
+    });
+    if (shouldEmitEvents && enforcement.event) {
+        guardrailEvents.push(enforcement.event);
+    }
+    const normStats = computeNormDeltas(enforcement.unitary);
+    return {
+        gateList,
+        unitary: enforcement.unitary,
+        telemetry: {
+            unitaryError: enforcement.unitaryError,
+            determinantDrift: enforcement.determinantDrift,
+            normDeltaMax: normStats.max,
+            normDeltaMean: normStats.mean,
+            projectorEnergy: computeProjectorEnergy(params.projector),
+            geodesicFallbacks: 0,
+        },
+        guardrails: shouldEmitEvents ? { events: guardrailEvents } : EMPTY_SU7_GUARDRAILS,
+    };
+};
 const DMT_SENS = {
     g1: 0.6,
     k1: 0.35,
     q1: 0.5,
     a1: 0.7,
     c1: 0.6,
-    t1: 0.5
+    t1: 0.5,
 };
-export const COMPOSER_FIELD_LIST = [
-    "surface",
-    "rim",
-    "kur",
-    "volume"
-];
+export const COMPOSER_FIELD_LIST = ['surface', 'rim', 'kur', 'volume'];
 export const createDefaultComposerConfig = () => ({
     fields: {
         surface: { exposure: 1.0, gamma: 1.0, weight: 1.0 },
         rim: { exposure: 1.0, gamma: 1.0, weight: 1.0 },
         kur: { exposure: 1.0, gamma: 1.0, weight: 1.0 },
-        volume: { exposure: 1.0, gamma: 1.0, weight: 1.0 }
+        volume: { exposure: 1.0, gamma: 1.0, weight: 1.0 },
     },
-    dmtRouting: "auto",
-    solverRegime: "balanced"
+    dmtRouting: 'auto',
+    solverRegime: 'balanced',
 });
 export const computeComposerBlendGain = (config) => {
     const dmtRoutingMode = config.dmtRouting;
     const solverMode = config.solverRegime;
-    const rimRoutingFactor = dmtRoutingMode === "rimBias" ? 1.1 : dmtRoutingMode === "surfaceBias" ? 0.9 : 1;
-    const surfaceRoutingFactor = dmtRoutingMode === "surfaceBias" ? 1.1 : dmtRoutingMode === "rimBias" ? 0.9 : 1;
-    const rimSolverFactor = solverMode === "rimLocked" ? 1.1 : solverMode === "surfaceLocked" ? 0.9 : 1;
-    const surfaceSolverFactor = solverMode === "surfaceLocked" ? 1.1 : solverMode === "rimLocked" ? 0.9 : 1;
+    const rimRoutingFactor = dmtRoutingMode === 'rimBias' ? 1.1 : dmtRoutingMode === 'surfaceBias' ? 0.9 : 1;
+    const surfaceRoutingFactor = dmtRoutingMode === 'surfaceBias' ? 1.1 : dmtRoutingMode === 'rimBias' ? 0.9 : 1;
+    const rimSolverFactor = solverMode === 'rimLocked' ? 1.1 : solverMode === 'surfaceLocked' ? 0.9 : 1;
+    const surfaceSolverFactor = solverMode === 'surfaceLocked' ? 1.1 : solverMode === 'rimLocked' ? 0.9 : 1;
     return [rimRoutingFactor * rimSolverFactor, surfaceRoutingFactor * surfaceSolverFactor];
 };
 const clampComposerValue = (value, min, max, fallback) => {
@@ -53,10 +122,10 @@ const sanitizeComposerConfig = (config) => {
             surface: { ...defaults.fields.surface },
             rim: { ...defaults.fields.rim },
             kur: { ...defaults.fields.kur },
-            volume: { ...defaults.fields.volume }
+            volume: { ...defaults.fields.volume },
         },
         dmtRouting: source.dmtRouting ?? defaults.dmtRouting,
-        solverRegime: source.solverRegime ?? defaults.solverRegime
+        solverRegime: source.solverRegime ?? defaults.solverRegime,
     };
     COMPOSER_FIELD_LIST.forEach((field) => {
         const incoming = source.fields?.[field];
@@ -64,7 +133,7 @@ const sanitizeComposerConfig = (config) => {
         result.fields[field] = {
             exposure: clampComposerValue(incoming?.exposure ?? fallback.exposure, 0, 8, fallback.exposure),
             gamma: clampComposerValue(incoming?.gamma ?? fallback.gamma, 0.2, 5, fallback.gamma),
-            weight: clampComposerValue(incoming?.weight ?? fallback.weight, 0, 2.5, fallback.weight)
+            weight: clampComposerValue(incoming?.weight ?? fallback.weight, 0, 2.5, fallback.weight),
         };
     });
     return result;
@@ -141,7 +210,7 @@ export const deriveSu7ScheduleContext = (params) => {
                 gridVectors[cell * 2 + 1] += gy;
                 gridCounts[cell] += 1;
                 const angle = Math.atan2(gy, gx);
-                const axis = ((Math.round((((angle % TAU) + TAU) % TAU) / TAU * 7) % 7) + 7) % 7;
+                const axis = ((Math.round(((((angle % TAU) + TAU) % TAU) / TAU) * 7) % 7) + 7) % 7;
                 axisBias[axis] += mag;
                 const dx = x - cx;
                 const dy = y - cy;
@@ -186,7 +255,7 @@ export const deriveSu7ScheduleContext = (params) => {
             coherence,
             axisBias: axisBiasNorm,
             gridSize,
-            gridVectors
+            gridVectors,
         };
     }
     let volumeCoverage = 0;
@@ -211,7 +280,7 @@ export const deriveSu7ScheduleContext = (params) => {
         flow: flowContext,
         curvatureStrength,
         parallaxRadial,
-        volumeCoverage
+        volumeCoverage,
     };
 };
 const createBranchAccumulators = (count) => Array.from({ length: count }, () => ({
@@ -220,7 +289,7 @@ const createBranchAccumulators = (count) => Array.from({ length: count }, () => 
     parallaxSum: 0,
     magnitudeSum: 0,
     hyperbolicSum: 0,
-    count: 0
+    count: 0,
 }));
 const computeMotionEnergyFromBranches = (branches, source) => {
     if (!branches)
@@ -249,7 +318,7 @@ const computeMotionEnergyFromBranches = (branches, source) => {
             parallaxMean: tag,
             parallaxStd: 0,
             parallaxAbsMean: Math.abs(tag),
-            source
+            source,
         };
     }
     let meanCos = 0;
@@ -292,7 +361,7 @@ const computeMotionEnergyFromBranches = (branches, source) => {
         parallaxMean: tagMean,
         parallaxStd,
         parallaxAbsMean,
-        source
+        source,
     };
 };
 const finalizeBranchAttentionSummary = (branches, kind) => {
@@ -318,14 +387,14 @@ const finalizeBranchAttentionSummary = (branches, kind) => {
             coherence,
             meanParallax,
             hyperbolicGain,
-            magnitude
+            magnitude,
         });
     }
     if (!entries.length)
         return null;
     return {
         kind,
-        entries
+        entries,
     };
 };
 export const computeHyperbolicFlowScale = (hyperRadius, curvatureStrength) => {
@@ -361,44 +430,44 @@ export const kEff = (k, d) => ({
     anisotropy: k.anisotropy + DMT_SENS.a1 * d,
     chirality: k.chirality + DMT_SENS.c1 * d,
     transparency: k.transparency + DMT_SENS.t1 * d,
-    couplingPreset: k.couplingPreset
+    couplingPreset: k.couplingPreset,
 });
 export const groupOps = (kind) => {
     const HALF = 0.5;
     const THIRD = 1 / 3;
     const rot = (angle, tx = 0, ty = 0) => ({
-        kind: "rot",
+        kind: 'rot',
         angle,
         tx,
-        ty
+        ty,
     });
     const id = (tx = 0, ty = 0) => rot(0, tx, ty);
-    const mirrorX = (tx = 0, ty = 0) => ({ kind: "mirrorX", tx, ty });
-    const mirrorY = (tx = 0, ty = 0) => ({ kind: "mirrorY", tx, ty });
-    const diag1 = (tx = 0, ty = 0) => ({ kind: "diag1", tx, ty });
-    const diag2 = (tx = 0, ty = 0) => ({ kind: "diag2", tx, ty });
+    const mirrorX = (tx = 0, ty = 0) => ({ kind: 'mirrorX', tx, ty });
+    const mirrorY = (tx = 0, ty = 0) => ({ kind: 'mirrorY', tx, ty });
+    const diag1 = (tx = 0, ty = 0) => ({ kind: 'diag1', tx, ty });
+    const diag2 = (tx = 0, ty = 0) => ({ kind: 'diag2', tx, ty });
     switch (kind) {
-        case "p1":
+        case 'p1':
             return [id(), id(HALF, 0), id(0, HALF), id(HALF, HALF)];
-        case "p2":
+        case 'p2':
             return [rot(0), rot(Math.PI), rot(0, HALF, HALF), rot(Math.PI, HALF, HALF)];
-        case "pm":
+        case 'pm':
             return [id(), mirrorX(), id(HALF, 0), mirrorX(HALF, 0)];
-        case "pg":
+        case 'pg':
             return [id(), mirrorX(HALF, 0), id(0, HALF), mirrorX(HALF, HALF)];
-        case "cm":
+        case 'cm':
             return [id(), mirrorY(0, HALF), mirrorX(HALF, 0), mirrorY(HALF, HALF)];
-        case "pmm":
+        case 'pmm':
             return [rot(0), rot(Math.PI), mirrorX(), mirrorY()];
-        case "pmg":
+        case 'pmg':
             return [rot(0), mirrorX(), mirrorY(HALF, 0), rot(Math.PI, HALF, 0)];
-        case "pgg":
+        case 'pgg':
             return [rot(0), rot(Math.PI), mirrorX(HALF, 0), mirrorY(0, HALF)];
-        case "cmm":
+        case 'cmm':
             return [rot(0), mirrorX(), mirrorY(), diag1(), diag2(), rot(Math.PI, HALF, HALF)];
-        case "p4":
+        case 'p4':
             return [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2].map((angle) => rot(angle));
-        case "p4m":
+        case 'p4m':
             return [
                 rot(0),
                 rot(Math.PI / 2),
@@ -407,9 +476,9 @@ export const groupOps = (kind) => {
                 mirrorX(),
                 mirrorY(),
                 diag1(),
-                diag2()
+                diag2(),
             ];
-        case "p4g":
+        case 'p4g':
             return [
                 rot(0),
                 rot(Math.PI / 2),
@@ -418,36 +487,32 @@ export const groupOps = (kind) => {
                 mirrorX(HALF, 0),
                 mirrorY(0, HALF),
                 diag1(HALF, 0),
-                diag2(0, HALF)
+                diag2(0, HALF),
             ];
-        case "p3":
+        case 'p3':
             return [0, (2 * Math.PI) / 3, (4 * Math.PI) / 3].map((angle) => rot(angle));
-        case "p3m1":
+        case 'p3m1':
             return [
                 rot(0),
                 rot((2 * Math.PI) / 3),
                 rot((4 * Math.PI) / 3),
                 mirrorX(),
                 diag1(THIRD, 0),
-                diag2(0, THIRD)
+                diag2(0, THIRD),
             ];
-        case "p31m":
+        case 'p31m':
             return [
                 rot(0),
                 rot((2 * Math.PI) / 3),
                 rot((4 * Math.PI) / 3),
                 mirrorY(),
                 diag1(2 * THIRD, THIRD),
-                diag2(THIRD, 2 * THIRD)
+                diag2(THIRD, 2 * THIRD),
             ];
-        case "p6":
+        case 'p6':
             return Array.from({ length: 6 }, (_, j) => rot((j * Math.PI) / 3));
-        case "p6m":
-            return [
-                ...Array.from({ length: 6 }, (_, j) => rot((j * Math.PI) / 3)),
-                mirrorX(),
-                mirrorY()
-            ];
+        case 'p6m':
+            return [...Array.from({ length: 6 }, (_, j) => rot((j * Math.PI) / 3)), mirrorX(), mirrorY()];
         default:
             return [rot(0)];
     }
@@ -456,15 +521,15 @@ export const toGpuOps = (ops) => ops.map((op) => {
     const tx = op.tx ?? 0;
     const ty = op.ty ?? 0;
     switch (op.kind) {
-        case "rot":
+        case 'rot':
             return { kind: 0, angle: op.angle, tx, ty };
-        case "mirrorX":
+        case 'mirrorX':
             return { kind: 1, angle: 0, tx, ty };
-        case "mirrorY":
+        case 'mirrorY':
             return { kind: 2, angle: 0, tx, ty };
-        case "diag1":
+        case 'diag1':
             return { kind: 3, angle: 0, tx, ty };
-        case "diag2":
+        case 'diag2':
             return { kind: 4, angle: 0, tx, ty };
         default:
             return { kind: 0, angle: 0, tx, ty };
@@ -476,26 +541,26 @@ export const applyOp = (op, x, y, cx, cy) => {
     let px = dx;
     let py = dy;
     switch (op.kind) {
-        case "rot": {
+        case 'rot': {
             const c = Math.cos(op.angle);
             const s = Math.sin(op.angle);
             px = c * dx - s * dy;
             py = s * dx + c * dy;
             break;
         }
-        case "mirrorX":
+        case 'mirrorX':
             px = -dx;
             py = dy;
             break;
-        case "mirrorY":
+        case 'mirrorY':
             px = dx;
             py = -dy;
             break;
-        case "diag1":
+        case 'diag1':
             px = dy;
             py = dx;
             break;
-        case "diag2":
+        case 'diag2':
             px = -dy;
             py = -dx;
             break;
@@ -550,7 +615,7 @@ export const sampleRGB = (data, x, y, W, H) => {
     return {
         R: mix(r0, r1, fy),
         G: mix(g0, g1, fy),
-        B: mix(b0, b1, fy)
+        B: mix(b0, b1, fy),
     };
 };
 const wallpaperAt = (xp, yp, cosA, sinA, ke, tSeconds, alive) => {
@@ -582,8 +647,9 @@ const TAU = 2 * Math.PI;
 const CRYSTAL_BEAT_SCALE = 12;
 const RIM_ENERGY_HIST_SCALE = 4;
 const SURFACE_HIST_BINS = 32;
+const FLUX_EPSILON = 1e-6;
 export const renderRainbowFrame = (input) => {
-    const { width, height, timeSeconds, out, surface, rim, phase, volume, kernel, dmt, arousal, blend, normPin, normTarget, lastObs, lambdaRef, lambdas, beta2, microsaccade, alive, phasePin, edgeThreshold, wallpaperGroup, surfEnabled, orientationAngles, thetaMode, thetaGlobal, polBins, jitter, coupling, sigma, contrast, rimAlpha, rimEnabled, displayMode, surfaceBlend, surfaceRegion, warpAmp, curvatureStrength, curvatureMode, kurEnabled, debug, su7, composer, attentionHooks } = input;
+    const { width, height, timeSeconds, out, surface, rim, phase, volume, kernel, dmt, arousal, blend, normPin, normTarget, lastObs, lambdaRef, lambdas, beta2, microsaccade, alive, phasePin, edgeThreshold, wallpaperGroup, surfEnabled, orientationAngles, thetaMode, thetaGlobal, polBins, jitter, coupling, sigma, contrast, rimAlpha, rimEnabled, displayMode, surfaceBlend, surfaceRegion, warpAmp, curvatureStrength, curvatureMode, kurEnabled, debug, su7, composer, attentionHooks, guardrailOptions, fluxOverlay, } = input;
     const rimDebug = debug?.rim ?? null;
     const surfaceDebug = debug?.surface ?? null;
     if (rimDebug) {
@@ -593,6 +659,17 @@ export const renderRainbowFrame = (input) => {
     if (surfaceDebug) {
         surfaceDebug.magnitudeHist.fill(0);
     }
+    const fluxOverlayData = fluxOverlay &&
+        fluxOverlay.width === width &&
+        fluxOverlay.height === height &&
+        fluxOverlay.energy.length === width * height &&
+        fluxOverlay.direction.length === width * height * 2
+        ? fluxOverlay
+        : null;
+    const fluxEnergyMap = fluxOverlayData?.energy ?? null;
+    const fluxDirectionMap = fluxOverlayData?.direction ?? null;
+    const fluxEnergyScale = fluxOverlayData?.energyScale ?? 0;
+    const fluxOverlayActive = fluxEnergyMap != null && fluxDirectionMap != null && fluxEnergyScale > FLUX_EPSILON;
     const kernelSpec = clampKernelSpec(kernel);
     const composerConfig = sanitizeComposerConfig(composer);
     const composerFields = composerConfig.fields;
@@ -600,27 +677,28 @@ export const renderRainbowFrame = (input) => {
         energy: 0,
         share: 0,
         weight: composerFields[field].weight,
-        blend: 0
+        blend: 0,
     });
     const baseCoupling = input.couplingBase
         ? { ...input.couplingBase }
         : { ...coupling };
     const composerTelemetry = {
         fields: {
-            surface: initialFieldMetrics("surface"),
-            rim: initialFieldMetrics("rim"),
-            kur: initialFieldMetrics("kur"),
-            volume: initialFieldMetrics("volume")
+            surface: initialFieldMetrics('surface'),
+            rim: initialFieldMetrics('rim'),
+            kur: initialFieldMetrics('kur'),
+            volume: initialFieldMetrics('volume'),
         },
         dmtRouting: composerConfig.dmtRouting,
         solverRegime: composerConfig.solverRegime,
         coupling: {
             base: baseCoupling,
             effective: { ...coupling },
-            scale: 1
-        }
+            scale: 1,
+        },
     };
     const su7Params = su7 ?? createDefaultSu7RuntimeParams();
+    const guardrailOpts = guardrailOptions ?? {};
     let surfaceFieldActive = surface;
     const surfaceData = surface?.rgba ?? null;
     const rimField = rim ?? null;
@@ -648,10 +726,12 @@ export const renderRainbowFrame = (input) => {
             volume: volumeField,
             dmt,
             arousal,
-            curvatureStrength
+            curvatureStrength,
         })
         : null;
-    const su7Telemetry = computeSu7Telemetry(su7Params, su7Context ?? undefined);
+    const su7Evaluation = resolveSu7Runtime(su7Params, su7Context ?? undefined, guardrailOpts);
+    const su7Telemetry = su7Evaluation.telemetry;
+    const guardrailEventAccumulator = guardrailOpts.emitGuardrailEvents === false ? [] : [...su7Evaluation.guardrails.events];
     const metrics = {
         rim: { mean: 0, max: 0, std: 0, count: 0 },
         warp: { mean: 0, std: 0, dominantAngle: 0, count: 0 },
@@ -662,13 +742,13 @@ export const renderRainbowFrame = (input) => {
             vortStd: 0,
             cohMean: 0,
             cohStd: 0,
-            sampleCount: 0
+            sampleCount: 0,
         },
         compositor: {
             effectiveBlend: 0,
             surfaceMean: 0,
             surfaceMax: 0,
-            surfaceCount: 0
+            surfaceCount: 0,
         },
         volume: {
             phaseMean: 0,
@@ -679,7 +759,7 @@ export const renderRainbowFrame = (input) => {
             depthGradStd: 0,
             intensityMean: 0,
             intensityStd: 0,
-            sampleCount: 0
+            sampleCount: 0,
         },
         parallax: {
             radialSlope: 0,
@@ -687,7 +767,7 @@ export const renderRainbowFrame = (input) => {
             kMean: 0,
             kStd: 0,
             tagConsistency: 0,
-            sampleCount: 0
+            sampleCount: 0,
         },
         motionEnergy: {
             branchCount: 0,
@@ -696,7 +776,10 @@ export const renderRainbowFrame = (input) => {
             parallaxMean: 0,
             parallaxStd: 0,
             parallaxAbsMean: 0,
-            source: "none"
+            source: 'none',
+        },
+        hopf: {
+            lenses: [],
         },
         composer: composerTelemetry,
         kuramoto: {
@@ -705,18 +788,18 @@ export const renderRainbowFrame = (input) => {
                 phase: 0,
                 real: 0,
                 imag: 0,
-                sampleCount: 0
+                sampleCount: 0,
             },
             interference: {
                 mean: 0,
                 variance: 0,
-                max: 0
+                max: 0,
             },
             frameId: -1,
             timestamp: 0,
             dt: 0,
             kernelVersion: 0,
-            kernel: cloneKernelSpec(kernelSpec)
+            kernel: cloneKernelSpec(kernelSpec),
         },
         texture: {
             wallpapericity: 0,
@@ -737,7 +820,7 @@ export const renderRainbowFrame = (input) => {
                 orientationMean: 0,
                 orientationStd: 0,
                 divisiveMean: 0,
-                divisiveStd: 0
+                divisiveStd: 0,
             },
             crystallizer: {
                 wallpapericity: 0,
@@ -745,10 +828,10 @@ export const renderRainbowFrame = (input) => {
                 beatEnergy: 0,
                 beatStd: 0,
                 resonanceRate: 0,
-                sampleCount: 0
-            }
+                sampleCount: 0,
+            },
         },
-        su7: su7Telemetry
+        su7: su7Telemetry,
     };
     if (input.kurTelemetry) {
         const tele = input.kurTelemetry;
@@ -776,33 +859,31 @@ export const renderRainbowFrame = (input) => {
     const applyComposerVec3 = (rgb, config) => [
         applyComposerColor(rgb[0], config),
         applyComposerColor(rgb[1], config),
-        applyComposerColor(rgb[2], config)
+        applyComposerColor(rgb[2], config),
     ];
     const composerEnergy = {
         surface: 0,
         rim: 0,
         kur: 0,
-        volume: 0
+        volume: 0,
     };
     const composerBlend = {
         surface: 0,
         rim: 0,
         kur: 0,
-        volume: 0
+        volume: 0,
     };
     const composerSamples = {
         surface: 0,
         rim: 0,
         kur: 0,
-        volume: 0
+        volume: 0,
     };
-    const { rimToSurfaceBlend, rimToSurfaceAlign, surfaceToRimOffset, surfaceToRimSigma, surfaceToRimHue, kurToTransparency, kurToOrientation, kurToChirality, volumePhaseToHue, volumeDepthToWarp } = coupling;
+    const { rimToSurfaceBlend, rimToSurfaceAlign, surfaceToRimOffset, surfaceToRimSigma, surfaceToRimHue, kurToTransparency, kurToOrientation, kurToChirality, volumePhaseToHue, volumeDepthToWarp, } = coupling;
     const coupleVolumePhase = volumePhase != null && volumePhaseToHue > 1e-4;
     let coupleVolumeWarp = false;
     const coupleRimSurface = rimToSurfaceBlend > 1e-4 || rimToSurfaceAlign > 1e-4;
-    const coupleSurfaceRim = surfaceToRimOffset > 1e-4 ||
-        surfaceToRimSigma > 1e-4 ||
-        surfaceToRimHue > 1e-4;
+    const coupleSurfaceRim = surfaceToRimOffset > 1e-4 || surfaceToRimSigma > 1e-4 || surfaceToRimHue > 1e-4;
     const coupleKurTransparency = kurEnabled && kurToTransparency > 1e-4;
     const coupleKurOrientation = kurEnabled && kurToOrientation > 1e-4;
     const coupleKurChirality = kurEnabled && kurToChirality > 1e-4;
@@ -818,7 +899,7 @@ export const renderRainbowFrame = (input) => {
         kurToOrientation: coupling.kurToOrientation * couplingDmtScale,
         kurToChirality: coupling.kurToChirality * couplingDmtScale,
         volumePhaseToHue: coupling.volumePhaseToHue * couplingDmtScale,
-        volumeDepthToWarp: coupling.volumeDepthToWarp * couplingDmtScale
+        volumeDepthToWarp: coupling.volumeDepthToWarp * couplingDmtScale,
     };
     const sigmaFloorBase = Math.max(0.25, sigma * 0.25);
     const hasImage = Boolean(surfaceData && rimField);
@@ -848,10 +929,9 @@ export const renderRainbowFrame = (input) => {
     let amp = phaseField?.amp ?? null;
     let su7Vectors = null;
     let su7Norms = null;
-    let su7Unitary = null;
     const su7Projector = su7Params.projector;
-    const su7Active = su7Params.enabled &&
-        su7Params.gain > 1e-4;
+    const su7Active = su7Params.enabled && su7Params.gain > 1e-4;
+    let su7Unitary = su7Active ? su7Evaluation.unitary : null;
     if (su7Active) {
         const embedResult = embedToC7({
             surface,
@@ -860,31 +940,33 @@ export const renderRainbowFrame = (input) => {
             volume,
             width,
             height,
-            gauge: "rim"
+            gauge: 'rim',
         });
         if (embedResult.vectors.length === width * height) {
             su7Vectors = embedResult.vectors;
             su7Norms = embedResult.norms;
-            su7Unitary = buildScheduledUnitary(su7Params, su7Context ?? undefined);
+            su7Unitary = su7Evaluation.unitary;
         }
     }
     let su7DecimationStride = 1;
-    let su7DecimationMode = "hybrid";
+    let su7DecimationMode = 'hybrid';
     if (su7Active) {
         const rawParams = su7Params;
-        const strideCandidate = rawParams["decimationStride"];
-        if (typeof strideCandidate === "number" && Number.isFinite(strideCandidate) && strideCandidate >= 1) {
+        const strideCandidate = rawParams['decimationStride'];
+        if (typeof strideCandidate === 'number' &&
+            Number.isFinite(strideCandidate) &&
+            strideCandidate >= 1) {
             su7DecimationStride = Math.max(1, Math.floor(strideCandidate));
         }
         else {
             su7DecimationStride = 2;
         }
-        const modeCandidate = rawParams["decimationMode"];
-        if (modeCandidate === "stride" || modeCandidate === "edges" || modeCandidate === "hybrid") {
+        const modeCandidate = rawParams['decimationMode'];
+        if (modeCandidate === 'stride' || modeCandidate === 'edges' || modeCandidate === 'hybrid') {
             su7DecimationMode = modeCandidate;
         }
         else {
-            su7DecimationMode = "hybrid";
+            su7DecimationMode = 'hybrid';
         }
     }
     let su7NormDeltaSum = 0;
@@ -892,21 +974,23 @@ export const renderRainbowFrame = (input) => {
     let su7NormSampleCount = 0;
     let su7EnergySum = 0;
     let su7EnergySampleCount = 0;
+    let autoGainBeforeSum = 0;
+    let autoGainAfterSum = 0;
+    let autoGainTargetSum = 0;
+    let autoGainSamples = 0;
     const ke = clampKernelSpec(kEff(kernelSpec, dmt));
     const effectiveBlend = clamp01(blend + ke.transparency * 0.5);
     const eps = 1e-6;
-    const frameGain = normPin
-        ? Math.pow((normTarget + eps) / (lastObs + eps), 0.5)
-        : 1.0;
+    const frameGain = normPin ? Math.pow((normTarget + eps) / (lastObs + eps), 0.5) : 1.0;
     metrics.compositor.effectiveBlend = effectiveBlend;
     const baseOffsets = {
         L: beta2 * (lambdaRef / lambdas.L - 1),
         M: beta2 * (lambdaRef / lambdas.M - 1),
-        S: beta2 * (lambdaRef / lambdas.S - 1)
+        S: beta2 * (lambdaRef / lambdas.S - 1),
     };
     const jitterPhase = microsaccade ? timeSeconds * 6.0 : 0.0;
     const breath = alive ? 0.15 * Math.sin(2 * Math.PI * 0.55 * timeSeconds) : 0.0;
-    const ops = wallpaperGroup === "off" ? [] : groupOps(wallpaperGroup);
+    const ops = wallpaperGroup === 'off' ? [] : groupOps(wallpaperGroup);
     const opsCount = ops.length;
     const useWallpaper = surfEnabled || coupleSurfaceRim;
     const cx = width * 0.5;
@@ -926,13 +1010,13 @@ export const renderRainbowFrame = (input) => {
     const curvatureStrengthClamped = clamp(Math.abs(curvatureStrength), 0, 0.95);
     const curvatureActive = curvatureStrengthClamped > 1e-4;
     const atlas = curvatureActive
-        ? input.hyperbolicAtlas ??
+        ? (input.hyperbolicAtlas ??
             createHyperbolicAtlas({
                 width,
                 height,
                 curvatureStrength: curvatureStrengthClamped,
-                mode: curvatureMode
-            })
+                mode: curvatureMode,
+            }))
         : null;
     const atlasCoords = atlas?.coords ?? null;
     const atlasJacobians = atlas?.jacobians ?? null;
@@ -941,9 +1025,7 @@ export const renderRainbowFrame = (input) => {
     const atlasMetadata = atlas?.metadata ?? null;
     const atlasSampleScale = atlasMetadata?.maxRadius ?? 1;
     const maxHyperRadius = curvatureActive && atlasMetadata
-        ? 2 *
-            atlasMetadata.curvatureScale *
-            Math.atanh(Math.min(0.999999, atlasMetadata.diskLimit))
+        ? 2 * atlasMetadata.curvatureScale * Math.atanh(Math.min(0.999999, atlasMetadata.diskLimit))
         : maxRadius;
     if (curvatureActive && atlas && atlasCoords) {
         const sampleScalar = (buffer, sx, sy) => {
@@ -1002,7 +1084,9 @@ export const renderRainbowFrame = (input) => {
         const ampResampled = amp ? new Float32Array(amp.length) : null;
         const volumePhaseResampled = volumePhase ? new Float32Array(volumePhase.length) : null;
         const volumeDepthResampled = volumeDepth ? new Float32Array(volumeDepth.length) : null;
-        const volumeIntensityResampled = volumeIntensity ? new Float32Array(volumeIntensity.length) : null;
+        const volumeIntensityResampled = volumeIntensity
+            ? new Float32Array(volumeIntensity.length)
+            : null;
         for (let y = 0; y < height; y++) {
             for (let x = 0; x < width; x++) {
                 const idx = y * width + x;
@@ -1085,11 +1169,11 @@ export const renderRainbowFrame = (input) => {
         if (volumeIntensityResampled)
             volumeIntensity = volumeIntensityResampled;
         surfaceFieldActive = surface
-            ? { kind: "surface", resolution: surface.resolution, rgba: baseResampled }
+            ? { kind: 'surface', resolution: surface.resolution, rgba: baseResampled }
             : surfaceFieldActive;
     }
     const textureDiag = computeTextureDiagnostics(surfaceFieldActive ?? surface, {
-        orientations: orientationAngles
+        orientations: orientationAngles,
     });
     metrics.texture.earlyVision = {
         wallpapericity: textureDiag.wallpapericityMean,
@@ -1103,7 +1187,7 @@ export const renderRainbowFrame = (input) => {
         orientationMean: textureDiag.orientationMean,
         orientationStd: textureDiag.orientationStd,
         divisiveMean: textureDiag.divisiveMean,
-        divisiveStd: textureDiag.divisiveStd
+        divisiveStd: textureDiag.divisiveStd,
     };
     const crystalBeatWeight = Math.min(textureDiag.beatEnergyMean * CRYSTAL_BEAT_SCALE, 1);
     if (volumePhase && volumeDepth && volumeIntensity) {
@@ -1254,6 +1338,7 @@ export const renderRainbowFrame = (input) => {
     let surfaceSum = 0;
     let surfaceMax = 0;
     let surfaceCount = 0;
+    const hopfAccum = [];
     let debugEnergyMin = Number.POSITIVE_INFINITY;
     let debugEnergyMax = 0;
     let debugHueMin = Number.POSITIVE_INFINITY;
@@ -1274,9 +1359,7 @@ export const renderRainbowFrame = (input) => {
             const hyperTheta = curvatureActive && atlasPolar
                 ? atlasPolar[coordOffset + 1]
                 : Math.atan2(sampleDy, sampleDx);
-            const radiusNorm = maxHyperRadius > 1e-6
-                ? clamp(hyperRadius / maxHyperRadius, 0, 0.999999)
-                : sampleRadiusNorm;
+            const radiusNorm = maxHyperRadius > 1e-6 ? clamp(hyperRadius / maxHyperRadius, 0, 0.999999) : sampleRadiusNorm;
             const hyperFlowScale = curvatureActive && curvatureStrengthClamped > 1e-6
                 ? computeHyperbolicFlowScale(hyperRadius, curvatureStrengthClamped)
                 : 1;
@@ -1286,8 +1369,7 @@ export const renderRainbowFrame = (input) => {
             out[i + 1] = baseData[i + 1];
             out[i + 2] = baseData[i + 2];
             out[i + 3] = 255;
-            if (displayMode === "grayBaseColorRims" ||
-                displayMode === "grayBaseGrayRims") {
+            if (displayMode === 'grayBaseColorRims' || displayMode === 'grayBaseGrayRims') {
                 const yb = Math.floor(0.2126 * out[i + 0] + 0.7152 * out[i + 1] + 0.0722 * out[i + 2]);
                 out[i + 0] = yb;
                 out[i + 1] = yb;
@@ -1296,7 +1378,7 @@ export const renderRainbowFrame = (input) => {
             const baseColorSrgb = [
                 clamp01(baseData[i + 0] / 255),
                 clamp01(baseData[i + 1] / 255),
-                clamp01(baseData[i + 2] / 255)
+                clamp01(baseData[i + 2] / 255),
             ];
             const magVal = mag[p];
             let composerWeightRim = composerFields.rim.weight;
@@ -1308,17 +1390,35 @@ export const renderRainbowFrame = (input) => {
                 const baseVector = su7Vectors[p];
                 const baseNorm = su7Norms[p] ?? 0;
                 if (baseVector && baseNorm > 0) {
+                    let fluxOverlaySample;
+                    if (fluxOverlayActive) {
+                        const energyValue = fluxEnergyMap[p];
+                        if (energyValue > FLUX_EPSILON) {
+                            const dirIndex = p * 2;
+                            const dirX = fluxDirectionMap[dirIndex];
+                            const dirY = fluxDirectionMap[dirIndex + 1];
+                            const dirMag = Math.hypot(dirX, dirY);
+                            if (dirMag > FLUX_EPSILON) {
+                                fluxOverlaySample = {
+                                    energy: energyValue,
+                                    energyScale: fluxEnergyScale,
+                                    dirX,
+                                    dirY,
+                                };
+                            }
+                        }
+                    }
                     const strideEligible = su7DecimationStride <= 1 ||
-                        ((x % su7DecimationStride === 0) && (y % su7DecimationStride === 0));
+                        (x % su7DecimationStride === 0 && y % su7DecimationStride === 0);
                     const rimEligible = magVal >= edgeThreshold;
                     let shouldProject = false;
                     if (su7DecimationStride <= 1) {
                         shouldProject = true;
                     }
-                    else if (su7DecimationMode === "stride") {
+                    else if (su7DecimationMode === 'stride') {
                         shouldProject = strideEligible;
                     }
-                    else if (su7DecimationMode === "edges") {
+                    else if (su7DecimationMode === 'edges') {
                         shouldProject = rimEligible;
                     }
                     else {
@@ -1339,11 +1439,19 @@ export const renderRainbowFrame = (input) => {
                             projector: su7Projector,
                             gain: su7Params.gain,
                             frameGain,
-                            baseColor: baseColorSrgb
+                            baseColor: baseColorSrgb,
+                            fluxOverlay: fluxOverlaySample,
                         });
                         if (su7Projection) {
                             su7EnergySum += su7Projection.energy;
                             su7EnergySampleCount += 1;
+                            if (su7Projection.guardrailEvent) {
+                                const event = su7Projection.guardrailEvent;
+                                autoGainBeforeSum += event.before;
+                                autoGainAfterSum += event.after;
+                                autoGainTargetSum += event.target;
+                                autoGainSamples += event.sampleCount;
+                            }
                         }
                     }
                     if (su7Projection?.composerWeights) {
@@ -1361,6 +1469,45 @@ export const renderRainbowFrame = (input) => {
                             composerWeightVolume = clamp(composerWeightVolume * weights.volume, 0.05, 3);
                         }
                     }
+                    if (su7Projection?.hopf) {
+                        for (const lens of su7Projection.hopf) {
+                            let entry = hopfAccum[lens.index];
+                            if (!entry) {
+                                entry = {
+                                    axes: lens.axes,
+                                    label: lens.label,
+                                    baseX: 0,
+                                    baseY: 0,
+                                    baseZ: 0,
+                                    baseWeight: 0,
+                                    fiberCos: 0,
+                                    fiberSin: 0,
+                                    magnitudeSum: 0,
+                                    shareSum: 0,
+                                    baseMixSum: 0,
+                                    fiberMixSum: 0,
+                                    samples: 0,
+                                };
+                                hopfAccum[lens.index] = entry;
+                            }
+                            entry.axes = lens.axes;
+                            if (lens.label !== undefined) {
+                                entry.label = lens.label;
+                            }
+                            const weight = Math.max(lens.magnitude, 0);
+                            entry.baseX += lens.base[0] * weight;
+                            entry.baseY += lens.base[1] * weight;
+                            entry.baseZ += lens.base[2] * weight;
+                            entry.baseWeight += weight;
+                            entry.fiberCos += Math.cos(lens.fiber) * weight;
+                            entry.fiberSin += Math.sin(lens.fiber) * weight;
+                            entry.magnitudeSum += lens.magnitude;
+                            entry.shareSum += lens.share;
+                            entry.baseMixSum += lens.baseMix;
+                            entry.fiberMixSum += lens.fiberMix;
+                            entry.samples += 1;
+                        }
+                    }
                 }
             }
             let baseGradX = 0;
@@ -1372,7 +1519,9 @@ export const renderRainbowFrame = (input) => {
             let flowX = 0;
             let flowY = 0;
             let projectionStretch = 1;
-            const debugOrientationCap = surfaceDebug ? Math.min(surfaceDebug.orientationCount, orientationCount) : 0;
+            const debugOrientationCap = surfaceDebug
+                ? Math.min(surfaceDebug.orientationCount, orientationCount)
+                : 0;
             if (orientationCount > 0) {
                 const latticeFreq = 0.015 + 0.004 * orientationCount;
                 const timeShift = timeSeconds * 0.6 + dmt * 0.3;
@@ -1462,11 +1611,7 @@ export const renderRainbowFrame = (input) => {
                 composerEnergy.volume += gradSignal;
                 composerBlend.volume += gradSignal;
                 composerSamples.volume += 1;
-                const boost = 1 +
-                    couplingDmtScale *
-                        volumeDepthToWarp *
-                        gradSignal *
-                        composerWeightVolume;
+                const boost = 1 + couplingDmtScale * volumeDepthToWarp * gradSignal * composerWeightVolume;
                 flowX *= boost;
                 flowY *= boost;
             }
@@ -1508,9 +1653,9 @@ export const renderRainbowFrame = (input) => {
                 baseGradX *= hyperFlowScale;
                 baseGradY *= hyperFlowScale;
             }
-            let sharedGX = baseGradX + flowX;
-            let sharedGY = baseGradY + flowY;
-            let sharedMag = Math.hypot(sharedGX, sharedGY);
+            const sharedGX = baseGradX + flowX;
+            const sharedGY = baseGradY + flowY;
+            const sharedMag = Math.hypot(sharedGX, sharedGY);
             let parallaxTransparencyBoost = 1;
             const normDenom = Math.max(0.12 + 0.85 * ke.k0, 1e-3);
             const kNorm = sharedMag > 1e-6 ? Math.min(sharedMag / normDenom, 1) : 0;
@@ -1529,7 +1674,7 @@ export const renderRainbowFrame = (input) => {
                 surfaceDebug.flowVectors.x[p] = sharedGX;
                 surfaceDebug.flowVectors.y[p] = sharedGY;
                 if (surfaceDebug.flowVectors.hyperbolicScale) {
-                    const hyperDebugScale = curvatureActive && curvatureMode === "klein" && atlasJacobians
+                    const hyperDebugScale = curvatureActive && curvatureMode === 'klein' && atlasJacobians
                         ? hyperFlowScale * projectionStretch
                         : curvatureActive
                             ? hyperFlowScale
@@ -1558,7 +1703,7 @@ export const renderRainbowFrame = (input) => {
                 const ty = nx;
                 const TAU = Math.PI * 2;
                 const thetaRaw = Math.atan2(ny, nx);
-                const thetaEdge = thetaMode === "gradient"
+                const thetaEdge = thetaMode === 'gradient'
                     ? polBins > 0
                         ? Math.round((thetaRaw / TAU) * polBins) * (TAU / polBins)
                         : thetaRaw
@@ -1576,8 +1721,7 @@ export const renderRainbowFrame = (input) => {
                         const vy = mixScalar(ey, ky, mixW);
                         thetaUse = Math.atan2(vy, vx);
                         if (polBins > 0) {
-                            thetaUse =
-                                Math.round((thetaUse / TAU) * polBins) * (TAU / polBins);
+                            thetaUse = Math.round((thetaUse / TAU) * polBins) * (TAU / polBins);
                         }
                     }
                 }
@@ -1585,33 +1729,22 @@ export const renderRainbowFrame = (input) => {
                 const rho = ke.chirality * 0.75;
                 const thetaEff = thetaUse + rho * timeSeconds;
                 const polL = 0.5 * (1 + Math.cos(delta) * Math.cos(2 * thetaEff));
-                const polM = 0.5 *
-                    (1 + Math.cos(delta) * Math.cos(2 * (thetaEff + 0.3)));
-                const polS = 0.5 *
-                    (1 + Math.cos(delta) * Math.cos(2 * (thetaEff + 0.6)));
+                const polM = 0.5 * (1 + Math.cos(delta) * Math.cos(2 * (thetaEff + 0.3)));
+                const polS = 0.5 * (1 + Math.cos(delta) * Math.cos(2 * (thetaEff + 0.6)));
                 const rawJ = Math.sin(jitterPhase + hash2(posX, posY) * Math.PI * 2);
-                const localJ = jitter *
-                    (microsaccade ? (phasePin ? rawJ - muJ : rawJ) : 0);
+                const localJ = jitter * (microsaccade ? (phasePin ? rawJ - muJ : rawJ) : 0);
                 const warpNorm = Math.hypot(flowX, flowY);
                 let bias = 0;
                 if (surfaceToRimOffset > 1e-4 && warpNorm > 1e-6) {
                     const proj = (flowX * nx + flowY * ny) / (warpNorm + 1e-9);
                     const magnitude = responseSoft(warpNorm / (1.05 + 0.55 * ke.k0), surfaceToRimOffset);
                     const signed = clamp(proj, -1, 1) * magnitude;
-                    bias = clamp(0.65 *
-                        couplingDmtScale *
-                        surfaceToRimOffset *
-                        composerWeightSurface *
-                        signed, -0.9, 0.9);
+                    bias = clamp(0.65 * couplingDmtScale * surfaceToRimOffset * composerWeightSurface * signed, -0.9, 0.9);
                 }
                 let sigmaEff = sigma;
                 if (surfaceToRimSigma > 1e-4 && warpNorm > 1e-6) {
                     const sharpness = responsePow(warpNorm / (1.15 + 0.6 * ke.k0), surfaceToRimSigma);
-                    const drop = clamp01(0.75 *
-                        couplingDmtScale *
-                        surfaceToRimSigma *
-                        composerWeightSurface *
-                        sharpness);
+                    const drop = clamp01(0.75 * couplingDmtScale * surfaceToRimSigma * composerWeightSurface * sharpness);
                     const sigmaFloor = Math.min(sigma, sigmaFloorBase);
                     sigmaEff = clamp(sigma * (1 - drop), sigmaFloor, sigma);
                 }
@@ -1624,11 +1757,7 @@ export const renderRainbowFrame = (input) => {
                     const phaseNorm = clamp(phaseVal / Math.PI, -1, 1);
                     const phaseMag = applyComposerScalar(Math.abs(phaseNorm), composerFields.volume);
                     const signedPhase = phaseNorm < 0 ? -phaseMag : phaseMag;
-                    const volHue = clamp(couplingDmtScale *
-                        volumePhaseToHue *
-                        composerWeightVolume *
-                        signedPhase *
-                        0.6, -1.5, 1.5);
+                    const volHue = clamp(couplingDmtScale * volumePhaseToHue * composerWeightVolume * signedPhase * 0.6, -1.5, 1.5);
                     hueShift += volHue;
                     composerEnergy.volume += Math.abs(signedPhase);
                     composerBlend.volume += Math.abs(signedPhase);
@@ -1642,11 +1771,7 @@ export const renderRainbowFrame = (input) => {
                     const warpWeight = responsePow(warpNorm / (1.1 + 0.6 * ke.k0), surfaceToRimHue);
                     const hueSignal = applyComposerScalar(clamp01(hueAmplitude * warpWeight), composerFields.surface);
                     const signed = (deltaAngle === 0 ? 0 : Math.sign(deltaAngle)) * hueSignal;
-                    hueShift = clamp(couplingDmtScale *
-                        surfaceToRimHue *
-                        composerWeightSurface *
-                        signed *
-                        0.9, -1.4, 1.4);
+                    hueShift = clamp(couplingDmtScale * surfaceToRimHue * composerWeightSurface * signed * 0.9, -1.4, 1.4);
                 }
                 const pL = sampleScalar(mag, x + (offL + breath) * nx, y + (offL + breath) * ny, width, height);
                 const pM = sampleScalar(mag, x + (offM + breath) * nx, y + (offM + breath) * ny, width, height);
@@ -1679,14 +1804,13 @@ export const renderRainbowFrame = (input) => {
                 R = clamp01(R);
                 G = clamp01(G);
                 B = clamp01(B);
-                if (displayMode === "grayBaseGrayRims" ||
-                    displayMode === "colorBaseGrayRims") {
+                if (displayMode === 'grayBaseGrayRims' || displayMode === 'colorBaseGrayRims') {
                     const yr = luma01(R, G, B);
                     R = yr;
                     G = yr;
                     B = yr;
                 }
-                else if (displayMode === "colorBaseBlendedRims") {
+                else if (displayMode === 'colorBaseBlendedRims') {
                     const baseR = clamp01(baseData[i + 0] / 255);
                     const baseG = clamp01(baseData[i + 1] / 255);
                     const baseB = clamp01(baseData[i + 2] / 255);
@@ -1744,12 +1868,7 @@ export const renderRainbowFrame = (input) => {
                     const ampVal = amp ? clamp01(amp[p]) : cohVal;
                     let kurMeasure = 0.5 * (cohVal + ampVal);
                     kurMeasure = applyComposerScalar(kurMeasure, composerFields.kur);
-                    const boost = clamp(1 +
-                        couplingDmtScale *
-                            kurToTransparency *
-                            composerWeightKur *
-                            (kurMeasure - 0.5) *
-                            1.5, 0.1, 2.5);
+                    const boost = clamp(1 + couplingDmtScale * kurToTransparency * composerWeightKur * (kurMeasure - 0.5) * 1.5, 0.1, 2.5);
                     pixelBlend = clamp01(pixelBlend * boost);
                     composerEnergy.kur += kurMeasure;
                     composerBlend.kur += kurMeasure;
@@ -1778,7 +1897,7 @@ export const renderRainbowFrame = (input) => {
             }
             if (surfEnabled) {
                 let mask = 1.0;
-                if (surfaceRegion === "surfaces") {
+                if (surfaceRegion === 'surfaces') {
                     if (edgeThreshold <= 1e-6) {
                         mask = 1;
                     }
@@ -1786,7 +1905,7 @@ export const renderRainbowFrame = (input) => {
                         mask = clamp01((edgeThreshold - magVal) / edgeThreshold);
                     }
                 }
-                else if (surfaceRegion === "edges") {
+                else if (surfaceRegion === 'edges') {
                     mask = clamp01((magVal - edgeThreshold) / Math.max(1e-6, 1 - edgeThreshold));
                 }
                 if (mask > 1e-3) {
@@ -1800,10 +1919,7 @@ export const renderRainbowFrame = (input) => {
                         if (surfLen > 1e-6) {
                             const dot = (gxSurf * tx + gySurf * ty) / (surfLen + 1e-9);
                             const alignment = responsePow((dot + 1) * 0.5, rimToSurfaceAlign);
-                            const alignWeight = clamp01(rimToSurfaceAlign *
-                                couplingDmtScale *
-                                composerWeightSurface *
-                                alignment);
+                            const alignWeight = clamp01(rimToSurfaceAlign * couplingDmtScale * composerWeightSurface * alignment);
                             const targetX = tx * surfLen;
                             const targetY = ty * surfLen;
                             gxSurf = mixScalar(gxSurf, targetX, alignWeight);
@@ -1834,7 +1950,7 @@ export const renderRainbowFrame = (input) => {
                     rW *= amplitude;
                     gW *= amplitude;
                     bW *= amplitude;
-                    if (displayMode === "grayBaseGrayRims") {
+                    if (displayMode === 'grayBaseGrayRims') {
                         const yy = luma01(rW, gW, bW);
                         rW = yy;
                         gW = yy;
@@ -1848,11 +1964,7 @@ export const renderRainbowFrame = (input) => {
                     sb *= parallaxTransparencyBoost;
                     if (coupleRimSurface) {
                         const energy = responseSoft(rimEnergy / (0.75 + 0.25 * ke.gain), rimToSurfaceBlend);
-                        const rimBoost = clamp(1 +
-                            couplingDmtScale *
-                                rimToSurfaceBlend *
-                                composerWeightRim *
-                                energy, 0.2, 3);
+                        const rimBoost = clamp(1 + couplingDmtScale * rimToSurfaceBlend * composerWeightRim * energy, 0.2, 3);
                         sb *= rimBoost;
                     }
                     if (coupleKurTransparency && coh) {
@@ -1861,11 +1973,7 @@ export const renderRainbowFrame = (input) => {
                         let kurMeasure = 0.5 * (cohVal + ampVal);
                         kurMeasure = applyComposerScalar(kurMeasure, composerFields.kur);
                         const boost = clamp(1 +
-                            couplingDmtScale *
-                                kurToTransparency *
-                                composerWeightKur *
-                                (kurMeasure - 0.5) *
-                                1.5, 0.1, 3);
+                            couplingDmtScale * kurToTransparency * composerWeightKur * (kurMeasure - 0.5) * 1.5, 0.1, 3);
                         sb *= boost;
                         composerEnergy.kur += kurMeasure;
                         composerBlend.kur += kurMeasure;
@@ -1928,7 +2036,7 @@ export const renderRainbowFrame = (input) => {
         beatEnergy: crystalBeatStats.mean,
         beatStd: crystalBeatStats.std,
         resonanceRate: crystalResonanceRate,
-        sampleCount: crystalSamples
+        sampleCount: crystalSamples,
     };
     const earlyVisionTexture = metrics.texture.earlyVision;
     metrics.texture.wallpapericity =
@@ -1945,7 +2053,7 @@ export const renderRainbowFrame = (input) => {
         mean: rimStats.mean,
         std: rimStats.std,
         max: rimMax,
-        count: rimCount
+        count: rimCount,
     };
     const warpStats = finalizeStats(warpSum, warpSumSq, warpCount);
     const warpAngle = warpCount > 0 ? Math.atan2(warpSin, warpCos) : 0;
@@ -1953,8 +2061,35 @@ export const renderRainbowFrame = (input) => {
         mean: warpStats.mean,
         std: warpStats.std,
         dominantAngle: warpAngle,
-        count: warpCount
+        count: warpCount,
     };
+    const hopfSummary = [];
+    for (let index = 0; index < hopfAccum.length; index++) {
+        const entry = hopfAccum[index];
+        if (!entry || entry.samples === 0) {
+            continue;
+        }
+        const baseWeight = entry.baseWeight > 1e-9 ? entry.baseWeight : 1;
+        const baseVec = [
+            clamp(entry.baseX / baseWeight, -1, 1),
+            clamp(entry.baseY / baseWeight, -1, 1),
+            clamp(entry.baseZ / baseWeight, -1, 1),
+        ];
+        const fiberAngle = entry.baseWeight > 0 ? Math.atan2(entry.fiberSin, entry.fiberCos) : 0;
+        hopfSummary.push({
+            index,
+            axes: entry.axes,
+            label: entry.label,
+            base: baseVec,
+            fiber: fiberAngle,
+            magnitude: entry.samples > 0 ? entry.magnitudeSum / entry.samples : 0,
+            share: entry.samples > 0 ? entry.shareSum / entry.samples : 0,
+            baseMix: entry.samples > 0 ? entry.baseMixSum / entry.samples : 0,
+            fiberMix: entry.samples > 0 ? entry.fiberMixSum / entry.samples : 0,
+            samples: entry.samples,
+        });
+    }
+    metrics.hopf.lenses = hopfSummary;
     const parallaxStats = finalizeStats(parallaxKSum, parallaxKSumSq, parallaxSamples);
     let radialSlope = 0;
     if (parallaxSamples > 1) {
@@ -1972,24 +2107,21 @@ export const renderRainbowFrame = (input) => {
         kMean: parallaxStats.mean,
         kStd: parallaxStats.std,
         tagConsistency,
-        sampleCount: parallaxSamples
+        sampleCount: parallaxSamples,
     };
-    const motionOrientation = computeMotionEnergyFromBranches(orientationBranches, "orientation");
-    const motionWallpaper = computeMotionEnergyFromBranches(wallpaperBranches, "wallpaper");
+    const motionOrientation = computeMotionEnergyFromBranches(orientationBranches, 'orientation');
+    const motionWallpaper = computeMotionEnergyFromBranches(wallpaperBranches, 'wallpaper');
     if (attentionHooks) {
-        const orientationSummary = finalizeBranchAttentionSummary(orientationBranches, "orientation");
+        const orientationSummary = finalizeBranchAttentionSummary(orientationBranches, 'orientation');
         if (orientationSummary) {
             attentionHooks.onOrientation?.(orientationSummary);
         }
-        const wallpaperSummary = finalizeBranchAttentionSummary(wallpaperBranches, "wallpaper");
+        const wallpaperSummary = finalizeBranchAttentionSummary(wallpaperBranches, 'wallpaper');
         if (wallpaperSummary) {
             attentionHooks.onWallpaper?.(wallpaperSummary);
         }
     }
-    metrics.motionEnergy =
-        motionOrientation ??
-            motionWallpaper ??
-            metrics.motionEnergy;
+    metrics.motionEnergy = motionOrientation ?? motionWallpaper ?? metrics.motionEnergy;
     metrics.compositor.surfaceMean = surfaceCount ? surfaceSum / surfaceCount : 0;
     metrics.compositor.surfaceMax = surfaceMax;
     metrics.compositor.surfaceCount = surfaceCount;
@@ -2019,35 +2151,23 @@ export const renderRainbowFrame = (input) => {
         metrics.volume.intensityStd = 0;
         metrics.volume.sampleCount = 0;
     }
-    const totalComposerEnergy = composerEnergy.surface +
-        composerEnergy.rim +
-        composerEnergy.kur +
-        composerEnergy.volume;
+    const totalComposerEnergy = composerEnergy.surface + composerEnergy.rim + composerEnergy.kur + composerEnergy.volume;
     const composerFieldMetrics = metrics.composer.fields;
     COMPOSER_FIELD_LIST.forEach((field) => {
         const samples = composerSamples[field];
         const energyTotal = composerEnergy[field];
-        composerFieldMetrics[field].energy =
-            samples > 0 ? energyTotal / samples : 0;
-        composerFieldMetrics[field].blend =
-            samples > 0 ? composerBlend[field] / samples : 0;
+        composerFieldMetrics[field].energy = samples > 0 ? energyTotal / samples : 0;
+        composerFieldMetrics[field].blend = samples > 0 ? composerBlend[field] / samples : 0;
         composerFieldMetrics[field].share =
             totalComposerEnergy > 1e-6 ? energyTotal / totalComposerEnergy : 0;
     });
     metrics.compositor.effectiveBlend = clamp01(effectiveBlend * rimComposerGain * composerFields.rim.weight);
     if (su7Active && su7Unitary && su7Vectors && su7Norms) {
         metrics.su7.normDeltaMean =
-            su7NormSampleCount > 0
-                ? su7NormDeltaSum / su7NormSampleCount
-                : su7Telemetry.normDeltaMean;
-        metrics.su7.normDeltaMax =
-            su7NormSampleCount > 0
-                ? su7NormDeltaMax
-                : su7Telemetry.normDeltaMax;
+            su7NormSampleCount > 0 ? su7NormDeltaSum / su7NormSampleCount : su7Telemetry.normDeltaMean;
+        metrics.su7.normDeltaMax = su7NormSampleCount > 0 ? su7NormDeltaMax : su7Telemetry.normDeltaMax;
         metrics.su7.projectorEnergy =
-            su7EnergySampleCount > 0
-                ? su7EnergySum / su7EnergySampleCount
-                : su7Telemetry.projectorEnergy;
+            su7EnergySampleCount > 0 ? su7EnergySum / su7EnergySampleCount : su7Telemetry.projectorEnergy;
     }
     else {
         metrics.su7.unitaryError = 0;
@@ -2055,6 +2175,15 @@ export const renderRainbowFrame = (input) => {
         metrics.su7.normDeltaMean = 0;
         metrics.su7.normDeltaMax = 0;
         metrics.su7.projectorEnergy = 0;
+    }
+    if (guardrailOpts.emitGuardrailEvents !== false && autoGainSamples > 0) {
+        guardrailEventAccumulator.push({
+            kind: 'autoGain',
+            before: autoGainBeforeSum / autoGainSamples,
+            after: autoGainAfterSum / autoGainSamples,
+            target: autoGainTargetSum / autoGainSamples,
+            sampleCount: autoGainSamples,
+        });
     }
     const obs = obsCount > 0 ? clamp(obsSum / obsCount, 0.001, 10) : clamp(lastObs, 0.001, 10);
     let debugResult;
@@ -2069,15 +2198,22 @@ export const renderRainbowFrame = (input) => {
                 energyMin,
                 energyMax,
                 hueMin,
-                hueMax
+                hueMax,
             };
         }
         if (surfaceDebug) {
             debugResult.surface = {
                 magnitudeMax: debugMagnitudeMax,
-                orientationCount: surfaceDebug.orientationCount
+                orientationCount: surfaceDebug.orientationCount,
             };
         }
     }
-    return { metrics, obsAverage: obs, debug: debugResult };
+    return {
+        metrics,
+        obsAverage: obs,
+        debug: debugResult,
+        guardrails: guardrailOpts.emitGuardrailEvents === false
+            ? undefined
+            : { events: guardrailEventAccumulator },
+    };
 };

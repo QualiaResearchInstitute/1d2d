@@ -1,15 +1,24 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
     "outDir": "build/tests",
     "allowJs": false,
     "noEmit": false,
     "rootDir": ".",
     "strict": false,
-    "noImplicitAny": false
+    "noImplicitAny": false,
+    "jsx": "react-jsx"
   },
-  "include": ["src/fields/**/*.ts", "src/validation/**/*.ts", "tests/**/*.ts", "tests/**/*.d.ts"],
+  "include": [
+    "src/fields/**/*.ts",
+    "src/validation/**/*.ts",
+    "src/timeline/**/*.ts",
+    "tests/**/*.ts",
+    "scripts/videoPipeline.ts",
+    "scripts/videoUtils.ts",
+    "tests/**/*.tsx",
+    "tests/**/*.d.ts",
+    "types/**/*.d.ts"
+  ],
   "exclude": []
 }

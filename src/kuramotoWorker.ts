@@ -32,6 +32,7 @@ type TickMessage = {
   dt: number;
   timestamp: number;
   frameId: number;
+  seed?: number;
 };
 
 type UpdateParamsMessage = {
@@ -144,6 +145,9 @@ const handleTick = (msg: TickMessage) => {
       message: '[kur-worker] dropping frame: buffer pool empty',
     });
     return;
+  }
+  if (msg.seed != null) {
+    ensureRand(msg.seed);
   }
   const activeKernel = kernelSpec ?? KERNEL_SPEC_DEFAULT;
   stepKuramotoState(state, params, msg.dt, randn, msg.timestamp, {

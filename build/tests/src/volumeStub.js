@@ -1,4 +1,4 @@
-import { makeResolution } from "./fields/contracts.js";
+import { makeResolution } from './fields/contracts.js';
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const wrapPi = (theta) => {
     const twoPi = Math.PI * 2;
@@ -33,7 +33,7 @@ export const createVolumeStubState = (width, height, seed = 2024) => {
         intensity: new Float32Array(total),
         basePhase,
         baseDepth,
-        baseIntensity
+        baseIntensity,
     };
     stepVolumeStub(state, 0);
     return state;
@@ -62,11 +62,11 @@ export const stepVolumeStub = (state, dt) => {
         return;
 };
 export const snapshotVolumeStub = (state) => ({
-    kind: "volume",
+    kind: 'volume',
     resolution: makeResolution(state.width, state.height),
     phase: state.phase,
     depth: state.depth,
-    intensity: state.intensity
+    intensity: state.intensity,
 });
 export const ingestVolumeRecording = (recording) => {
     const { width, height, phase, depth, intensity } = recording;
@@ -75,10 +75,10 @@ export const ingestVolumeRecording = (recording) => {
         throw new Error(`[volumeStub] recording length mismatch (phase=${phase.length}, depth=${depth.length}, intensity=${intensity.length}, expected=${total})`);
     }
     return {
-        kind: "volume",
+        kind: 'volume',
         resolution: makeResolution(width, height),
         phase: Float32Array.from(phase),
         depth: Float32Array.from(depth),
-        intensity: Float32Array.from(intensity)
+        intensity: Float32Array.from(intensity),
     };
 };

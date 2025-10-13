@@ -1,6 +1,6 @@
-import { clampKernelSpec, cloneKernelSpec, getDefaultKernelSpec } from "./kernelSpec.js";
+import { clampKernelSpec, cloneKernelSpec, getDefaultKernelSpec, } from './kernelSpec.js';
 const now = () => {
-    if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
         return performance.now();
     }
     return Date.now();
@@ -11,7 +11,7 @@ const computeChangedKeys = (prev, next) => {
     Object.keys(prev).forEach((key) => {
         const prevValue = prev[key];
         const nextValue = next[key];
-        if (typeof prevValue === "number" && typeof nextValue === "number") {
+        if (typeof prevValue === 'number' && typeof nextValue === 'number') {
             if (Math.abs(prevValue - nextValue) > EPS) {
                 keys.push(key);
             }
@@ -28,10 +28,10 @@ const cloneEvent = (event) => ({
     version: event.version,
     timestamp: event.timestamp,
     source: event.source,
-    changed: [...event.changed]
+    changed: [...event.changed],
 });
 export class KernelSpecHub {
-    constructor(initial, source = "init") {
+    constructor(initial, source = 'init') {
         Object.defineProperty(this, "snapshot", {
             enumerable: true,
             configurable: true,
@@ -68,7 +68,7 @@ export class KernelSpecHub {
             version: 0,
             timestamp: now(),
             source,
-            changed: ["gain", "k0", "Q", "anisotropy", "chirality", "transparency", "couplingPreset"]
+            changed: ['gain', 'k0', 'Q', 'anisotropy', 'chirality', 'transparency', 'couplingPreset'],
         };
         this.subscribers = new Set();
         this.pendingEvent = null;
@@ -95,8 +95,8 @@ export class KernelSpecHub {
             spec: merged,
             version: this.snapshot.version + 1,
             timestamp: now(),
-            source: options?.source ?? "unspecified",
-            changed
+            source: options?.source ?? 'unspecified',
+            changed,
         };
         this.snapshot = event;
         this.enqueueBroadcast(event);
@@ -129,7 +129,7 @@ export class KernelSpecHub {
             subscriberCount: this.subscribers.size,
             lastVersion: this.snapshot.version,
             lastSource: this.snapshot.source,
-            lastDispatchLatency: this.lastDispatchLatency
+            lastDispatchLatency: this.lastDispatchLatency,
         };
     }
     getSubscriberCount() {

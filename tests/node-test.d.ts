@@ -16,6 +16,25 @@ declare module 'node:path' {
   export const join: (...args: any[]) => string;
 }
 
+declare module 'jsdom' {
+  export class JSDOM {
+    constructor(html?: string, options?: any);
+    window: Window & typeof globalThis;
+  }
+}
+
+declare module 'axe-core' {
+  const axe: {
+    run: (
+      context?: Element | Document,
+      options?: unknown,
+    ) => Promise<{
+      violations: Array<{ id: string; nodes: Array<unknown> }>;
+    }>;
+  };
+  export default axe;
+}
+
 declare const process: {
   cwd(): string;
 };

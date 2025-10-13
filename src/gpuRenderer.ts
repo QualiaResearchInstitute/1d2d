@@ -10,6 +10,7 @@ import {
 } from './fields/contracts';
 import type { CouplingConfig, CurvatureMode } from './pipeline/rainbowFrame';
 import type { HyperbolicAtlasGpuPackage } from './hyperbolic/atlas.js';
+import { FLOATS_PER_MATRIX } from './qcd/lattice.js';
 
 const VERTEX_SRC = `#version 300 es
 precision highp float;
@@ -135,6 +136,10 @@ uniform int uSu7TileRows;
 uniform int uSu7TileSize;
 uniform int uSu7UnitaryTexWidth;
 uniform int uSu7UnitaryTexRowsPerTile;
+uniform int uSu7Pretransformed;
+uniform int uSu7HopfLensCount;
+uniform ivec2 uSu7HopfLensAxes[3];
+uniform vec2 uSu7HopfLensMix[3];
 
 #define COMPOSER_FIELD_SURFACE 0
 #define COMPOSER_FIELD_RIM 1
@@ -148,6 +153,8 @@ uniform int uSu7UnitaryTexRowsPerTile;
 #define SU7_PROJECTOR_OVERLAY_SPLIT 2
 #define SU7_PROJECTOR_DIRECT_RGB 3
 #define SU7_PROJECTOR_MATRIX 4
+#define SU7_PROJECTOR_HOPF_LENS 5
+#define SU7_OVERLAY_MAX 6
 
 const float TAU = 6.283185307179586;
 
@@ -566,8 +573,8 @@ void main() {
   vec3 baseSrgbOriginal = baseRgb;
   vec3 su7ProjectedRgb = vec3(0.0);
   float su7ProjectedMix = 0.0;
-  vec3 su7OverlayRgb[4];
-  float su7OverlayMix[4];
+  vec3 su7OverlayRgb[SU7_OVERLAY_MAX];
+  float su7OverlayMix[SU7_OVERLAY_MAX];
   int su7OverlayCount = 0;
 
   if (
@@ -598,16 +605,21 @@ void main() {
       shouldProject = strideEligible || rimEligible;
     }
     if (shouldProject && su7Norm > 1e-6 && effectiveGain > 1e-6) {
-      vec2 su7Vec[7];
-      su7Vec[0] = su7Tex0.xy;
-      su7Vec[1] = su7Tex0.zw;
-      su7Vec[2] = su7Tex1.xy;
-      su7Vec[3] = su7Tex1.zw;
-      su7Vec[4] = su7Tex2.xy;
-      su7Vec[5] = su7Tex2.zw;
-      su7Vec[6] = su7Tex3.xy;
+    vec2 su7Vec[7];
+    su7Vec[0] = su7Tex0.xy;
+    su7Vec[1] = su7Tex0.zw;
+    su7Vec[2] = su7Tex1.xy;
+    su7Vec[3] = su7Tex1.zw;
+    su7Vec[4] = su7Tex2.xy;
+    su7Vec[5] = su7Tex2.zw;
+    su7Vec[6] = su7Tex3.xy;
+    vec2 su7Transformed[7];
+    if (uSu7Pretransformed == 1) {
+      for (int row = 0; row < 7; ++row) {
+        su7Transformed[row] = su7Vec[row];
+      }
+    } else {
       int tileIndex = computeSu7TileIndex(pixelCoord);
-      vec2 su7Transformed[7];
       for (int row = 0; row < 7; ++row) {
         vec2 sum = vec2(0.0);
         for (int col = 0; col < 7; ++col) {
@@ -616,6 +628,7 @@ void main() {
         }
         su7Transformed[row] = sum;
       }
+    }
       float scale = su7Norm * effectiveGain;
       float toneScale = scale * (uSu7ProjectorWeight > 0.0 ? uSu7ProjectorWeight : 1.0);
       float magnitude0 = complexAbs(su7Transformed[0]);
@@ -698,22 +711,83 @@ void main() {
           su7OverlayCount++;
         }
         float surfaceMix = clamp(shareNorm.y * mixAmount, 0.0, 1.0);
-        if (surfaceMix > 1e-6 && su7OverlayCount < 4) {
+        if (surfaceMix > 1e-6 && su7OverlayCount < SU7_OVERLAY_MAX) {
           su7OverlayRgb[su7OverlayCount] = su7TintColor(shareNorm.y, vec3(0.95, 0.72, 0.33));
           su7OverlayMix[su7OverlayCount] = surfaceMix;
           su7OverlayCount++;
         }
         float kurMix = clamp(shareNorm.z * mixAmount, 0.0, 1.0);
-        if (kurMix > 1e-6 && su7OverlayCount < 4) {
+        if (kurMix > 1e-6 && su7OverlayCount < SU7_OVERLAY_MAX) {
           su7OverlayRgb[su7OverlayCount] = su7TintColor(shareNorm.z, vec3(0.28, 0.78, 1.0));
           su7OverlayMix[su7OverlayCount] = kurMix;
           su7OverlayCount++;
         }
         float volumeMix = clamp(shareNorm.w * mixAmount, 0.0, 1.0);
-        if (volumeMix > 1e-6 && su7OverlayCount < 4) {
+        if (volumeMix > 1e-6 && su7OverlayCount < SU7_OVERLAY_MAX) {
           su7OverlayRgb[su7OverlayCount] = su7TintColor(shareNorm.w, vec3(0.42, 0.9, 0.56));
           su7OverlayMix[su7OverlayCount] = volumeMix;
           su7OverlayCount++;
+        }
+      } else if (uSu7ProjectorMode == SU7_PROJECTOR_HOPF_LENS) {
+        su7OverlayCount = 0;
+        int lensCount = clamp(uSu7HopfLensCount, 0, 3);
+        for (int lensIdx = 0; lensIdx < 3; ++lensIdx) {
+          if (lensIdx >= lensCount) {
+            break;
+          }
+          if (su7OverlayCount >= SU7_OVERLAY_MAX) {
+            break;
+          }
+          ivec2 axes = uSu7HopfLensAxes[lensIdx];
+          int axisA = clamp(axes.x, 0, 6);
+          int axisB = clamp(axes.y, 0, 6);
+          if (axisA == axisB) {
+            axisB = (axisA + 1) % 7;
+          }
+          vec2 compA = su7Transformed[axisA];
+          vec2 compB = su7Transformed[axisB];
+          float magA = length(compA);
+          float magB = length(compB);
+          float pairMag = sqrt(magA * magA + magB * magB);
+          if (pairMag <= 1e-6) {
+            continue;
+          }
+          float share = clamp(pairMag / max(su7Norm, 1e-6), 0.0, 1.0);
+          float baseMix = clamp(uSu7HopfLensMix[lensIdx].x * share * mixAmount, 0.0, 1.0);
+          float fiberMix = clamp(uSu7HopfLensMix[lensIdx].y * share * mixAmount, 0.0, 1.0);
+          if (baseMix <= 1e-6 && fiberMix <= 1e-6) {
+            continue;
+          }
+          vec2 nA = compA / pairMag;
+          vec2 nB = compB / pairMag;
+          vec2 conjB = vec2(nB.x, -nB.y);
+          vec2 prod = complexMul(nA, conjB);
+          float baseX = clamp(prod.x * 2.0, -1.0, 1.0);
+          float baseY = clamp(prod.y * 2.0, -1.0, 1.0);
+          float nzA = clamp(length(nA), 0.0, 1.0);
+          float nzB = clamp(length(nB), 0.0, 1.0);
+          float baseZ = clamp(nzA * nzA - nzB * nzB, -1.0, 1.0);
+          if (baseMix > 1e-6 && su7OverlayCount < SU7_OVERLAY_MAX) {
+            vec3 baseColor = clamp(vec3(0.5) + 0.5 * vec3(baseX, baseY, baseZ), vec3(0.0), vec3(1.0));
+            su7OverlayRgb[su7OverlayCount] = baseColor;
+            su7OverlayMix[su7OverlayCount] = baseMix;
+            su7OverlayCount++;
+          }
+          if (fiberMix > 1e-6 && su7OverlayCount < SU7_OVERLAY_MAX) {
+            float fiberAngle = 0.5 * (atan(nA.y, nA.x) + atan(nB.y, nB.x));
+            fiberAngle = mod(fiberAngle + 3.141592653589793, TAU) - 3.141592653589793;
+            float cosA = cos(fiberAngle);
+            float cosB = cos(fiberAngle - 2.094395102f);
+            float cosC = cos(fiberAngle + 2.094395102f);
+            vec3 fiberColor = vec3(
+              clamp01(0.5 + 0.5 * cosA),
+              clamp01(0.5 + 0.5 * cosB),
+              clamp01(0.5 + 0.5 * cosC)
+            );
+            su7OverlayRgb[su7OverlayCount] = fiberColor;
+            su7OverlayMix[su7OverlayCount] = fiberMix;
+            su7OverlayCount++;
+          }
         }
       } else {
         su7OverlayCount = 0;
@@ -1152,7 +1226,7 @@ void main() {
   if (su7ProjectedMix > 1e-6) {
     resultRgb = clamp(mix(resultRgb, su7ProjectedRgb, su7ProjectedMix), vec3(0.0), vec3(1.0));
   }
-  for (int overlayIdx = 0; overlayIdx < 4; ++overlayIdx) {
+  for (int overlayIdx = 0; overlayIdx < SU7_OVERLAY_MAX; ++overlayIdx) {
     if (overlayIdx >= su7OverlayCount) {
       break;
     }
@@ -1227,7 +1301,14 @@ export type Su7ProjectorMode =
   | 'composerWeights'
   | 'overlaySplit'
   | 'directRgb'
-  | 'matrix';
+  | 'matrix'
+  | 'hopfLens';
+
+export type Su7HopfLensUniform = {
+  axes: [number, number];
+  baseMix: number;
+  fiberMix: number;
+};
 
 export type Su7Uniforms = {
   enabled: boolean;
@@ -1237,6 +1318,8 @@ export type Su7Uniforms = {
   projectorMode: Su7ProjectorMode;
   projectorWeight: number;
   projectorMatrix?: Float32Array | null;
+  pretransformed: boolean;
+  hopfLenses?: Su7HopfLensUniform[] | null;
 };
 
 export type Su7TexturePayload = {
@@ -1249,6 +1332,7 @@ export type Su7TexturePayload = {
   tileSize: number;
   tileTexWidth: number;
   tileTexRowsPerTile: number;
+  pretransformed?: boolean;
 };
 
 export type RenderUniforms = {
@@ -1301,6 +1385,166 @@ export type RenderInputs = {
 
 export type RenderOptions = RenderUniforms & RenderInputs;
 
+const QCD_WORKGROUP_SIZE_X = 8;
+const QCD_WORKGROUP_SIZE_Y = 8;
+const QCD_SEED_ALIGNMENT_BYTES = 256;
+const UINT32_BYTES = Uint32Array.BYTES_PER_ELEMENT;
+const QCD_SEED_BYTES_PER_TEXEL = 4 * UINT32_BYTES;
+const QCD_COMPLEX_STRIDE = 2;
+const QCD_ROW_STRIDE = 6;
+const QCD_UNIFORM_SIZE_BYTES = 64;
+
+type QcdSeedTexturePayload = {
+  data: Uint32Array;
+  bytesPerRow: number;
+  signature: string;
+  keyLo: number;
+  keyHi: number;
+};
+
+export type QcdGpuSweepOptions = {
+  lattice: Float32Array;
+  width: number;
+  height: number;
+  siteStride: number;
+  linkStride: number;
+  rowStride: number;
+  complexStride: number;
+  beta: number;
+  parity: 0 | 1;
+  axis: 'x' | 'y';
+  sweepIndex: number;
+  overRelaxationSteps: number;
+  seed?: number;
+  scope?: string | number;
+};
+
+const toUint32 = (value: number): number => Math.trunc(value) >>> 0;
+
+const hash32 = (value: number): number => {
+  let x = toUint32(value);
+  x ^= x >>> 16;
+  x = Math.imul(x, 0x7feb352d);
+  x ^= x >>> 15;
+  x = Math.imul(x, 0x846ca68b);
+  x ^= x >>> 16;
+  return x >>> 0;
+};
+
+const hashScope = (scope: string | number | undefined): number => {
+  if (typeof scope === 'number') {
+    return hash32(scope);
+  }
+  if (typeof scope !== 'string' || scope.length === 0) {
+    return 0;
+  }
+  let hash = 0;
+  for (let idx = 0; idx < scope.length; idx += 1) {
+    hash = (hash << 5) - hash + scope.charCodeAt(idx);
+    hash |= 0;
+  }
+  return hash32(hash);
+};
+
+const alignTo = (value: number, alignment: number): number =>
+  Math.ceil(value / alignment) * alignment;
+
+const createQcdSeedTexturePayload = (
+  width: number,
+  height: number,
+  seed: number,
+  scopeHash: number,
+): QcdSeedTexturePayload => {
+  const bytesPerRowRaw = width * QCD_SEED_BYTES_PER_TEXEL;
+  const bytesPerRow = alignTo(bytesPerRowRaw, QCD_SEED_ALIGNMENT_BYTES);
+  const uint32PerRow = bytesPerRow / UINT32_BYTES;
+  const data = new Uint32Array(uint32PerRow * height);
+  const signature = `${width}x${height}:${toUint32(seed)}:${scopeHash >>> 0}`;
+  const baseSeed = hash32(seed ^ scopeHash ^ 0x51ed2705);
+  const keyLo = hash32(baseSeed ^ 0x9e3779b9);
+  const keyHi = hash32(baseSeed ^ 0x632beb5);
+  for (let y = 0; y < height; y += 1) {
+    const rowOffset = y * uint32PerRow;
+    for (let x = 0; x < width; x += 1) {
+      const base = rowOffset + x * 4;
+      const siteIndex = y * width + x;
+      let value = hash32(seed ^ scopeHash ^ siteIndex);
+      data[base] = value;
+      value = hash32(value ^ 0x9e3779b9);
+      data[base + 1] = value;
+      value = hash32(value ^ 0x632beb5);
+      data[base + 2] = value;
+      value = hash32(value ^ 0xa511e9b5);
+      data[base + 3] = value;
+    }
+  }
+  return { data, bytesPerRow, signature, keyLo, keyHi };
+};
+
+let cachedQcdKernelWgsl: string | null = null;
+
+const loadQcdKernelWgsl = async (): Promise<string> => {
+  if (cachedQcdKernelWgsl) {
+    return cachedQcdKernelWgsl;
+  }
+  const maybeGlobal = globalThis as { process?: unknown };
+  const nodeProcess = maybeGlobal?.process as { versions?: Record<string, unknown> } | undefined;
+  const isNode =
+    typeof nodeProcess === 'object' &&
+    nodeProcess != null &&
+    typeof nodeProcess.versions === 'object';
+  if (isNode) {
+    const [{ readFile }, { fileURLToPath }, { dirname, resolve }] = await Promise.all([
+      import('node:fs/promises'),
+      import('node:url'),
+      import('node:path'),
+    ]);
+    const baseDir = dirname(fileURLToPath(import.meta.url));
+    const filePath = resolve(baseDir, 'qcd/gpuKernel.wgsl');
+    cachedQcdKernelWgsl = await readFile(filePath, 'utf8');
+    return cachedQcdKernelWgsl;
+  }
+  const module = await import('./qcd/gpuKernel.wgsl?raw');
+  cachedQcdKernelWgsl = (module as { default: string }).default;
+  return cachedQcdKernelWgsl;
+};
+
+const GPU_BUFFER_USAGE = (globalThis as { GPUBufferUsage?: Record<string, number> })
+  .GPUBufferUsage ?? {
+  MAP_READ: 0x0001,
+  MAP_WRITE: 0x0002,
+  COPY_SRC: 0x0004,
+  COPY_DST: 0x0008,
+  UNIFORM: 0x0040,
+  STORAGE: 0x0080,
+};
+
+const GPU_TEXTURE_USAGE = (globalThis as { GPUTextureUsage?: Record<string, number> })
+  .GPUTextureUsage ?? {
+  COPY_DST: 0x0002,
+  TEXTURE_BINDING: 0x0004,
+};
+
+const GPU_MAP_MODE = (globalThis as { GPUMapMode?: Record<string, number> }).GPUMapMode ?? {
+  READ: 0x0001,
+};
+
+type QcdGpuContext = {
+  device: any;
+  pipeline: any;
+  bindGroupLayout: any;
+  uniformBuffer: any;
+  uniformArray: ArrayBuffer;
+  uniformU32: Uint32Array;
+  uniformF32: Float32Array;
+  latticeBuffer: any | null;
+  latticeCapacityFloats: number;
+  seedTexture: any | null;
+  seedTextureView: any | null;
+  seedSignature: string | null;
+  seedKey: { lo: number; hi: number } | null;
+};
+
 export type GpuRenderer = {
   resize(width: number, height: number): void;
   uploadBase(image: ImageData): void;
@@ -1313,6 +1557,7 @@ export type GpuRenderer = {
   render(options: RenderOptions): void;
   readPixels(target: Uint8Array): void;
   dispose(): void;
+  runQcdHeatbathSweep?(options: QcdGpuSweepOptions): Promise<boolean>;
 };
 
 type TextureInfo = {
@@ -1345,6 +1590,8 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
 
   const uniforms = locateUniforms(gl, program);
   const zeroSu7ProjectorMatrix = new Float32Array(21);
+  const hopfAxesScratch = new Int32Array(6);
+  const hopfMixScratch = new Float32Array(6);
   let hyperbolicAtlasPackage: HyperbolicAtlasGpuPackage | null = null;
 
   const baseTex = createTexture(gl, {
@@ -1484,7 +1731,136 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     tileSize: number;
     tileTexWidth: number;
     tileTexRowsPerTile: number;
+    pretransformed: boolean;
   } | null = null;
+
+  let qcdContext: QcdGpuContext | null = null;
+  let qcdContextPromise: Promise<QcdGpuContext | null> | null = null;
+
+  const ensureQcdContext = async (): Promise<QcdGpuContext | null> => {
+    if (qcdContext) {
+      return qcdContext;
+    }
+    if (qcdContextPromise) {
+      qcdContext = await qcdContextPromise;
+      return qcdContext;
+    }
+    if (typeof navigator === 'undefined' || !(navigator as { gpu?: unknown }).gpu) {
+      qcdContextPromise = Promise.resolve(null);
+      return null;
+    }
+    qcdContextPromise = (async () => {
+      try {
+        const gpuNavigator = navigator as { gpu: any };
+        const adapter = await gpuNavigator.gpu.requestAdapter?.();
+        if (!adapter) {
+          return null;
+        }
+        const device = await adapter.requestDevice?.();
+        if (!device) {
+          return null;
+        }
+        const code = await loadQcdKernelWgsl();
+        const module = device.createShaderModule({
+          label: 'qcd-gpu-kernel',
+          code,
+        });
+        const pipeline =
+          device.createComputePipelineAsync != null
+            ? await device.createComputePipelineAsync({
+                layout: 'auto',
+                label: 'qcd-gpu-kernel',
+                compute: {
+                  module,
+                  entryPoint: 'main',
+                },
+              })
+            : device.createComputePipeline({
+                layout: 'auto',
+                label: 'qcd-gpu-kernel',
+                compute: {
+                  module,
+                  entryPoint: 'main',
+                },
+              });
+        const bindGroupLayout = pipeline.getBindGroupLayout(0);
+        const uniformBuffer = device.createBuffer({
+          size: QCD_UNIFORM_SIZE_BYTES,
+          usage: GPU_BUFFER_USAGE.UNIFORM | GPU_BUFFER_USAGE.COPY_DST,
+          label: 'qcd-uniform-buffer',
+        });
+        const uniformArray = new ArrayBuffer(QCD_UNIFORM_SIZE_BYTES);
+        const uniformU32 = new Uint32Array(uniformArray);
+        const uniformF32 = new Float32Array(uniformArray);
+        return {
+          device,
+          pipeline,
+          bindGroupLayout,
+          uniformBuffer,
+          uniformArray,
+          uniformU32,
+          uniformF32,
+          latticeBuffer: null,
+          latticeCapacityFloats: 0,
+          seedTexture: null,
+          seedTextureView: null,
+          seedSignature: null,
+          seedKey: null,
+        };
+      } catch (error) {
+        console.warn('[gpu-renderer] QCD WebGPU initialization failed', error);
+        return null;
+      }
+    })();
+    qcdContext = await qcdContextPromise;
+    return qcdContext;
+  };
+
+  const ensureQcdSeedTexture = (
+    ctx: QcdGpuContext,
+    width: number,
+    height: number,
+    seed: number,
+    scopeHash: number,
+  ): { keyLo: number; keyHi: number } | null => {
+    const signature = `${width}x${height}:${toUint32(seed)}:${scopeHash >>> 0}`;
+    if (ctx.seedTexture && ctx.seedSignature === signature && ctx.seedKey) {
+      return ctx.seedKey;
+    }
+    const payload = createQcdSeedTexturePayload(width, height, seed, scopeHash);
+    ctx.seedTexture?.destroy();
+    ctx.seedTexture = ctx.device.createTexture({
+      label: 'qcd-seed-texture',
+      size: { width, height, depthOrArrayLayers: 1 },
+      format: 'rgba32uint',
+      usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+    });
+    ctx.seedTextureView = ctx.seedTexture.createView({ dimension: '2d' });
+    ctx.device.queue.writeTexture(
+      { texture: ctx.seedTexture },
+      payload.data,
+      { bytesPerRow: payload.bytesPerRow, rowsPerImage: height },
+      { width, height, depthOrArrayLayers: 1 },
+    );
+    ctx.seedSignature = payload.signature;
+    ctx.seedKey = { lo: payload.keyLo, hi: payload.keyHi };
+    return ctx.seedKey;
+  };
+
+  const ensureQcdLatticeBuffer = (ctx: QcdGpuContext, floatCount: number): void => {
+    const requiredBytes = floatCount * Float32Array.BYTES_PER_ELEMENT;
+    if (ctx.latticeBuffer && ctx.latticeCapacityFloats >= floatCount) {
+      return;
+    }
+    ctx.latticeBuffer?.destroy();
+    const size = alignTo(requiredBytes, 256);
+    ctx.latticeBuffer = ctx.device.createBuffer({
+      size,
+      usage: GPU_BUFFER_USAGE.STORAGE | GPU_BUFFER_USAGE.COPY_DST | GPU_BUFFER_USAGE.COPY_SRC,
+      label: 'qcd-lattice-buffer',
+    });
+    ctx.latticeCapacityFloats = size / Float32Array.BYTES_PER_ELEMENT;
+  };
 
   gl.disable(gl.DEPTH_TEST);
   gl.disable(gl.CULL_FACE);
@@ -1684,6 +2060,7 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
         tileSize,
         tileTexWidth,
         tileTexRowsPerTile,
+        pretransformed: Boolean(payload.pretransformed),
       };
     },
     setHyperbolicAtlas(atlas) {
@@ -1763,6 +2140,11 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
         bindTexture(gl, state.textures.su7Unitary.texture, 12, uniforms.su7UnitaryTex);
         gl.uniform1i(uniforms.su7Enabled, 1);
         gl.uniform1f(uniforms.su7Gain, su7Options.gain);
+        const pretransformedActive =
+          su7Options.pretransformed != null
+            ? su7Options.pretransformed
+            : (su7State?.pretransformed ?? false);
+        gl.uniform1i(uniforms.su7Pretransformed, pretransformedActive ? 1 : 0);
         gl.uniform1i(uniforms.su7DecimationStride, Math.max(1, su7Options.decimationStride));
         const su7ModeEnum =
           su7Options.decimationMode === 'stride'
@@ -1779,10 +2161,39 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
                 ? 3
                 : su7Options.projectorMode === 'matrix'
                   ? 4
-                  : 0;
+                  : su7Options.projectorMode === 'hopfLens'
+                    ? 5
+                    : 0;
         gl.uniform1i(uniforms.su7DecimationMode, su7ModeEnum);
         gl.uniform1f(uniforms.su7ProjectorWeight, su7Options.projectorWeight);
         gl.uniform1i(uniforms.su7ProjectorMode, projectorModeEnum);
+        const hopfLenses = su7Options.hopfLenses ?? [];
+        const hopfCount = Math.min(hopfLenses.length, 3);
+        if (uniforms.su7HopfLensCount) {
+          gl.uniform1i(uniforms.su7HopfLensCount, hopfCount);
+        }
+        if (uniforms.su7HopfLensAxes) {
+          hopfAxesScratch.fill(0);
+          for (let i = 0; i < 3; i++) {
+            const lens = i < hopfCount ? hopfLenses[i] : undefined;
+            const axisA = lens ? Math.max(0, Math.min(6, Math.trunc(lens.axes[0]))) : 0;
+            const axisB = lens ? Math.max(0, Math.min(6, Math.trunc(lens.axes[1]))) : 0;
+            hopfAxesScratch[i * 2] = axisA;
+            hopfAxesScratch[i * 2 + 1] = axisB;
+          }
+          gl.uniform2iv(uniforms.su7HopfLensAxes, hopfAxesScratch);
+        }
+        if (uniforms.su7HopfLensMix) {
+          hopfMixScratch.fill(0);
+          for (let i = 0; i < 3; i++) {
+            const lens = i < hopfCount ? hopfLenses[i] : undefined;
+            const baseMix = lens ? Math.min(Math.max(lens.baseMix, 0), 1) : 0;
+            const fiberMix = lens ? Math.min(Math.max(lens.fiberMix, 0), 1) : 0;
+            hopfMixScratch[i * 2] = baseMix;
+            hopfMixScratch[i * 2 + 1] = fiberMix;
+          }
+          gl.uniform2fv(uniforms.su7HopfLensMix, hopfMixScratch);
+        }
         gl.uniform1i(uniforms.su7TileCols, su7State.tileCols);
         gl.uniform1i(uniforms.su7TileRows, su7State.tileRows);
         gl.uniform1i(uniforms.su7TileSize, su7State.tileSize);
@@ -1802,9 +2213,21 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
         gl.uniform1i(uniforms.su7DecimationMode, 0);
         gl.uniform1f(uniforms.su7ProjectorWeight, su7Options.projectorWeight);
         gl.uniform1i(uniforms.su7ProjectorMode, 0);
+        if (uniforms.su7HopfLensCount) {
+          gl.uniform1i(uniforms.su7HopfLensCount, 0);
+        }
+        if (uniforms.su7HopfLensAxes) {
+          hopfAxesScratch.fill(0);
+          gl.uniform2iv(uniforms.su7HopfLensAxes, hopfAxesScratch);
+        }
+        if (uniforms.su7HopfLensMix) {
+          hopfMixScratch.fill(0);
+          gl.uniform2fv(uniforms.su7HopfLensMix, hopfMixScratch);
+        }
         gl.uniform1i(uniforms.su7TileCols, su7State ? su7State.tileCols : 0);
         gl.uniform1i(uniforms.su7TileRows, su7State ? su7State.tileRows : 0);
         gl.uniform1i(uniforms.su7TileSize, su7State ? su7State.tileSize : 32);
+        gl.uniform1i(uniforms.su7Pretransformed, 0);
         gl.uniform1i(uniforms.su7UnitaryTexWidth, su7State ? su7State.tileTexWidth : 1);
         gl.uniform1i(uniforms.su7UnitaryTexRowsPerTile, su7State ? su7State.tileTexRowsPerTile : 1);
         if (uniforms.su7ProjectorMatrix) {
@@ -2005,6 +2428,156 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       }
       gl.readPixels(0, 0, state.width, state.height, gl.RGBA, gl.UNSIGNED_BYTE, target);
     },
+    async runQcdHeatbathSweep(options) {
+      try {
+        const ctx = await ensureQcdContext();
+        if (!ctx) {
+          return false;
+        }
+        const {
+          lattice,
+          width,
+          height,
+          siteStride,
+          linkStride,
+          rowStride,
+          complexStride,
+          beta,
+          parity,
+          axis,
+          sweepIndex,
+          overRelaxationSteps,
+          seed,
+          scope,
+        } = options;
+        if (!(lattice instanceof Float32Array)) {
+          throw new TypeError('[gpu-renderer] QCD lattice buffer must be a Float32Array');
+        }
+        const widthInt = Math.max(1, Math.trunc(width));
+        const heightInt = Math.max(1, Math.trunc(height));
+        const siteStrideInt = Math.max(1, Math.trunc(siteStride));
+        const linkStrideInt = Math.max(1, Math.trunc(linkStride));
+        const rowStrideInt = Math.max(1, Math.trunc(rowStride));
+        const complexStrideInt = Math.max(1, Math.trunc(complexStride));
+        const expectedLength = widthInt * heightInt * siteStrideInt;
+        if (lattice.length !== expectedLength) {
+          throw new RangeError(
+            `[gpu-renderer] QCD lattice length mismatch (expected ${expectedLength}, received ${lattice.length})`,
+          );
+        }
+        const seedValue = toUint32(seed ?? 0);
+        const scopeHash = hashScope(scope);
+        const key = ensureQcdSeedTexture(ctx, widthInt, heightInt, seedValue, scopeHash);
+        if (!key || !ctx.seedTextureView) {
+          return false;
+        }
+
+        ensureQcdLatticeBuffer(ctx, lattice.length);
+        if (!ctx.latticeBuffer) {
+          return false;
+        }
+
+        ctx.device.queue.writeBuffer(
+          ctx.latticeBuffer,
+          0,
+          lattice.buffer,
+          lattice.byteOffset,
+          lattice.byteLength,
+        );
+
+        ctx.uniformU32[0] = toUint32(widthInt);
+        ctx.uniformU32[1] = toUint32(heightInt);
+        ctx.uniformU32[2] = toUint32(parity & 1);
+        ctx.uniformU32[3] = toUint32(Math.max(0, Math.floor(overRelaxationSteps)));
+        ctx.uniformU32[4] = toUint32(siteStrideInt);
+        ctx.uniformU32[5] = toUint32(linkStrideInt);
+        ctx.uniformU32[6] = toUint32(rowStrideInt);
+        ctx.uniformU32[7] = toUint32(complexStrideInt);
+        ctx.uniformU32[8] = key.lo;
+        ctx.uniformU32[9] = key.hi;
+        ctx.uniformU32[10] = toUint32(Math.max(0, Math.trunc(sweepIndex)));
+        ctx.uniformU32[11] = axis === 'y' ? 1 : 0;
+        ctx.uniformF32[12] = Number.isFinite(beta) ? beta : 0;
+        ctx.uniformF32[13] = 0;
+        ctx.uniformF32[14] = 0;
+        ctx.uniformF32[15] = 0;
+        ctx.device.queue.writeBuffer(ctx.uniformBuffer, 0, ctx.uniformArray);
+
+        const bindGroup = ctx.device.createBindGroup({
+          layout: ctx.bindGroupLayout,
+          entries: [
+            {
+              binding: 0,
+              resource: { buffer: ctx.latticeBuffer },
+            },
+            {
+              binding: 1,
+              resource: ctx.seedTextureView,
+            },
+            {
+              binding: 2,
+              resource: { buffer: ctx.uniformBuffer },
+            },
+          ],
+          label: 'qcd-bind-group',
+        });
+
+        const queueAny = ctx.device.queue as {
+          readBuffer?: (
+            buffer: any,
+            offset: number,
+            data: ArrayBuffer | ArrayBufferView,
+            dataOffset?: number,
+            size?: number,
+          ) => Promise<void>;
+        };
+        const supportsReadBuffer = typeof queueAny.readBuffer === 'function';
+        let readbackBuffer: GPUBuffer | null = null;
+        if (!supportsReadBuffer) {
+          const copyBytes = alignTo(lattice.byteLength, 4);
+          readbackBuffer = ctx.device.createBuffer({
+            size: copyBytes,
+            usage: GPU_BUFFER_USAGE.COPY_DST | GPU_BUFFER_USAGE.MAP_READ,
+            label: 'qcd-readback',
+          });
+        }
+
+        const workgroupX = Math.ceil(widthInt / QCD_WORKGROUP_SIZE_X);
+        const workgroupY = Math.ceil(heightInt / QCD_WORKGROUP_SIZE_Y);
+        const encoder = ctx.device.createCommandEncoder({ label: 'qcd-command-encoder' });
+        const pass = encoder.beginComputePass({ label: 'qcd-compute-pass' });
+        pass.setPipeline(ctx.pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(workgroupX, workgroupY);
+        pass.end();
+        if (!supportsReadBuffer && readbackBuffer) {
+          encoder.copyBufferToBuffer(ctx.latticeBuffer, 0, readbackBuffer, 0, lattice.byteLength);
+        }
+        ctx.device.queue.submit([encoder.finish()]);
+        await ctx.device.queue.onSubmittedWorkDone();
+
+        if (supportsReadBuffer && queueAny.readBuffer) {
+          await queueAny.readBuffer(
+            ctx.latticeBuffer,
+            0,
+            lattice.buffer,
+            lattice.byteOffset,
+            lattice.byteLength,
+          );
+        } else if (readbackBuffer) {
+          await readbackBuffer.mapAsync(GPU_MAP_MODE.READ);
+          const mapped = readbackBuffer.getMappedRange();
+          lattice.set(new Float32Array(mapped, 0, lattice.length));
+          readbackBuffer.unmap();
+          readbackBuffer.destroy();
+        }
+
+        return true;
+      } catch (error) {
+        console.warn('[gpu-renderer] QCD heatbath sweep failed', error);
+        return false;
+      }
+    },
     dispose() {
       gl.deleteProgram(program);
       gl.deleteVertexArray(vao);
@@ -2029,6 +2602,16 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       atlasState = null;
       atlasDirty = false;
       su7State = null;
+      if (qcdContext) {
+        qcdContext.uniformBuffer.destroy();
+        qcdContext.latticeBuffer?.destroy();
+        qcdContext.seedTexture?.destroy();
+        qcdContext.seedTextureView = null;
+        qcdContext.seedSignature = null;
+        qcdContext.seedKey = null;
+        qcdContext = null;
+      }
+      qcdContextPromise = null;
     },
   };
 
@@ -2271,6 +2854,7 @@ function locateUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
     tracerDt: getUniform(gl, program, 'uTracerDt'),
     su7Enabled: getUniform(gl, program, 'uSu7Enabled'),
     su7Gain: getUniform(gl, program, 'uSu7Gain'),
+    su7Pretransformed: getUniform(gl, program, 'uSu7Pretransformed'),
     su7DecimationStride: getUniform(gl, program, 'uSu7DecimationStride'),
     su7DecimationMode: getUniform(gl, program, 'uSu7DecimationMode'),
     su7ProjectorWeight: getUniform(gl, program, 'uSu7ProjectorWeight'),
@@ -2281,6 +2865,9 @@ function locateUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
     su7UnitaryTexWidth: getUniform(gl, program, 'uSu7UnitaryTexWidth'),
     su7UnitaryTexRowsPerTile: getUniform(gl, program, 'uSu7UnitaryTexRowsPerTile'),
     su7ProjectorMatrix: getOptionalUniform(gl, program, 'uSu7ProjectorMatrix'),
+    su7HopfLensCount: getOptionalUniform(gl, program, 'uSu7HopfLensCount'),
+    su7HopfLensAxes: getOptionalUniform(gl, program, 'uSu7HopfLensAxes'),
+    su7HopfLensMix: getOptionalUniform(gl, program, 'uSu7HopfLensMix'),
   };
 }
 

@@ -1,8 +1,8 @@
-import test from "node:test";
-import assert from "node:assert/strict";
-import { createKuramotoState, createDerivedViews, derivedBufferSize, deriveKuramotoFields, initKuramotoState, stepKuramotoState, createIrradianceFrameBuffer, createTelemetrySnapshot } from "../src/kuramotoCore.js";
-import { AngularSpectrumSolver } from "../src/optics/angularSpectrum.js";
-import { KERNEL_SPEC_DEFAULT } from "../src/kernel/kernelSpec.js";
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createKuramotoState, createDerivedViews, derivedBufferSize, deriveKuramotoFields, initKuramotoState, stepKuramotoState, createIrradianceFrameBuffer, createTelemetrySnapshot, } from '../src/kuramotoCore.js';
+import { AngularSpectrumSolver } from '../src/optics/angularSpectrum.js';
+import { KERNEL_SPEC_DEFAULT } from '../src/kernel/kernelSpec.js';
 const defaultParams = {
     alphaKur: 0.2,
     gammaKur: 0.15,
@@ -13,7 +13,7 @@ const defaultParams = {
     fluxY: 0,
     smallWorldWeight: 0,
     p_sw: 0,
-    smallWorldEnabled: false
+    smallWorldEnabled: false,
 };
 const makePhaseField = (width, height) => {
     const buffer = new ArrayBuffer(derivedBufferSize(width, height));
@@ -28,7 +28,7 @@ const computeMaxDiff = (a, b) => {
     }
     return max;
 };
-test("Kuramoto and angular-spectrum phases agree after alignment", () => {
+test('Kuramoto and angular-spectrum phases agree after alignment', () => {
     const width = 12;
     const height = 10;
     const steps = 4;
@@ -46,7 +46,7 @@ test("Kuramoto and angular-spectrum phases agree after alignment", () => {
         height,
         wavelengthNm: 550,
         pixelPitchMeters: 1e-6,
-        dzMeters: 0.004
+        dzMeters: 0.004,
     });
     const angularFrame = solver.propagate(kurState.field, { dzMeters: 0.004, timestamp: 0.25 });
     solver.alignPhase(angularFrame, 0, kurState.field.getPhase(0));
@@ -60,7 +60,7 @@ test("Kuramoto and angular-spectrum phases agree after alignment", () => {
         Zr: angularFrame.real,
         Zi: angularFrame.imag,
         telemetry: angularTelemetry,
-        irradiance: angularIrradiance
+        irradiance: angularIrradiance,
     };
     const angularPhase = makePhaseField(width, height);
     deriveKuramotoFields(angularState, angularPhase);
@@ -69,7 +69,7 @@ test("Kuramoto and angular-spectrum phases agree after alignment", () => {
         gradY: computeMaxDiff(kurPhase.gradY, angularPhase.gradY),
         vort: computeMaxDiff(kurPhase.vort, angularPhase.vort),
         coh: computeMaxDiff(kurPhase.coh, angularPhase.coh),
-        amp: computeMaxDiff(kurPhase.amp, angularPhase.amp)
+        amp: computeMaxDiff(kurPhase.amp, angularPhase.amp),
     };
     const tolerance = 1e-5;
     assert.ok(metrics.gradX < tolerance, `gradX diff ${metrics.gradX}`);
@@ -77,9 +77,9 @@ test("Kuramoto and angular-spectrum phases agree after alignment", () => {
     assert.ok(metrics.vort < tolerance, `vort diff ${metrics.vort}`);
     assert.ok(metrics.coh < tolerance, `coh diff ${metrics.coh}`);
     assert.ok(metrics.amp < tolerance, `amp diff ${metrics.amp}`);
-    assert.ok(angularFrame.getMeta().frameId >= 0, "angular solver should stamp frame IDs");
+    assert.ok(angularFrame.getMeta().frameId >= 0, 'angular solver should stamp frame IDs');
 });
-test("Kuramoto telemetry updates order parameter and irradiance metadata", () => {
+test('Kuramoto telemetry updates order parameter and irradiance metadata', () => {
     const width = 2;
     const height = 1;
     const state = createKuramotoState(width, height);
@@ -94,10 +94,10 @@ test("Kuramoto telemetry updates order parameter and irradiance metadata", () =>
         fluxY: 0,
         smallWorldWeight: 0,
         p_sw: 0,
-        smallWorldEnabled: false
+        smallWorldEnabled: false,
     };
     const result = stepKuramotoState(state, params, 0, () => 0, 1, {
-        telemetry: { kernelVersion: 7 }
+        telemetry: { kernelVersion: 7 },
     });
     const meta = state.field.getMeta();
     assert.equal(result.telemetry.frameId, meta.frameId);

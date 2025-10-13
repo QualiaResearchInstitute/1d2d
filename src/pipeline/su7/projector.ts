@@ -1,15 +1,25 @@
 import { lmsToRgb, linearLuma, linearToSrgb, srgbToLinear } from '../colorSpaces.js';
-import type { C7Vector, Su7ProjectorDescriptor } from './types.js';
+import { buildFluxSu3Block, fluxEnergyToOverlayColor } from '../../qcd/overlays.js';
+import { computeHopfCoordinates, hopfBaseToRgb, hopfFiberToRgb } from './geodesic.js';
+import { su3_embed } from './math.js';
+import type { Complex3x3 } from '../../qcd/su3.js';
+import type {
+  C7Vector,
+  HopfLensDescriptor,
+  Su7GuardrailEvent,
+  Su7ProjectorDescriptor,
+} from './types.js';
 
 const EPSILON = 1e-9;
+const FLUX_OVERLAY_EPSILON = 1e-6;
 
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(Math.max(value, min), max);
 
 const clamp01 = (value: number): number => clamp(value, 0, 1);
 
-const safeNumber = (value: number, fallback = 0): number =>
-  Number.isFinite(value) ? (value as number) : fallback;
+const safeNumber = (value: number | null | undefined, fallback = 0): number =>
+  typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 
 const cellMagnitude = (cell: { re: number; im: number }): number => Math.hypot(cell.re, cell.im);
 
@@ -31,6 +41,15 @@ export type Su7ProjectionResult = {
   energy: number;
   composerWeights?: Su7ComposerWeights;
   overlays?: Su7ProjectionOverlay[];
+  guardrailEvent?: Extract<Su7GuardrailEvent, { kind: 'autoGain' }>;
+  hopf?: HopfLensProjection[];
+};
+
+export type FluxOverlaySample = {
+  energy: number;
+  energyScale: number;
+  dirX: number;
+  dirY: number;
 };
 
 export type ProjectSu7VectorParams = {
@@ -40,6 +59,19 @@ export type ProjectSu7VectorParams = {
   gain: number;
   frameGain: number;
   baseColor: [number, number, number];
+  fluxOverlay?: FluxOverlaySample;
+};
+
+export type HopfLensProjection = {
+  index: number;
+  axes: [number, number];
+  base: [number, number, number];
+  fiber: number;
+  magnitude: number;
+  share: number;
+  baseMix: number;
+  fiberMix: number;
+  label: string | undefined;
 };
 
 type EnergyShares = {
@@ -91,6 +123,9 @@ const tintColor = (
   return [clamp01(scale * tint[0]), clamp01(scale * tint[1]), clamp01(scale * tint[2])];
 };
 
+export const MAX_HOPF_LENSES = 3;
+const MAX_HOPF_OVERLAYS = MAX_HOPF_LENSES * 2;
+
 const sharesToOverlays = (
   shares: EnergyShares,
   projectedRgb: [number, number, number],
@@ -118,6 +153,74 @@ const sharesToOverlays = (
     },
   ];
   return overlays.filter((overlay) => overlay.mix > EPSILON);
+};
+
+const applyFluxBlockHead = (
+  block: Complex3x3,
+  vector: C7Vector,
+): [{ re: number; im: number }, { re: number; im: number }, { re: number; im: number }] => {
+  const embedded = su3_embed(block);
+  const out: [{ re: number; im: number }, { re: number; im: number }, { re: number; im: number }] =
+    [
+      { re: 0, im: 0 },
+      { re: 0, im: 0 },
+      { re: 0, im: 0 },
+    ];
+  for (let row = 0; row < 3; row++) {
+    let sumRe = 0;
+    let sumIm = 0;
+    for (let col = 0; col < 3; col++) {
+      const coeff = embedded[row][col];
+      if (coeff.re === 0 && coeff.im === 0) continue;
+      const cell = vector[col];
+      sumRe += coeff.re * cell.re - coeff.im * cell.im;
+      sumIm += coeff.re * cell.im + coeff.im * cell.re;
+    }
+    out[row] = { re: sumRe, im: sumIm };
+  }
+  return out;
+};
+
+export const DEFAULT_HOPF_LENSES: readonly HopfLensDescriptor[] = Object.freeze([
+  { axes: [0, 1], baseMix: 1, fiberMix: 1, controlTarget: 'none', label: 'Lens 1' },
+  { axes: [2, 3], baseMix: 1, fiberMix: 1, controlTarget: 'none', label: 'Lens 2' },
+  { axes: [4, 5], baseMix: 1, fiberMix: 1, controlTarget: 'none', label: 'Lens 3' },
+]);
+
+const sanitizeLensAxes = (axes: [number, number]): [number, number] => {
+  const a = Math.max(0, Math.min(6, Math.trunc(axes[0])));
+  const b = Math.max(0, Math.min(6, Math.trunc(axes[1])));
+  if (a === b) {
+    const fallback = (a + 1) % 7;
+    return [a, fallback];
+  }
+  return [a, b];
+};
+
+export const resolveHopfLenses = (descriptor: Su7ProjectorDescriptor): HopfLensDescriptor[] => {
+  const options = descriptor.hopf;
+  if (!options || !Array.isArray(options.lenses) || options.lenses.length === 0) {
+    return DEFAULT_HOPF_LENSES.map((lens) => ({ ...lens }));
+  }
+  const sanitized = options.lenses.map((lens, idx) => {
+    const tuple =
+      Array.isArray(lens.axes) && lens.axes.length === 2 ? lens.axes : [idx % 7, (idx + 1) % 7];
+    const axes = sanitizeLensAxes(tuple as [number, number]);
+    const baseMix =
+      typeof lens.baseMix === 'number' && Number.isFinite(lens.baseMix) ? clamp01(lens.baseMix) : 1;
+    const fiberMix =
+      typeof lens.fiberMix === 'number' && Number.isFinite(lens.fiberMix)
+        ? clamp01(lens.fiberMix)
+        : 1;
+    return {
+      axes,
+      baseMix,
+      fiberMix,
+      controlTarget: lens.controlTarget ?? 'none',
+      label: lens.label,
+    };
+  });
+  return sanitized.slice(0, MAX_HOPF_LENSES);
 };
 
 export const projectSu7Vector = (params: ProjectSu7VectorParams): Su7ProjectionResult | null => {
@@ -170,6 +273,25 @@ export const projectSu7Vector = (params: ProjectSu7VectorParams): Su7ProjectionR
     su7Luma = linearLuma(linearRgb[0], linearRgb[1], linearRgb[2]);
   }
 
+  const targetEnergy = normValue * effectiveGain * frameGain;
+  const su7LumaBeforeAutoGain = su7Luma;
+  let autoGainEvent: Extract<Su7GuardrailEvent, { kind: 'autoGain' }> | null = null;
+  if (targetEnergy > EPSILON) {
+    const tolerance = Math.max(targetEnergy * 0.05, 1e-6);
+    if (Math.abs(su7Luma - targetEnergy) > tolerance) {
+      const correction = clamp(targetEnergy / Math.max(su7Luma, 1e-6), 0.25, 4);
+      linearRgb = linearRgb.map((channel) => channel * correction) as [number, number, number];
+      su7Luma = Math.max(0, su7Luma * correction);
+      autoGainEvent = {
+        kind: 'autoGain',
+        before: su7LumaBeforeAutoGain,
+        after: su7Luma,
+        target: targetEnergy,
+        sampleCount: 1,
+      };
+    }
+  }
+
   const srgb = linearRgb.map((channel) => clamp01(linearToSrgb(channel))) as [
     number,
     number,
@@ -182,6 +304,7 @@ export const projectSu7Vector = (params: ProjectSu7VectorParams): Su7ProjectionR
       rgb: srgb,
       mix,
       energy: su7Luma,
+      guardrailEvent: autoGainEvent ?? undefined,
     };
   }
 
@@ -190,6 +313,7 @@ export const projectSu7Vector = (params: ProjectSu7VectorParams): Su7ProjectionR
     rgb: srgb,
     mix,
     energy: su7Luma,
+    guardrailEvent: autoGainEvent ?? undefined,
   };
 
   if (projectorId === 'composerweights' || projectorId === 'overlaysplit') {
@@ -197,6 +321,90 @@ export const projectSu7Vector = (params: ProjectSu7VectorParams): Su7ProjectionR
   }
   if (projectorId === 'overlaysplit') {
     result.overlays = sharesToOverlays(shares, srgb, mix);
+  } else if (projectorId === 'hopflens') {
+    const lenses = resolveHopfLenses(projector);
+    const hopf: HopfLensProjection[] = [];
+    const overlays: Su7ProjectionOverlay[] = [];
+    const epsilon = 1e-6;
+    if (lenses.length > 0 && mix > epsilon) {
+      const invNorm = norm > epsilon ? 1 / norm : 0;
+      lenses.forEach((lens, index) => {
+        const [axisA, axisB] = lens.axes;
+        const compA = vector[axisA];
+        const compB = vector[axisB];
+        const coords = computeHopfCoordinates(compA, compB);
+        if (coords.magnitude <= epsilon) {
+          return;
+        }
+        const share = clamp01(coords.magnitude * invNorm);
+        const baseMix = clamp01(share * mix * (lens.baseMix ?? 1));
+        const fiberMix = clamp01(share * mix * (lens.fiberMix ?? 1));
+        const projection: HopfLensProjection = {
+          index,
+          axes: [axisA, axisB],
+          base: coords.base,
+          fiber: coords.fiber,
+          magnitude: coords.magnitude,
+          share,
+          baseMix,
+          fiberMix,
+          label: lens.label,
+        };
+        hopf.push(projection);
+        if (baseMix > epsilon && overlays.length < MAX_HOPF_OVERLAYS) {
+          overlays.push({
+            rgb: hopfBaseToRgb(coords.base),
+            mix: baseMix,
+          });
+        }
+        if (fiberMix > epsilon && overlays.length < MAX_HOPF_OVERLAYS) {
+          overlays.push({
+            rgb: hopfFiberToRgb(coords.fiber),
+            mix: fiberMix,
+          });
+        }
+      });
+    }
+    if (hopf.length > 0) {
+      result.hopf = hopf;
+    }
+    if (overlays.length > 0) {
+      result.overlays = overlays;
+    }
+  }
+
+  const fluxSample = params.fluxOverlay;
+  if (fluxSample && fluxSample.energyScale > FLUX_OVERLAY_EPSILON && mix > FLUX_OVERLAY_EPSILON) {
+    const normalizedEnergy = clamp01(fluxSample.energy * fluxSample.energyScale);
+    const dirMagnitude = Math.hypot(fluxSample.dirX, fluxSample.dirY);
+    if (normalizedEnergy > FLUX_OVERLAY_EPSILON && dirMagnitude > FLUX_OVERLAY_EPSILON) {
+      const angle = Math.atan2(fluxSample.dirY, fluxSample.dirX);
+      const block = buildFluxSu3Block(normalizedEnergy, angle);
+      const transformedHead = applyFluxBlockHead(block, vector);
+      const headMagnitudes = transformedHead.map((cell) => clamp01(cellMagnitude(cell))) as [
+        number,
+        number,
+        number,
+      ];
+      const headMean = (headMagnitudes[0] + headMagnitudes[1] + headMagnitudes[2]) / 3;
+      const modulation = clamp(headMean * 0.85 + 0.15, 0.1, 1.35);
+      const overlayMix = clamp01(normalizedEnergy * modulation * mix);
+      if (overlayMix > FLUX_OVERLAY_EPSILON) {
+        const baseOverlay = fluxEnergyToOverlayColor(normalizedEnergy, angle);
+        const tintedOverlay = baseOverlay.map((channel, idx) =>
+          clamp01(channel * 0.6 + headMagnitudes[Math.min(idx, 2)] * 0.4),
+        ) as [number, number, number];
+        const overlay: Su7ProjectionOverlay = {
+          rgb: tintedOverlay,
+          mix: overlayMix,
+        };
+        if (result.overlays) {
+          result.overlays.push(overlay);
+        } else {
+          result.overlays = [overlay];
+        }
+      }
+    }
   }
 
   return result;

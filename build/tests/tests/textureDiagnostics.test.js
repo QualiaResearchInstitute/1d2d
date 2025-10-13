@@ -1,10 +1,10 @@
-import test from "node:test";
-import assert from "node:assert/strict";
-import { makeResolution } from "../src/fields/contracts.js";
-import { computeTextureDiagnostics } from "../src/pipeline/textureDiagnostics.js";
-import { renderRainbowFrame } from "../src/pipeline/rainbowFrame.js";
-import { createDefaultSu7RuntimeParams } from "../src/pipeline/su7/types.js";
-import { createKernelSpec } from "../src/kernel/kernelSpec.js";
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { makeResolution } from '../src/fields/contracts.js';
+import { computeTextureDiagnostics } from '../src/pipeline/textureDiagnostics.js';
+import { renderRainbowFrame } from '../src/pipeline/rainbowFrame.js';
+import { createDefaultSu7RuntimeParams } from '../src/pipeline/su7/types.js';
+import { createKernelSpec } from '../src/kernel/kernelSpec.js';
 const clamp01 = (value) => Math.max(0, Math.min(1, value));
 const createSurfaceFromFn = (width, height, fn) => {
     const rgba = new Uint8ClampedArray(width * height * 4);
@@ -20,9 +20,9 @@ const createSurfaceFromFn = (width, height, fn) => {
         }
     }
     return {
-        kind: "surface",
+        kind: 'surface',
         resolution: makeResolution(width, height),
-        rgba
+        rgba,
     };
 };
 const createUniformSurface = (width, height, value) => createSurfaceFromFn(width, height, () => value);
@@ -53,28 +53,28 @@ const createBeatSurface = (width, height, baseFreq, deltaAngle) => {
 const createFlatRimField = (width, height) => {
     const total = width * height;
     return {
-        kind: "rim",
+        kind: 'rim',
         resolution: makeResolution(width, height),
         gx: new Float32Array(total),
         gy: new Float32Array(total),
-        mag: new Float32Array(total)
+        mag: new Float32Array(total),
     };
 };
-test("texture diagnostics near zero for uniform surface", () => {
+test('texture diagnostics near zero for uniform surface', () => {
     const surface = createUniformSurface(32, 32, 0.5);
     const result = computeTextureDiagnostics(surface, { orientations: [0, Math.PI / 2] });
     assert.equal(result.sampleCount, 32 * 32);
     assert.ok(result.wallpapericityMean < 1e-3);
     assert.ok(result.beatEnergyMean < 1e-3);
 });
-test("texture diagnostics wallpapericity rises for striped surface", () => {
+test('texture diagnostics wallpapericity rises for striped surface', () => {
     const surface = createStripeSurface(64, 64, 0, 6);
     const result = computeTextureDiagnostics(surface, { orientations: [0, Math.PI / 2] });
     assert.equal(result.sampleCount, 64 * 64);
     assert.ok(result.wallpapericityMean > 0.08);
     assert.ok(result.beatEnergyMean >= 0);
 });
-test("texture diagnostics beat energy spikes for near-resonant stripes", () => {
+test('texture diagnostics beat energy spikes for near-resonant stripes', () => {
     const baseSurface = createStripeSurface(64, 64, 0, 6);
     const beatSurface = createBeatSurface(64, 64, 6, Math.PI / 7);
     const baseMetrics = computeTextureDiagnostics(baseSurface, { orientations: [0, Math.PI / 7] });
@@ -99,7 +99,7 @@ const buildRenderInput = (surface, rim) => {
             Q: 3.6,
             anisotropy: 0.8,
             chirality: 1.15,
-            transparency: 0.28
+            transparency: 0.28,
         }),
         dmt: 0.25,
         arousal: 0.2,
@@ -114,10 +114,10 @@ const buildRenderInput = (surface, rim) => {
         alive: false,
         phasePin: true,
         edgeThreshold: 0.18,
-        wallpaperGroup: "off",
+        wallpaperGroup: 'off',
         surfEnabled: true,
         orientationAngles: [0, Math.PI / 6],
-        thetaMode: "gradient",
+        thetaMode: 'gradient',
         thetaGlobal: 0,
         polBins: 16,
         jitter: 0.4,
@@ -131,25 +131,25 @@ const buildRenderInput = (surface, rim) => {
             kurToOrientation: 0,
             kurToChirality: 0,
             volumePhaseToHue: 0,
-            volumeDepthToWarp: 0
+            volumeDepthToWarp: 0,
         },
         sigma: 3.2,
         contrast: 1.1,
         rimAlpha: 1,
         rimEnabled: true,
-        displayMode: "color",
+        displayMode: 'color',
         surfaceBlend: 0.3,
-        surfaceRegion: "both",
+        surfaceRegion: 'both',
         warpAmp: 1,
         curvatureStrength: 0,
-        curvatureMode: "poincare",
+        curvatureMode: 'poincare',
         kurEnabled: false,
         debug: undefined,
         su7: createDefaultSu7RuntimeParams(),
-        composer: undefined
+        composer: undefined,
     };
 };
-test("renderRainbowFrame exposes texture metrics with beat spikes", () => {
+test('renderRainbowFrame exposes texture metrics with beat spikes', () => {
     const width = 64;
     const height = 64;
     const rim = createFlatRimField(width, height);

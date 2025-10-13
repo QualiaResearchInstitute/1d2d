@@ -13,11 +13,13 @@ import {
   computeProjectorEnergy,
   buildScheduledUnitary,
   computeUnitaryError,
+  createSu7GateListSnapshot,
   type Su7ScheduleContext,
 } from '../src/pipeline/su7/math.js';
 import { applySU7 } from '../src/pipeline/su7/unitary.js';
 import { createKernelSpec, type KernelSpec } from '../src/kernel/kernelSpec.js';
 import { makeResolution, type SurfaceField, type RimField } from '../src/fields/contracts.js';
+import { hashCanonicalJson, writeCanonicalJson } from '../src/serialization/canonicalJson.js';
 
 const FRAME_WIDTH = 12;
 const FRAME_HEIGHT = 10;
@@ -319,6 +321,15 @@ test('seeded SU7 runtime produces stable outputs across runs', () => {
   const second = renderFrame(seeded);
   assert.equal(maxChannelDelta(first.pixels, second.pixels), 0);
   assert.deepEqual(first.metrics.su7, second.metrics.su7);
+  const snapshotA = createSu7GateListSnapshot(seeded);
+  const snapshotB = createSu7GateListSnapshot(seeded);
+  assert.deepEqual(snapshotA, snapshotB);
+  const canonicalA = writeCanonicalJson(snapshotA);
+  const canonicalB = writeCanonicalJson(snapshotB);
+  assert.equal(canonicalA, canonicalB);
+  const { hash: hashA } = hashCanonicalJson(snapshotA);
+  const { hash: hashB } = hashCanonicalJson(snapshotB);
+  assert.equal(hashA, hashB);
 });
 
 test('contextual SU7 scheduling stays unitary and responds to flow cues', () => {
@@ -372,6 +383,17 @@ test('contextual SU7 scheduling stays unitary and responds to flow cues', () => 
     `expected contextual schedule to differ from legacy (diff=${diffMagnitude})`,
   );
   assert.ok(maxOffDiag > 1e-3, `expected contextual mixing pulses, maxOffDiag=${maxOffDiag}`);
+  const snapshotContextual = createSu7GateListSnapshot(contextualParams, context);
+  const secondSnapshot = createSu7GateListSnapshot(contextualParams, context);
+  assert.deepEqual(snapshotContextual, secondSnapshot);
+  const { hash: contextualHashA } = hashCanonicalJson(snapshotContextual);
+  const { hash: contextualHashB } = hashCanonicalJson(secondSnapshot);
+  assert.equal(contextualHashA, contextualHashB);
+  let pulseEnergy = 0;
+  snapshotContextual.gains.pulseAngles.forEach((theta) => {
+    pulseEnergy += Math.abs(theta);
+  });
+  assert.ok(pulseEnergy > 0, 'expected contextual snapshot to record pulse gates');
 });
 
 test('decimation stride limits SU7 mixing footprint', () => {

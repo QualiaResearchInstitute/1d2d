@@ -13,6 +13,9 @@ export const SU7_TILE_TEXTURE_ROWS_PER_TILE = 4;
 
 const VECTOR_COMPONENTS_PER_TEXEL = 4;
 const COMPLEX_PER_TEXEL = 2;
+const COMPLEX_PER_VECTOR = 7;
+const FLOATS_PER_COMPLEX = 2;
+export const SU7_VECTOR_FLOATS = COMPLEX_PER_VECTOR * FLOATS_PER_COMPLEX;
 const TOTAL_COMPLEX = 7 * 7;
 const TILE_TEXELS_PER_TILE = SU7_TILE_TEXTURE_WIDTH * SU7_TILE_TEXTURE_ROWS_PER_TILE;
 const TILE_TEXELS_USED = Math.ceil(TOTAL_COMPLEX / COMPLEX_PER_TEXEL);
@@ -93,6 +96,47 @@ export const fillSu7VectorBuffers = (
     }
     tex3[base + 2] = norm;
     tex3[base + 3] = 0;
+  }
+};
+
+export const fillSu7VectorBuffersFromPacked = (
+  packed: Float32Array,
+  norms: Float32Array,
+  texelCount: number,
+  target: Su7VectorBuffers,
+  strideFloats: number = SU7_VECTOR_FLOATS,
+) => {
+  const required = texelCount * strideFloats;
+  if (packed.length < required) {
+    throw new Error(
+      `[su7-gpu] packed vector buffer length ${packed.length} expected >= ${required}`,
+    );
+  }
+  const { tex0, tex1, tex2, tex3 } = target;
+  for (let i = 0; i < texelCount; i++) {
+    const baseTex = i * VECTOR_COMPONENTS_PER_TEXEL;
+    const basePacked = i * strideFloats;
+    const norm = norms[i] ?? 0;
+
+    tex0[baseTex + 0] = packed[basePacked + 0];
+    tex0[baseTex + 1] = packed[basePacked + 1];
+    tex0[baseTex + 2] = packed[basePacked + 2];
+    tex0[baseTex + 3] = packed[basePacked + 3];
+
+    tex1[baseTex + 0] = packed[basePacked + 4];
+    tex1[baseTex + 1] = packed[basePacked + 5];
+    tex1[baseTex + 2] = packed[basePacked + 6];
+    tex1[baseTex + 3] = packed[basePacked + 7];
+
+    tex2[baseTex + 0] = packed[basePacked + 8];
+    tex2[baseTex + 1] = packed[basePacked + 9];
+    tex2[baseTex + 2] = packed[basePacked + 10];
+    tex2[baseTex + 3] = packed[basePacked + 11];
+
+    tex3[baseTex + 0] = packed[basePacked + 12];
+    tex3[baseTex + 1] = packed[basePacked + 13];
+    tex3[baseTex + 2] = norm;
+    tex3[baseTex + 3] = 0;
   }
 };
 

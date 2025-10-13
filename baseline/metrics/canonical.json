@@ -1,58 +1,241 @@
 {
-  "width": 256,
+  "canonicalParams": {
+    "arousal": 0.35,
+    "beta2": 1.9,
+    "blend": 0.39,
+    "contrast": 1.62,
+    "dmt": 0.2,
+    "edgeThreshold": 0.08,
+    "jitter": 1.16,
+    "microsaccade": true,
+    "sigma": 4,
+    "speed": 1.32,
+    "thetaGlobal": 0,
+    "thetaMode": "gradient"
+  },
+  "goldens": {
+    "presetHash": "de4d406d593dffbbad866818e04a0d17c76211ff059791cfa08e136ae451a4f9",
+    "render": {
+      "hash": "4f605510de12a7e7ba3ca97fa51d0834bc71e9c312db889a2a792a9fc50b0dd6",
+      "height": 256,
+      "width": 256
+    },
+    "thumbnail64": {
+      "hash": "5fa68b1274f13816385b0464adf7845de9ee02ee7af9773028cb60b0906f162b",
+      "height": 64,
+      "width": 64
+    }
+  },
   "height": 256,
-  "preset": "Rainbow Rims + DMT Kernel Effects",
-  "timestamp": "2025-10-07T10:40:00.966Z",
+  "kurParams": {
+    "K0": 0.6,
+    "alphaKur": 0.2,
+    "epsKur": 0.002,
+    "fluxX": 0,
+    "fluxY": 0,
+    "gammaKur": 0.15,
+    "omega0": 0,
+    "p_sw": 0,
+    "smallWorldWeight": 0
+  },
   "metrics": {
-    "rim": {
-      "mean": 0.2713195510249252,
-      "std": 0.19897725704810845,
-      "max": 3.442372491421044,
-      "count": 5277
-    },
-    "warp": {
-      "mean": 0.05719568721304084,
-      "std": 0.029787491338875864,
-      "dominantAngle": 0.0037276788122762423,
-      "count": 65536
-    },
-    "gradient": {
-      "gradMean": 0.05719568721304084,
-      "gradStd": 0.029787491338875864,
-      "vortMean": -1.6429903079168829e-22,
-      "vortStd": 9.554140931009417e-18,
-      "cohMean": 0.7942690923673581,
-      "cohStd": 0.04257203554706451,
-      "sampleCount": 65536
+    "composer": {
+      "coupling": {
+        "base": {
+          "kurToChirality": 0.35,
+          "kurToOrientation": 0.32,
+          "kurToTransparency": 0.25,
+          "rimToSurfaceAlign": 0.35,
+          "rimToSurfaceBlend": 0.28,
+          "surfaceToRimHue": 0.4,
+          "surfaceToRimOffset": 0.28,
+          "surfaceToRimSigma": 0.35,
+          "volumeDepthToWarp": 0.48,
+          "volumePhaseToHue": 0.52
+        },
+        "effective": {
+          "kurToChirality": 0.39549999999999996,
+          "kurToOrientation": 0.3616,
+          "kurToTransparency": 0.2825,
+          "rimToSurfaceAlign": 0.39549999999999996,
+          "rimToSurfaceBlend": 0.3164,
+          "surfaceToRimHue": 0.45199999999999996,
+          "surfaceToRimOffset": 0.3164,
+          "surfaceToRimSigma": 0.39549999999999996,
+          "volumeDepthToWarp": 0.5423999999999999,
+          "volumePhaseToHue": 0.5876
+        },
+        "scale": 1.13
+      },
+      "dmtRouting": "auto",
+      "fields": {
+        "kur": {
+          "blend": 1,
+          "energy": 1,
+          "share": 0.19831306414905503,
+          "weight": 1
+        },
+        "rim": {
+          "blend": 0.7028875000000586,
+          "energy": 0.1935512601516701,
+          "share": 0.03838374347058859,
+          "weight": 1
+        },
+        "surface": {
+          "blend": 0,
+          "energy": 0,
+          "share": 0,
+          "weight": 1
+        },
+        "volume": {
+          "blend": 0.28682688361627223,
+          "energy": 0.28682688361627223,
+          "share": 0.7633031923803564,
+          "weight": 1
+        }
+      },
+      "solverRegime": "balanced"
     },
     "compositor": {
       "effectiveBlend": 0.5800000000000001,
-      "surfaceMean": 0,
+      "surfaceCount": 0,
       "surfaceMax": 0,
-      "surfaceCount": 0
+      "surfaceMean": 0
+    },
+    "gradient": {
+      "cohMean": 1,
+      "cohStd": 0,
+      "gradMean": 0.18176408563899807,
+      "gradStd": 0.09544041622617457,
+      "sampleCount": 65536,
+      "vortMean": 0,
+      "vortStd": 0
+    },
+    "kuramoto": {
+      "dt": 0,
+      "frameId": -1,
+      "interference": {
+        "max": 0,
+        "mean": 0,
+        "variance": 0
+      },
+      "kernel": {
+        "Q": 4.6,
+        "anisotropy": 0.95,
+        "chirality": 1.46,
+        "couplingPreset": "dmt",
+        "gain": 3,
+        "k0": 0.2,
+        "transparency": 0.28
+      },
+      "kernelVersion": 0,
+      "orderParameter": {
+        "imag": 0,
+        "magnitude": 0,
+        "phase": 0,
+        "real": 0,
+        "sampleCount": 0
+      },
+      "timestamp": 0
+    },
+    "motionEnergy": {
+      "branchCount": 4,
+      "parallaxAbsMean": 0.003435229155283751,
+      "parallaxMean": 1.8106176280507924e-17,
+      "parallaxStd": 0.0034352376274389557,
+      "phaseShiftMean": 3.401431219249905,
+      "phaseShiftStd": 1.7562036827601815,
+      "source": "orientation"
+    },
+    "parallax": {
+      "eccentricityMean": 0.5410814005141502,
+      "kMean": 0.22131043080329565,
+      "kStd": 0.11663462851164594,
+      "radialSlope": 0.011714596261753963,
+      "sampleCount": 65536,
+      "tagConsistency": 0.6624785369402821
+    },
+    "rim": {
+      "count": 5277,
+      "max": 3.8740285519169033,
+      "mean": 0.27536591581393943,
+      "std": 0.1915813024193552
+    },
+    "su7": {
+      "determinantDrift": 0,
+      "geodesicFallbacks": 0,
+      "normDeltaMax": 0,
+      "normDeltaMean": 0,
+      "projectorEnergy": 0,
+      "unitaryError": 0
+    },
+    "texture": {
+      "beatEnergy": 0.3677820880158054,
+      "beatStd": 0.43223380858143745,
+      "crystallizer": {
+        "beatEnergy": 0.3172221447378131,
+        "beatStd": 0.2389944394013458,
+        "resonanceRate": 0.599761962890625,
+        "sampleCount": 65536,
+        "wallpaperStd": 0.21940215227959936,
+        "wallpapericity": 0.4256415858943567
+      },
+      "earlyVision": {
+        "beatEnergy": 0.3677820880158054,
+        "beatStd": 0.43223380858143745,
+        "divisiveMean": 0.7600575581633658,
+        "divisiveStd": 0.29847573922307125,
+        "dogMean": 0.0005239359053653315,
+        "dogStd": 0.0011847671638186281,
+        "orientationMean": 0.004353716920251251,
+        "orientationStd": 0.015649794874591196,
+        "resonanceRate": 0.451934814453125,
+        "sampleCount": 65536,
+        "wallpaperStd": 0.29847573922307125,
+        "wallpapericity": 0.7600575581633658
+      },
+      "resonanceRate": 0.599761962890625,
+      "sampleCount": 65536,
+      "wallpaperStd": 0.29847573922307125,
+      "wallpapericity": 0.5928495720288612
+    },
+    "volume": {
+      "depthGradMean": 0.02497587577731805,
+      "depthGradStd": 0.013054905125217241,
+      "depthMean": 0.44487321340545805,
+      "depthStd": 0.22438011047020373,
+      "intensityMean": 0.7096514300660601,
+      "intensityStd": 0.05371913690016809,
+      "phaseMean": -0.0019789800032712357,
+      "phaseStd": 1.8136955159559471,
+      "sampleCount": 65536
+    },
+    "warp": {
+      "count": 65536,
+      "dominantAngle": 0.09261804741553142,
+      "mean": 0.22131043080329565,
+      "std": 0.11663462851164594
     }
   },
-  "obsAverage": 0.10116634438555858,
-  "kurParams": {
-    "alphaKur": 0.2,
-    "gammaKur": 0.15,
-    "omega0": 0,
-    "K0": 0.6,
-    "epsKur": 0.002,
-    "fluxX": 0,
-    "fluxY": 0
+  "obsAverage": 0.1007615475298877,
+  "preset": "Rainbow Rims + DMT Kernel Effects",
+  "su7Gate": {
+    "hash": "de4d406d593dffbbad866818e04a0d17c76211ff059791cfa08e136ae451a4f9",
+    "snapshot": {
+      "gains": {
+        "baseGain": 1,
+        "chiralityPhase": 0,
+        "phaseAngles": [0, 0, 0, 0, 0, 0, 0],
+        "pulseAngles": [0, 0, 0, 0, 0, 0, 0]
+      },
+      "preset": "identity",
+      "projector": {
+        "id": "identity"
+      },
+      "schedule": [],
+      "seed": 0
+    }
   },
-  "canonicalParams": {
-    "edgeThreshold": 0.08,
-    "blend": 0.39,
-    "dmt": 0.2,
-    "thetaMode": "gradient",
-    "thetaGlobal": 0,
-    "beta2": 1.9,
-    "jitter": 1.16,
-    "sigma": 4,
-    "microsaccade": true,
-    "speed": 1.32,
-    "contrast": 1.62
-  }
+  "timestamp": "2025-10-12T12:22:20.964Z",
+  "width": 256
 }

@@ -4,18 +4,127 @@ export type { RimField, PhaseField, SurfaceField, VolumeField } from '../fields/
 import { clampKernelSpec, cloneKernelSpec, type KernelSpec } from '../kernel/kernelSpec.js';
 import type { KuramotoTelemetrySnapshot } from '../kuramotoCore.js';
 export type { KernelSpec } from '../kernel/kernelSpec.js';
+import type { FluxOverlayFrameData } from '../qcd/overlays.js';
 import { computeTextureDiagnostics } from './textureDiagnostics.js';
 import { embedToC7 } from './su7/embed.js';
-import { buildScheduledUnitary, computeSu7Telemetry, type Su7ScheduleContext } from './su7/math.js';
+import {
+  compose_dense,
+  computeNormDeltas,
+  computeProjectorEnergy,
+  createSu7GateList,
+  enforceUnitaryGuardrail,
+  phase_gate,
+  type Su7ScheduleContext,
+} from './su7/math.js';
 import { projectSu7Vector, type Su7ProjectionResult } from './su7/projector.js';
 import { applySU7 } from './su7/unitary.js';
 import {
+  DEFAULT_SU7_TELEMETRY,
+  EMPTY_SU7_GUARDRAILS,
   createDefaultSu7RuntimeParams,
+  mergeGateAppends,
   type C7Vector,
+  type Complex,
   type Complex7x7,
+  type GateList,
+  type GateListGains,
+  type Su7GuardrailEvent,
+  type Su7GuardrailStatus,
   type Su7RuntimeParams,
   type Su7Telemetry,
 } from './su7/types.js';
+
+const SU7_VECTOR_DIM = 7;
+
+const createIdentity7 = (): Complex7x7 => {
+  const rows: Complex[][] = [];
+  for (let row = 0; row < SU7_VECTOR_DIM; row++) {
+    const cells: Complex[] = [];
+    for (let col = 0; col < SU7_VECTOR_DIM; col++) {
+      cells.push({ re: row === col ? 1 : 0, im: 0 });
+    }
+    rows.push(cells);
+  }
+  return rows as Complex7x7;
+};
+
+const createTwoPlanePulseMatrix = (
+  axisA: number,
+  axisB: number,
+  theta: number,
+  phase: number,
+): Complex7x7 => {
+  const result = createIdentity7();
+  const cos = Math.cos(theta);
+  const sin = Math.sin(theta);
+  const phaseCos = Math.cos(phase);
+  const phaseSin = Math.sin(phase);
+
+  result[axisA][axisA] = { re: cos, im: 0 };
+  result[axisB][axisB] = { re: cos, im: 0 };
+  result[axisA][axisB] = { re: -sin * phaseCos, im: -sin * phaseSin };
+  result[axisB][axisA] = { re: sin * phaseCos, im: -sin * phaseSin };
+  return result;
+};
+
+export const buildSu7UnitaryFromGains = (gains: GateListGains): Complex7x7 => {
+  let current = phase_gate(gains.phaseAngles);
+  for (let axis = 0; axis < SU7_VECTOR_DIM; axis++) {
+    const theta = gains.pulseAngles[axis];
+    if (!Number.isFinite(theta) || Math.abs(theta) <= 1e-6) continue;
+    const neighbor = (axis + 1) % SU7_VECTOR_DIM;
+    const rotation = createTwoPlanePulseMatrix(axis, neighbor, theta, gains.chiralityPhase);
+    current = compose_dense(rotation, current);
+  }
+  return current;
+};
+
+export const resolveSu7Runtime = (
+  params: Su7RuntimeParams,
+  context?: Su7ScheduleContext,
+  options?: Su7GuardrailOptions,
+): Su7RuntimeEvaluation => {
+  const shouldEmitEvents = options?.emitGuardrailEvents !== false;
+  const guardrailEvents: Su7GuardrailEvent[] = [];
+  const baseGateList = createSu7GateList(params, context);
+  const gateList =
+    params.gateAppends && params.gateAppends.length > 0
+      ? mergeGateAppends(baseGateList, params.gateAppends)
+      : mergeGateAppends(baseGateList, []);
+  const unitary = buildSu7UnitaryFromGains(gateList.gains);
+
+  if (!params.enabled || params.gain <= 1e-4) {
+    return {
+      gateList,
+      unitary,
+      telemetry: { ...DEFAULT_SU7_TELEMETRY },
+      guardrails: shouldEmitEvents ? { events: [] } : EMPTY_SU7_GUARDRAILS,
+    };
+  }
+
+  const enforcement = enforceUnitaryGuardrail(unitary, {
+    threshold: 1e-6,
+    force: options?.forceReorthon === true,
+  });
+  if (shouldEmitEvents && enforcement.event) {
+    guardrailEvents.push(enforcement.event);
+  }
+
+  const normStats = computeNormDeltas(enforcement.unitary);
+  return {
+    gateList,
+    unitary: enforcement.unitary,
+    telemetry: {
+      unitaryError: enforcement.unitaryError,
+      determinantDrift: enforcement.determinantDrift,
+      normDeltaMax: normStats.max,
+      normDeltaMean: normStats.mean,
+      projectorEnergy: computeProjectorEnergy(params.projector),
+      geodesicFallbacks: 0,
+    },
+    guardrails: shouldEmitEvents ? { events: guardrailEvents } : EMPTY_SU7_GUARDRAILS,
+  };
+};
 
 const DMT_SENS = {
   g1: 0.6,
@@ -84,6 +193,18 @@ export type ComposerConfig = {
   fields: Record<ComposerFieldId, ComposerFieldConfig>;
   dmtRouting: DmtRoutingMode;
   solverRegime: SolverRegime;
+};
+
+export type Su7GuardrailOptions = {
+  forceReorthon?: boolean;
+  emitGuardrailEvents?: boolean;
+};
+
+export type Su7RuntimeEvaluation = {
+  gateList: GateList;
+  unitary: Complex7x7;
+  telemetry: Su7Telemetry;
+  guardrails: Su7GuardrailStatus;
 };
 
 export type ComposerFieldMetrics = {
@@ -283,6 +404,20 @@ export type RainbowFrameMetrics = {
   };
   parallax: ParallaxMetrics;
   motionEnergy: MotionEnergyMetrics;
+  hopf: {
+    lenses: Array<{
+      index: number;
+      axes: [number, number];
+      base: [number, number, number];
+      fiber: number;
+      magnitude: number;
+      share: number;
+      baseMix: number;
+      fiberMix: number;
+      label?: string;
+      samples: number;
+    }>;
+  };
   composer: ComposerTelemetry;
   kuramoto: {
     orderParameter: {
@@ -390,6 +525,8 @@ export type RainbowFrameInput = {
   su7: Su7RuntimeParams;
   composer?: ComposerConfig;
   attentionHooks?: BranchAttentionHooks;
+  guardrailOptions?: Su7GuardrailOptions;
+  fluxOverlay?: FluxOverlayFrameData | null;
 };
 
 export type RainbowFrameResult = {
@@ -399,6 +536,7 @@ export type RainbowFrameResult = {
     rim?: RimDebugResult;
     surface?: SurfaceDebugResult;
   };
+  guardrails?: Su7GuardrailStatus;
 };
 
 export const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -983,6 +1121,7 @@ const TAU = 2 * Math.PI;
 const CRYSTAL_BEAT_SCALE = 12;
 const RIM_ENERGY_HIST_SCALE = 4;
 const SURFACE_HIST_BINS = 32;
+const FLUX_EPSILON = 1e-6;
 
 export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult => {
   const {
@@ -1031,6 +1170,8 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
     su7,
     composer,
     attentionHooks,
+    guardrailOptions,
+    fluxOverlay,
   } = input;
   const rimDebug = debug?.rim ?? null;
   const surfaceDebug = debug?.surface ?? null;
@@ -1041,6 +1182,20 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
   if (surfaceDebug) {
     surfaceDebug.magnitudeHist.fill(0);
   }
+
+  const fluxOverlayData =
+    fluxOverlay &&
+    fluxOverlay.width === width &&
+    fluxOverlay.height === height &&
+    fluxOverlay.energy.length === width * height &&
+    fluxOverlay.direction.length === width * height * 2
+      ? fluxOverlay
+      : null;
+  const fluxEnergyMap = fluxOverlayData?.energy ?? null;
+  const fluxDirectionMap = fluxOverlayData?.direction ?? null;
+  const fluxEnergyScale = fluxOverlayData?.energyScale ?? 0;
+  const fluxOverlayActive =
+    fluxEnergyMap != null && fluxDirectionMap != null && fluxEnergyScale > FLUX_EPSILON;
 
   const kernelSpec = clampKernelSpec(kernel);
 
@@ -1072,6 +1227,7 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
   };
 
   const su7Params: Su7RuntimeParams = su7 ?? createDefaultSu7RuntimeParams();
+  const guardrailOpts: Su7GuardrailOptions = guardrailOptions ?? {};
   let surfaceFieldActive = surface;
   const surfaceData = surface?.rgba ?? null;
   const rimField = rim ?? null;
@@ -1103,7 +1259,10 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
           curvatureStrength,
         })
       : null;
-  const su7Telemetry = computeSu7Telemetry(su7Params, su7Context ?? undefined);
+  const su7Evaluation = resolveSu7Runtime(su7Params, su7Context ?? undefined, guardrailOpts);
+  const su7Telemetry = su7Evaluation.telemetry;
+  const guardrailEventAccumulator: Su7GuardrailEvent[] =
+    guardrailOpts.emitGuardrailEvents === false ? [] : [...su7Evaluation.guardrails.events];
 
   const metrics: RainbowFrameMetrics = {
     rim: { mean: 0, max: 0, std: 0, count: 0 },
@@ -1150,6 +1309,9 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
       parallaxStd: 0,
       parallaxAbsMean: 0,
       source: 'none',
+    },
+    hopf: {
+      lenses: [],
     },
     composer: composerTelemetry,
     kuramoto: {
@@ -1326,9 +1488,9 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
   let amp = phaseField?.amp ?? null;
   let su7Vectors: C7Vector[] | null = null;
   let su7Norms: Float32Array | null = null;
-  let su7Unitary: Complex7x7 | null = null;
   const su7Projector = su7Params.projector;
   const su7Active = su7Params.enabled && su7Params.gain > 1e-4;
+  let su7Unitary: Complex7x7 | null = su7Active ? su7Evaluation.unitary : null;
   if (su7Active) {
     const embedResult = embedToC7({
       surface,
@@ -1342,7 +1504,7 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
     if (embedResult.vectors.length === width * height) {
       su7Vectors = embedResult.vectors;
       su7Norms = embedResult.norms;
-      su7Unitary = buildScheduledUnitary(su7Params, su7Context ?? undefined);
+      su7Unitary = su7Evaluation.unitary;
     }
   }
   let su7DecimationStride = 1;
@@ -1371,6 +1533,10 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
   let su7NormSampleCount = 0;
   let su7EnergySum = 0;
   let su7EnergySampleCount = 0;
+  let autoGainBeforeSum = 0;
+  let autoGainAfterSum = 0;
+  let autoGainTargetSum = 0;
+  let autoGainSamples = 0;
   const ke = clampKernelSpec(kEff(kernelSpec, dmt));
   const effectiveBlend = clamp01(blend + ke.transparency * 0.5);
   const eps = 1e-6;
@@ -1748,6 +1914,22 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
   let surfaceMax = 0;
   let surfaceCount = 0;
 
+  const hopfAccum: Array<{
+    axes: [number, number];
+    label?: string;
+    baseX: number;
+    baseY: number;
+    baseZ: number;
+    baseWeight: number;
+    fiberCos: number;
+    fiberSin: number;
+    magnitudeSum: number;
+    shareSum: number;
+    baseMixSum: number;
+    fiberMixSum: number;
+    samples: number;
+  }> = [];
+
   let debugEnergyMin = Number.POSITIVE_INFINITY;
   let debugEnergyMax = 0;
   let debugHueMin = Number.POSITIVE_INFINITY;
@@ -1805,6 +1987,31 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
         const baseVector = su7Vectors[p];
         const baseNorm = su7Norms[p] ?? 0;
         if (baseVector && baseNorm > 0) {
+          let fluxOverlaySample:
+            | {
+                energy: number;
+                energyScale: number;
+                dirX: number;
+                dirY: number;
+              }
+            | undefined;
+          if (fluxOverlayActive) {
+            const energyValue = fluxEnergyMap[p];
+            if (energyValue > FLUX_EPSILON) {
+              const dirIndex = p * 2;
+              const dirX = fluxDirectionMap![dirIndex];
+              const dirY = fluxDirectionMap![dirIndex + 1];
+              const dirMag = Math.hypot(dirX, dirY);
+              if (dirMag > FLUX_EPSILON) {
+                fluxOverlaySample = {
+                  energy: energyValue,
+                  energyScale: fluxEnergyScale,
+                  dirX,
+                  dirY,
+                };
+              }
+            }
+          }
           const strideEligible =
             su7DecimationStride <= 1 ||
             (x % su7DecimationStride === 0 && y % su7DecimationStride === 0);
@@ -1835,10 +2042,18 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
               gain: su7Params.gain,
               frameGain,
               baseColor: baseColorSrgb,
+              fluxOverlay: fluxOverlaySample,
             });
             if (su7Projection) {
               su7EnergySum += su7Projection.energy;
               su7EnergySampleCount += 1;
+              if (su7Projection.guardrailEvent) {
+                const event = su7Projection.guardrailEvent;
+                autoGainBeforeSum += event.before;
+                autoGainAfterSum += event.after;
+                autoGainTargetSum += event.target;
+                autoGainSamples += event.sampleCount;
+              }
             }
           }
           if (su7Projection?.composerWeights) {
@@ -1854,6 +2069,45 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
             }
             if (weights.volume != null) {
               composerWeightVolume = clamp(composerWeightVolume * weights.volume, 0.05, 3);
+            }
+          }
+          if (su7Projection?.hopf) {
+            for (const lens of su7Projection.hopf) {
+              let entry = hopfAccum[lens.index];
+              if (!entry) {
+                entry = {
+                  axes: lens.axes,
+                  label: lens.label,
+                  baseX: 0,
+                  baseY: 0,
+                  baseZ: 0,
+                  baseWeight: 0,
+                  fiberCos: 0,
+                  fiberSin: 0,
+                  magnitudeSum: 0,
+                  shareSum: 0,
+                  baseMixSum: 0,
+                  fiberMixSum: 0,
+                  samples: 0,
+                };
+                hopfAccum[lens.index] = entry;
+              }
+              entry.axes = lens.axes;
+              if (lens.label !== undefined) {
+                entry.label = lens.label;
+              }
+              const weight = Math.max(lens.magnitude, 0);
+              entry.baseX += lens.base[0] * weight;
+              entry.baseY += lens.base[1] * weight;
+              entry.baseZ += lens.base[2] * weight;
+              entry.baseWeight += weight;
+              entry.fiberCos += Math.cos(lens.fiber) * weight;
+              entry.fiberSin += Math.sin(lens.fiber) * weight;
+              entry.magnitudeSum += lens.magnitude;
+              entry.shareSum += lens.share;
+              entry.baseMixSum += lens.baseMix;
+              entry.fiberMixSum += lens.fiberMix;
+              entry.samples += 1;
             }
           }
         }
@@ -2514,6 +2768,34 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
     count: warpCount,
   };
 
+  const hopfSummary: RainbowFrameMetrics['hopf']['lenses'] = [];
+  for (let index = 0; index < hopfAccum.length; index++) {
+    const entry = hopfAccum[index];
+    if (!entry || entry.samples === 0) {
+      continue;
+    }
+    const baseWeight = entry.baseWeight > 1e-9 ? entry.baseWeight : 1;
+    const baseVec = [
+      clamp(entry.baseX / baseWeight, -1, 1),
+      clamp(entry.baseY / baseWeight, -1, 1),
+      clamp(entry.baseZ / baseWeight, -1, 1),
+    ] as [number, number, number];
+    const fiberAngle = entry.baseWeight > 0 ? Math.atan2(entry.fiberSin, entry.fiberCos) : 0;
+    hopfSummary.push({
+      index,
+      axes: entry.axes,
+      label: entry.label,
+      base: baseVec,
+      fiber: fiberAngle,
+      magnitude: entry.samples > 0 ? entry.magnitudeSum / entry.samples : 0,
+      share: entry.samples > 0 ? entry.shareSum / entry.samples : 0,
+      baseMix: entry.samples > 0 ? entry.baseMixSum / entry.samples : 0,
+      fiberMix: entry.samples > 0 ? entry.fiberMixSum / entry.samples : 0,
+      samples: entry.samples,
+    });
+  }
+  metrics.hopf.lenses = hopfSummary;
+
   const parallaxStats = finalizeStats(parallaxKSum, parallaxKSumSq, parallaxSamples);
   let radialSlope = 0;
   if (parallaxSamples > 1) {
@@ -2609,6 +2891,16 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
     metrics.su7.projectorEnergy = 0;
   }
 
+  if (guardrailOpts.emitGuardrailEvents !== false && autoGainSamples > 0) {
+    guardrailEventAccumulator.push({
+      kind: 'autoGain',
+      before: autoGainBeforeSum / autoGainSamples,
+      after: autoGainAfterSum / autoGainSamples,
+      target: autoGainTargetSum / autoGainSamples,
+      sampleCount: autoGainSamples,
+    });
+  }
+
   const obs = obsCount > 0 ? clamp(obsSum / obsCount, 0.001, 10) : clamp(lastObs, 0.001, 10);
   let debugResult: RainbowFrameResult['debug'];
   if (rimDebug || surfaceDebug) {
@@ -2633,5 +2925,13 @@ export const renderRainbowFrame = (input: RainbowFrameInput): RainbowFrameResult
     }
   }
 
-  return { metrics, obsAverage: obs, debug: debugResult };
+  return {
+    metrics,
+    obsAverage: obs,
+    debug: debugResult,
+    guardrails:
+      guardrailOpts.emitGuardrailEvents === false
+        ? undefined
+        : { events: guardrailEventAccumulator },
+  };
 };

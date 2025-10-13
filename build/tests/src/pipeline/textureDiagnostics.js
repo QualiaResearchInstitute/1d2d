@@ -14,7 +14,7 @@ const DEFAULT_RESULT = {
     orientationMean: 0,
     orientationStd: 0,
     divisiveMean: 0,
-    divisiveStd: 0
+    divisiveStd: 0,
 };
 const toGray = (surface) => {
     const { width, height } = surface.resolution;
@@ -248,6 +248,6 @@ export const computeTextureDiagnostics = (surface, config) => {
         divisiveMean: divisiveStats.mean,
         divisiveStd: divisiveStats.std,
         wallpapericityMap,
-        beatEnvelopeMap
+        beatEnvelopeMap,
     };
 };

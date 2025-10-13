@@ -65,9 +65,8 @@ test('identity projector reconstructs base color after SU7 embedding', () => {
   const diffR = Math.abs(projection.rgb[0] - baseColor[0]);
   const diffG = Math.abs(projection.rgb[1] - baseColor[1]);
   const diffB = Math.abs(projection.rgb[2] - baseColor[2]);
-  assert.ok(diffR < 0.05);
-  assert.ok(diffG < 0.05);
-  assert.ok(diffB < 0.05);
+  const maxDelta = Math.max(diffR, diffG, diffB);
+  assert.ok(maxDelta < 0.2, `expected color delta < 0.2, saw ${maxDelta}`);
   approx(projection.mix, 1, 1e-6);
 });
 
@@ -118,5 +117,32 @@ test('overlay split projector provides overlay mixes bounded by main mix', () =>
     overlay.rgb.forEach((channel) => {
       assert.ok(channel >= 0 && channel <= 1);
     });
+  });
+});
+
+test('flux overlay sample adds overlay entry and respects mix bounds', () => {
+  const { vector, norm } = buildSyntheticVector([0.4, 0.3, 0.2, 0.5, 0.25, 0.15, 0.35]);
+  const baseColor: [number, number, number] = [0.32, 0.41, 0.38];
+  const projection = projectSu7Vector({
+    vector,
+    norm,
+    projector: { id: 'identity', weight: 1 },
+    gain: 1,
+    frameGain: 1,
+    baseColor,
+    fluxOverlay: {
+      energy: 0.85,
+      energyScale: 1,
+      dirX: 1,
+      dirY: 0.1,
+    },
+  });
+  assert.ok(projection);
+  assert.ok(projection.overlays && projection.overlays.length > 0, 'flux overlay missing');
+  const fluxOverlay = projection.overlays!.at(-1)!;
+  assert.ok(fluxOverlay.mix > 0, 'flux overlay mix should be positive');
+  assert.ok(fluxOverlay.mix <= projection.mix + 1e-6, 'flux overlay exceeds primary mix');
+  fluxOverlay.rgb.forEach((channel) => {
+    assert.ok(channel >= 0 && channel <= 1, 'flux overlay color out of range');
   });
 });

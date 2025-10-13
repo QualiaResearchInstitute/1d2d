@@ -1,22 +1,22 @@
-import test from "node:test";
-import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { ingestVolumeRecording, createVolumeStubState, stepVolumeStub, snapshotVolumeStub } from "../src/volumeStub.js";
-import { renderRainbowFrame } from "../src/pipeline/rainbowFrame.js";
-import { createDefaultSu7RuntimeParams } from "../src/pipeline/su7/types.js";
-import { createKernelSpec } from "../src/kernel/kernelSpec.js";
-import { makeResolution } from "../src/fields/contracts.js";
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { ingestVolumeRecording, createVolumeStubState, stepVolumeStub, snapshotVolumeStub, } from '../src/volumeStub.js';
+import { renderRainbowFrame } from '../src/pipeline/rainbowFrame.js';
+import { createDefaultSu7RuntimeParams } from '../src/pipeline/su7/types.js';
+import { createKernelSpec } from '../src/kernel/kernelSpec.js';
+import { makeResolution, } from '../src/fields/contracts.js';
 const readFixture = async () => {
-    const fixturePath = join(process.cwd(), "tests", "fixtures", "volume-preroll.json");
-    const raw = await readFile(fixturePath, "utf8");
+    const fixturePath = join(process.cwd(), 'tests', 'fixtures', 'volume-preroll.json');
+    const raw = await readFile(fixturePath, 'utf8');
     const parsed = JSON.parse(raw);
     const recording = {
         width: parsed.meta.width,
         height: parsed.meta.height,
         phase: parsed.phase,
         depth: parsed.depth,
-        intensity: parsed.intensity
+        intensity: parsed.intensity,
     };
     return { recording, meta: parsed.meta };
 };
@@ -34,9 +34,9 @@ const makeSurfaceField = (width, height) => {
         }
     }
     return {
-        kind: "surface",
+        kind: 'surface',
         resolution: makeResolution(width, height),
-        rgba
+        rgba,
     };
 };
 const makeRimField = (width, height) => {
@@ -57,14 +57,14 @@ const makeRimField = (width, height) => {
         }
     }
     return {
-        kind: "rim",
+        kind: 'rim',
         resolution: makeResolution(width, height),
         gx,
         gy,
-        mag
+        mag,
     };
 };
-test("volume stub matches prerecorded fixture", async () => {
+test('volume stub matches prerecorded fixture', async () => {
     const { recording, meta } = await readFixture();
     const volume = ingestVolumeRecording(recording);
     const stub = createVolumeStubState(meta.width, meta.height, meta.seed);
@@ -86,7 +86,7 @@ const CANONICAL_KERNEL = createKernelSpec({
     Q: 3.8,
     anisotropy: 0.7,
     chirality: 1.1,
-    transparency: 0.32
+    transparency: 0.32,
 });
 const makeInput = (volume, surface, rim) => {
     const total = surface.resolution.texels;
@@ -113,10 +113,10 @@ const makeInput = (volume, surface, rim) => {
         alive: false,
         phasePin: true,
         edgeThreshold: 0.18,
-        wallpaperGroup: "off",
+        wallpaperGroup: 'off',
         surfEnabled: true,
         orientationAngles: [0, Math.PI / 2],
-        thetaMode: "gradient",
+        thetaMode: 'gradient',
         thetaGlobal: 0,
         polBins: 16,
         jitter: 0.4,
@@ -130,24 +130,24 @@ const makeInput = (volume, surface, rim) => {
             kurToOrientation: 0,
             kurToChirality: 0,
             volumePhaseToHue: 1.4,
-            volumeDepthToWarp: 1.2
+            volumeDepthToWarp: 1.2,
         },
         sigma: 3.2,
         contrast: 1.15,
         rimAlpha: 1,
         rimEnabled: true,
-        displayMode: "color",
+        displayMode: 'color',
         surfaceBlend: 0.38,
-        surfaceRegion: "both",
+        surfaceRegion: 'both',
         warpAmp: 1.4,
         curvatureStrength: 0,
-        curvatureMode: "poincare",
+        curvatureMode: 'poincare',
         kurEnabled: false,
         debug: undefined,
-        su7: createDefaultSu7RuntimeParams()
+        su7: createDefaultSu7RuntimeParams(),
     };
 };
-test("volume feed modulates pipeline outputs", async () => {
+test('volume feed modulates pipeline outputs', async () => {
     const { recording, meta } = await readFixture();
     const volume = ingestVolumeRecording(recording);
     const surface = makeSurfaceField(meta.width, meta.height);

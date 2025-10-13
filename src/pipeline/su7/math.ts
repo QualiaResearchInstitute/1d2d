@@ -1,13 +1,22 @@
 import {
   DEFAULT_SU7_TELEMETRY,
   cloneComplex7x7,
+  cloneSu7ProjectorDescriptor,
+  cloneSu7Schedule,
   createDefaultSu7RuntimeParams,
   type Complex,
   type Complex7x7,
+  type Gate,
+  type GateList,
+  type GateListSnapshot,
+  type GatePhaseVector,
+  type Su7GuardrailEvent,
   type Su7ProjectorDescriptor,
   type Su7RuntimeParams,
+  type Su7Schedule,
   type Su7Telemetry,
 } from './types.js';
+import { su3_embed as embedSu3Block, type Complex3x3 } from '../../qcd/su3.js';
 
 export type Su7ScheduleFlowContext = {
   angle: number;
@@ -36,6 +45,18 @@ const createIdentity7 = (): Complex7x7 => {
     const row: Complex[] = [];
     for (let j = 0; j < 7; j++) {
       row.push({ re: i === j ? 1 : 0, im: 0 });
+    }
+    rows.push(row);
+  }
+  return rows as Complex7x7;
+};
+
+const createZero7 = (): Complex7x7 => {
+  const rows: Complex[][] = [];
+  for (let i = 0; i < 7; i++) {
+    const row: Complex[] = [];
+    for (let j = 0; j < 7; j++) {
+      row.push({ re: 0, im: 0 });
     }
     rows.push(row);
   }
@@ -73,6 +94,16 @@ const complexDiv = (a: Complex, b: Complex): Complex => {
   return { re: num.re / denom, im: num.im / denom };
 };
 
+const complexScale = (value: Complex, scalar: number): Complex => ({
+  re: value.re * scalar,
+  im: value.im * scalar,
+});
+
+const complexFromPolar = (magnitude: number, angle: number): Complex => ({
+  re: magnitude * Math.cos(angle),
+  im: magnitude * Math.sin(angle),
+});
+
 const conjugateTranspose = (matrix: Complex7x7): Complex7x7 => {
   const result = createIdentity7();
   for (let i = 0; i < 7; i++) {
@@ -97,6 +128,101 @@ const matrixMultiply = (a: Complex7x7, b: Complex7x7): Complex7x7 => {
   return result;
 };
 
+const addMatrices = (a: Complex7x7, b: Complex7x7): Complex7x7 => {
+  const result = createZero7();
+  for (let row = 0; row < 7; row++) {
+    for (let col = 0; col < 7; col++) {
+      const lhs = a[row][col];
+      const rhs = b[row][col];
+      result[row][col] = { re: lhs.re + rhs.re, im: lhs.im + rhs.im };
+    }
+  }
+  return result;
+};
+
+const subtractMatrices = (a: Complex7x7, b: Complex7x7): Complex7x7 => {
+  const result = createZero7();
+  for (let row = 0; row < 7; row++) {
+    for (let col = 0; col < 7; col++) {
+      const lhs = a[row][col];
+      const rhs = b[row][col];
+      result[row][col] = { re: lhs.re - rhs.re, im: lhs.im - rhs.im };
+    }
+  }
+  return result;
+};
+
+const scaleMatrix = (matrix: Complex7x7, scalar: number): Complex7x7 => {
+  const result = createZero7();
+  for (let row = 0; row < 7; row++) {
+    for (let col = 0; col < 7; col++) {
+      const entry = matrix[row][col];
+      result[row][col] = { re: entry.re * scalar, im: entry.im * scalar };
+    }
+  }
+  return result;
+};
+
+const addScaledIdentity = (matrix: Complex7x7, scalar: number): Complex7x7 => {
+  const result = cloneComplex7x7(matrix);
+  for (let i = 0; i < 7; i++) {
+    result[i][i] = complexAdd(result[i][i], { re: scalar, im: 0 });
+  }
+  return result;
+};
+
+const linearCombination = (
+  terms: readonly { matrix: Complex7x7; weight: number }[],
+): Complex7x7 => {
+  const result = createZero7();
+  for (const { matrix, weight } of terms) {
+    if (!Number.isFinite(weight) || weight === 0) continue;
+    for (let row = 0; row < 7; row++) {
+      for (let col = 0; col < 7; col++) {
+        const entry = matrix[row][col];
+        result[row][col].re += entry.re * weight;
+        result[row][col].im += entry.im * weight;
+      }
+    }
+  }
+  return result;
+};
+
+const matrixOneNorm = (matrix: Complex7x7): number => {
+  let max = 0;
+  for (let col = 0; col < 7; col++) {
+    let sum = 0;
+    for (let row = 0; row < 7; row++) {
+      const entry = matrix[row][col];
+      sum += Math.hypot(entry.re, entry.im);
+    }
+    if (sum > max) {
+      max = sum;
+    }
+  }
+  return max;
+};
+
+const makeSkewHermitian = (matrix: Complex7x7): Complex7x7 => {
+  const adjoint = conjugateTranspose(matrix);
+  const result = createZero7();
+  for (let row = 0; row < 7; row++) {
+    for (let col = 0; col < 7; col++) {
+      const diff = complexSub(matrix[row][col], adjoint[row][col]);
+      result[row][col] = complexScale(diff, 0.5);
+    }
+  }
+  return result;
+};
+
+const computeTrace = (matrix: Complex7x7): Complex => {
+  let trace: Complex = { re: 0, im: 0 };
+  for (let i = 0; i < 7; i++) {
+    trace = complexAdd(trace, matrix[i][i]);
+  }
+  return trace;
+};
+
 const clamp01 = (value: number): number =>
   Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
 
@@ -107,6 +233,45 @@ const wrapAngle = (theta: number): number => {
   while (t > Math.PI) t -= TAU;
   return t;
 };
+
+const VECTOR_DIM = 7;
+
+const safeNumber = (value: number): number => (Number.isFinite(value) ? value : 0);
+
+const createPhaseAccumulator = (): number[] => new Array(VECTOR_DIM).fill(0);
+
+const toGatePhaseVector = (values: ArrayLike<number>): GatePhaseVector => {
+  const result: number[] = [];
+  for (let i = 0; i < VECTOR_DIM; i++) {
+    const raw = values[i] as number | undefined;
+    result.push(safeNumber(raw ?? 0));
+  }
+  return result as GatePhaseVector;
+};
+
+const finalizePhaseAngles = (phases: number[]): GatePhaseVector => {
+  const total = phases.reduce((acc, value) => acc + value, 0);
+  const mean = phases.length > 0 ? total / phases.length : 0;
+  const wrapped = phases.map((value) => wrapAngle(value - mean));
+  return toGatePhaseVector(wrapped);
+};
+
+const finalizePulseAngles = (pulses: number[]): GatePhaseVector =>
+  toGatePhaseVector(pulses.map((value) => safeNumber(value)));
+
+const createPhaseGate = (phases: number[], label?: string): Gate => ({
+  kind: 'phase',
+  label,
+  phases: toGatePhaseVector(phases),
+});
+
+const createPulseGate = (axis: number, theta: number, phase: number, label?: string): Gate => ({
+  kind: 'pulse',
+  axis,
+  theta: safeNumber(theta),
+  phase: safeNumber(phase),
+  label,
+});
 
 const orthonormalize = (matrix: Complex7x7): Complex7x7 => {
   const result = createIdentity7();
@@ -138,7 +303,7 @@ const orthonormalize = (matrix: Complex7x7): Complex7x7 => {
   return result;
 };
 
-const projectToSpecialUnitary = (matrix: Complex7x7): Complex7x7 => {
+export const projectToSpecialUnitary = (matrix: Complex7x7): Complex7x7 => {
   const orthonormal = orthonormalize(matrix);
   const det = computeDeterminant(orthonormal);
   const magnitude = complexAbs(det);
@@ -220,7 +385,7 @@ const hashLabel = (label: string): number => {
   return h >>> 0;
 };
 
-const computeDeterminant = (matrix: Complex7x7): Complex => {
+export const computeDeterminant = (matrix: Complex7x7): Complex => {
   const working = cloneComplex7x7(matrix);
   let sign = 1;
   let det: Complex = { re: 1, im: 0 };
@@ -264,6 +429,71 @@ const computeDeterminant = (matrix: Complex7x7): Complex => {
   }
 
   return det;
+};
+
+const solveLinear = (lhs: Complex7x7, rhs: Complex7x7): Complex7x7 => {
+  const a = cloneComplex7x7(lhs);
+  const result = cloneComplex7x7(rhs);
+
+  for (let pivotIndex = 0; pivotIndex < 7; pivotIndex++) {
+    let pivotRow = pivotIndex;
+    let pivotMag = complexAbs2(a[pivotIndex][pivotIndex]);
+    for (let candidate = pivotIndex + 1; candidate < 7; candidate++) {
+      const magnitude = complexAbs2(a[candidate][pivotIndex]);
+      if (magnitude > pivotMag) {
+        pivotMag = magnitude;
+        pivotRow = candidate;
+      }
+    }
+
+    if (pivotMag <= EPSILON) {
+      a[pivotIndex][pivotIndex] = { re: 1, im: 0 };
+      pivotMag = 1;
+    }
+
+    if (pivotRow !== pivotIndex) {
+      const tmpRow = a[pivotIndex];
+      a[pivotIndex] = a[pivotRow];
+      a[pivotRow] = tmpRow;
+      const tmpRes = result[pivotIndex];
+      result[pivotIndex] = result[pivotRow];
+      result[pivotRow] = tmpRes;
+    }
+
+    const pivot = a[pivotIndex][pivotIndex];
+
+    for (let row = pivotIndex + 1; row < 7; row++) {
+      const entry = a[row][pivotIndex];
+      if (complexAbs2(entry) <= EPSILON) {
+        a[row][pivotIndex] = { re: 0, im: 0 };
+        continue;
+      }
+      const factor = complexDiv(entry, pivot);
+      for (let col = pivotIndex; col < 7; col++) {
+        a[row][col] = complexSub(a[row][col], complexMul(factor, a[pivotIndex][col]));
+      }
+      for (let col = 0; col < 7; col++) {
+        result[row][col] = complexSub(
+          result[row][col],
+          complexMul(factor, result[pivotIndex][col]),
+        );
+      }
+      a[row][pivotIndex] = { re: 0, im: 0 };
+    }
+  }
+
+  for (let row = 6; row >= 0; row--) {
+    const pivot = a[row][row];
+    for (let col = 0; col < 7; col++) {
+      let value = result[row][col];
+      for (let k = row + 1; k < 7; k++) {
+        value = complexSub(value, complexMul(a[row][k], result[k][col]));
+      }
+      result[row][col] = complexDiv(value, pivot);
+    }
+  }
+
+  return result;
 };
 
 const columnNormDeltas = (matrix: Complex7x7): { max: number; mean: number } => {
@@ -337,53 +567,456 @@ export const computeProjectorEnergy = (descriptor: Su7ProjectorDescriptor): numb
   return computeProjectorEnergyInternal(projector, weight);
 };
 
-const buildScheduledUnitaryLegacy = (params: Su7RuntimeParams): Complex7x7 => {
-  const base = createIdentity7();
-  const phases = new Float64Array(7);
-  const rng = mulberry32((params.seed ?? 0) >>> 0);
-  const fallback = createDefaultSu7RuntimeParams().schedule;
-  const schedule = params.schedule.length ? params.schedule : fallback;
-
-  schedule.forEach((stage) => {
-    const spread = Number.isFinite(stage.spread ?? NaN) ? (stage.spread as number) : 1;
-    const gain = Number.isFinite(stage.gain) ? stage.gain : 0;
-    if (!Number.isFinite(gain) || gain === 0) return;
-    if (typeof stage.index === 'number' && Number.isFinite(stage.index)) {
-      const target = ((Math.trunc(stage.index) % 7) + 7) % 7;
-      phases[target] += gain * spread;
-    } else {
-      for (let column = 0; column < 7; column++) {
-        const jitter = (rng() - 0.5) * spread * 0.05;
-        phases[column] += gain * (1 + (column - 3) * 0.02) + jitter;
-      }
-    }
-  });
-
-  const baseGain = Number.isFinite(params.gain) ? params.gain : 1;
-  for (let i = 0; i < 7; i++) {
-    phases[i] += baseGain;
+export const su2_embed = (axisA: number, axisB: number, theta: number, phi: number): Complex7x7 => {
+  const i = Math.trunc(Number.isFinite(axisA) ? axisA : 0);
+  const j = Math.trunc(Number.isFinite(axisB) ? axisB : 0);
+  if (i === j || i < 0 || j < 0 || i >= 7 || j >= 7) {
+    return createIdentity7();
   }
+  const angle = Number.isFinite(theta) ? theta : 0;
+  const phaseAngle = Number.isFinite(phi) ? phi : 0;
+  const result = createIdentity7();
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const phase = complexFromPolar(1, phaseAngle);
 
-  const meanPhase = phases.reduce((acc, value) => acc + value, 0) / phases.length;
-  for (let i = 0; i < 7; i++) {
-    const theta = wrapAngle(phases[i] - meanPhase);
-    base[i][i] = { re: Math.cos(theta), im: Math.sin(theta) };
-  }
-
-  return base;
+  result[i][i] = { re: cos, im: 0 };
+  result[j][j] = { re: cos, im: 0 };
+  result[i][j] = { re: -sin * phase.re, im: -sin * phase.im };
+  result[j][i] = { re: sin * phase.re, im: -sin * phase.im };
+  return result;
 };
 
-const buildScheduledUnitaryAdvanced = (
-  params: Su7RuntimeParams,
-  context: Su7ScheduleContext,
-): Complex7x7 => {
-  const axisAngles = new Float64Array(7);
+export const phase_gate = (phases: ArrayLike<number>): Complex7x7 => {
+  const diagonal = createIdentity7();
+  const buffer = new Float64Array(7);
+  let sum = 0;
   for (let i = 0; i < 7; i++) {
-    axisAngles[i] = (i / 7) * TAU;
+    const value = i < phases.length ? phases[i] : 0;
+    const finite = Number.isFinite(value) ? (value as number) : 0;
+    buffer[i] = finite;
+    sum += finite;
+  }
+  const mean = sum / 7;
+  for (let i = 0; i < 7; i++) {
+    const theta = wrapAngle(buffer[i] - mean);
+    diagonal[i][i] = { re: Math.cos(theta), im: Math.sin(theta) };
+  }
+  return diagonal;
+};
+
+export const compose_dense = (lhs: Complex7x7, rhs: Complex7x7): Complex7x7 => {
+  const result = createZero7();
+  const rhsRe = new Float64Array(49);
+  const rhsIm = new Float64Array(49);
+
+  for (let col = 0; col < 7; col++) {
+    for (let row = 0; row < 7; row++) {
+      const index = col * 7 + row;
+      const entry = rhs[row][col];
+      rhsRe[index] = entry.re;
+      rhsIm[index] = entry.im;
+    }
   }
 
-  const fallback = createDefaultSu7RuntimeParams().schedule;
-  const schedule = params.schedule.length ? params.schedule : fallback;
+  for (let row = 0; row < 7; row++) {
+    const lhsRow = lhs[row];
+    for (let col = 0; col < 7; col++) {
+      let sumRe = 0;
+      let sumIm = 0;
+      for (let k = 0; k < 7; k++) {
+        const a = lhsRow[k];
+        const index = col * 7 + k;
+        const br = rhsRe[index];
+        const bi = rhsIm[index];
+        sumRe += a.re * br - a.im * bi;
+        sumIm += a.re * bi + a.im * br;
+      }
+      result[row][col] = { re: sumRe, im: sumIm };
+    }
+  }
+  return result;
+};
+
+export const su3_embed = (block: Complex3x3): Complex7x7 => embedSu3Block(block);
+
+const polarInverseSqrt = (matrix: Complex7x7): Complex7x7 => {
+  const hermitian = matrix;
+  let trace = 0;
+  for (let i = 0; i < 7; i++) {
+    trace += hermitian[i][i].re;
+  }
+  let scale = trace / 7;
+  if (!Number.isFinite(scale) || scale <= 0) {
+    scale = 1;
+  }
+  let Y = scaleMatrix(hermitian, 1 / scale);
+  let Z = createIdentity7();
+  let residual = Number.POSITIVE_INFINITY;
+
+  for (let iter = 0; iter < 12; iter++) {
+    const YZ = compose_dense(Z, Y);
+    const correction = createZero7();
+    for (let row = 0; row < 7; row++) {
+      for (let col = 0; col < 7; col++) {
+        const entry = YZ[row][col];
+        correction[row][col] = { re: -entry.re, im: -entry.im };
+      }
+      correction[row][row].re += 3;
+    }
+    const halfCorrection = scaleMatrix(correction, 0.5);
+    const nextY = compose_dense(Y, halfCorrection);
+    const nextZ = compose_dense(halfCorrection, Z);
+    const gram = compose_dense(conjugateTranspose(nextY), nextY);
+    const error = frobeniusNorm(matrixMinusIdentity(gram));
+    Y = nextY;
+    Z = nextZ;
+    if (error < 1e-10 || Math.abs(error - residual) < 1e-12) {
+      break;
+    }
+    residual = error;
+  }
+
+  return scaleMatrix(Z, 1 / Math.sqrt(scale));
+};
+
+export const polar_reunitarize = (matrix: Complex7x7): Complex7x7 => {
+  const base = cloneComplex7x7(matrix);
+  const gram = compose_dense(conjugateTranspose(base), base);
+  const invSqrt = polarInverseSqrt(gram);
+  let unitary = compose_dense(base, invSqrt);
+
+  const gramCheck = compose_dense(conjugateTranspose(unitary), unitary);
+  const deviation = frobeniusNorm(matrixMinusIdentity(gramCheck));
+  if (deviation > 1e-10) {
+    unitary = projectToSpecialUnitary(unitary);
+  }
+
+  const det = computeDeterminant(unitary);
+  const phase = -Math.atan2(det.im, det.re) / 7;
+  const correction = complexFromPolar(1, phase);
+  for (let row = 0; row < 7; row++) {
+    unitary[row][6] = complexMul(unitary[row][6], correction);
+  }
+  return unitary;
+};
+
+const matrixSquareRootUnitary = (unitary: Complex7x7): Complex7x7 => {
+  let Y = cloneComplex7x7(unitary);
+  let Z = createIdentity7();
+  const identity = createIdentity7();
+
+  for (let iter = 0; iter < 12; iter++) {
+    const Yinv = solveLinear(Y, identity);
+    const Zinv = solveLinear(Z, identity);
+    const nextY = scaleMatrix(addMatrices(Y, Zinv), 0.5);
+    const nextZ = scaleMatrix(addMatrices(Z, Yinv), 0.5);
+    const diffY = frobeniusNorm(subtractMatrices(nextY, Y));
+    const diffZ = frobeniusNorm(subtractMatrices(nextZ, Z));
+    Y = nextY;
+    Z = nextZ;
+    if (diffY < 1e-10 && diffZ < 1e-10) {
+      break;
+    }
+  }
+
+  return projectToSpecialUnitary(Y);
+};
+
+export const logm_su = (matrix: Complex7x7): Complex7x7 => {
+  let unitary = polar_reunitarize(matrix);
+  const identity = createIdentity7();
+  let scaling = 0;
+
+  while (scaling < 10) {
+    const delta = subtractMatrices(unitary, identity);
+    const norm = frobeniusNorm(delta);
+    if (norm < 0.55) {
+      break;
+    }
+    unitary = matrixSquareRootUnitary(unitary);
+    scaling += 1;
+  }
+
+  const UplusI = addScaledIdentity(unitary, 1);
+  const UminusI = subtractMatrices(unitary, identity);
+  const inverse = solveLinear(UplusI, identity);
+  let K = compose_dense(UminusI, inverse);
+  K = makeSkewHermitian(K);
+
+  const K2 = compose_dense(K, K);
+  let term = cloneComplex7x7(K);
+  let result = scaleMatrix(term, 2);
+  const maxTerms = 18;
+  for (let n = 1; n < maxTerms; n++) {
+    term = compose_dense(term, K2);
+    const coeff = 2 / (2 * n + 1);
+    const contribution = scaleMatrix(term, coeff);
+    result = addMatrices(result, contribution);
+    const magnitude = frobeniusNorm(contribution);
+    if (magnitude < 1e-10) {
+      break;
+    }
+  }
+
+  const scaleFactor = 1 << scaling;
+  if (scaling > 0) {
+    result = scaleMatrix(result, scaleFactor);
+  }
+
+  result = makeSkewHermitian(result);
+  const trace = computeTrace(result);
+  const mean = { re: trace.re / 7, im: trace.im / 7 };
+  for (let i = 0; i < 7; i++) {
+    result[i][i] = complexSub(result[i][i], mean);
+  }
+  return result;
+};
+
+export const expm_su = (skew: Complex7x7): Complex7x7 => {
+  const input = makeSkewHermitian(skew);
+  const trace = computeTrace(input);
+  const mean = { re: trace.re / 7, im: trace.im / 7 };
+  for (let i = 0; i < 7; i++) {
+    input[i][i] = complexSub(input[i][i], mean);
+  }
+
+  const theta13 = 2.29;
+  const norm = matrixOneNorm(input);
+  let s = 0;
+  if (norm > theta13) {
+    s = Math.max(0, Math.ceil(Math.log2(norm / theta13)));
+  }
+  const scale = 1 / (1 << s);
+  const scaled = scaleMatrix(input, scale);
+
+  const X2 = compose_dense(scaled, scaled);
+  const X4 = compose_dense(X2, X2);
+  const X6 = compose_dense(X4, X2);
+
+  const b = [
+    64764752532480000, 32382376266240000, 7771770303897600, 1187353796428800, 129060195264000,
+    10559470521600, 670442572800, 33522128640, 1323241920, 40840800, 960960, 16380, 182, 1,
+  ];
+
+  const identity = createIdentity7();
+  const innerU = linearCombination([
+    { matrix: X6, weight: b[13] },
+    { matrix: X4, weight: b[11] },
+    { matrix: X2, weight: b[9] },
+  ]);
+  const X6InnerU = compose_dense(X6, innerU);
+  const polyU = linearCombination([
+    { matrix: X6InnerU, weight: 1 },
+    { matrix: X6, weight: b[7] },
+    { matrix: X4, weight: b[5] },
+    { matrix: X2, weight: b[3] },
+    { matrix: identity, weight: b[1] },
+  ]);
+  const U = compose_dense(scaled, polyU);
+
+  const innerV = linearCombination([
+    { matrix: X6, weight: b[12] },
+    { matrix: X4, weight: b[10] },
+    { matrix: X2, weight: b[8] },
+  ]);
+  const X6InnerV = compose_dense(X6, innerV);
+  const V = linearCombination([
+    { matrix: X6InnerV, weight: 1 },
+    { matrix: X6, weight: b[6] },
+    { matrix: X4, weight: b[4] },
+    { matrix: X2, weight: b[2] },
+    { matrix: identity, weight: b[0] },
+  ]);
+
+  const VminusU = subtractMatrices(V, U);
+  const VplusU = addMatrices(V, U);
+  let result = solveLinear(VminusU, VplusU);
+
+  for (let i = 0; i < s; i++) {
+    result = compose_dense(result, result);
+  }
+
+  return polar_reunitarize(result);
+};
+
+type ResolvedScheduleStage = {
+  gain: number;
+  spread: number;
+  index: number | null;
+  phase: number | null;
+  label?: string;
+  lane: string;
+  macro: boolean;
+  time: number;
+  length: number;
+  order: number;
+};
+
+const normalizeLaneId = (value: string | undefined): string => {
+  if (!value) {
+    return 'main';
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed.toLowerCase() : 'main';
+};
+
+const resolveScheduleStages = (schedule: Su7Schedule): ResolvedScheduleStage[] => {
+  const resolved: ResolvedScheduleStage[] = [];
+  for (let i = 0; i < schedule.length; i++) {
+    const stage = schedule[i];
+    const gain = Number.isFinite(stage.gain) ? (stage.gain as number) : 0;
+    const lane = normalizeLaneId(stage.lane);
+    const macro = stage.macro === true || lane === 'macro';
+    if (!macro && Math.abs(gain) <= 1e-12) {
+      continue;
+    }
+    const spread =
+      Number.isFinite(stage.spread) && stage.spread != null ? (stage.spread as number) : 1;
+    const rawIndex =
+      typeof stage.index === 'number' && Number.isFinite(stage.index) ? stage.index : null;
+    const index =
+      rawIndex != null ? ((Math.trunc(rawIndex) % VECTOR_DIM) + VECTOR_DIM) % VECTOR_DIM : null;
+    const time =
+      typeof stage.time === 'number' && Number.isFinite(stage.time) ? (stage.time as number) : i;
+    const length =
+      typeof stage.length === 'number' &&
+      Number.isFinite(stage.length) &&
+      (stage.length as number) > 0
+        ? (stage.length as number)
+        : 0;
+    const phase =
+      typeof stage.phase === 'number' && Number.isFinite(stage.phase)
+        ? (stage.phase as number)
+        : null;
+    resolved.push({
+      gain,
+      spread,
+      index,
+      label: stage.label,
+      lane,
+      macro,
+      time,
+      length,
+      phase,
+      order: i,
+    });
+  }
+  resolved.sort((a, b) => {
+    if (a.time !== b.time) {
+      return a.time < b.time ? -1 : 1;
+    }
+    if (a.lane !== b.lane) {
+      return a.lane < b.lane ? -1 : 1;
+    }
+    return a.order - b.order;
+  });
+  return resolved;
+};
+
+type PulseGate = Extract<Gate, { kind: 'pulse' }>;
+
+type MacroGateEntry = {
+  amount: number;
+  gate: PulseGate;
+};
+
+const computeStageSeed = (baseSeed: number, stage: ResolvedScheduleStage): number => {
+  const laneHash = hashLabel(stage.lane);
+  const labelHash = stage.label ? hashLabel(stage.label) : 0;
+  const indexHash = stage.index != null ? (stage.index & 0xff) * 1315423911 : 0;
+  const timeHash = Math.trunc(stage.time * 4096) | 0;
+  const lengthHash = Math.trunc(stage.length * 4096) | 0;
+  const phaseHash = stage.phase != null ? Math.trunc(stage.phase * 4096) | 0 : 0;
+  const seed = baseSeed ^ laneHash ^ labelHash ^ indexHash ^ timeHash ^ lengthHash ^ phaseHash;
+  return seed >>> 0;
+};
+
+const createStageRng = (baseSeed: number, stage: ResolvedScheduleStage): (() => number) =>
+  mulberry32(computeStageSeed(baseSeed, stage));
+
+type GateComputationResult = {
+  gates: Gate[];
+  phaseAngles: GatePhaseVector;
+  pulseAngles: GatePhaseVector;
+  baseGain: number;
+  chiralityPhase: number;
+};
+
+const computeLegacyGateComputation = (
+  params: Su7RuntimeParams,
+  schedule: Su7Schedule,
+): GateComputationResult => {
+  const phases = createPhaseAccumulator();
+  const pulses = createPhaseAccumulator();
+  const gates: Gate[] = [];
+  const baseSeed = (params.seed ?? 0) >>> 0;
+  const resolvedStages = resolveScheduleStages(schedule);
+
+  for (const stage of resolvedStages) {
+    if (stage.macro) {
+      const axis = stage.index ?? 0;
+      const theta = safeNumber(stage.gain * stage.spread);
+      const phase = safeNumber(stage.phase ?? 0);
+      pulses[axis] += theta;
+      gates.push(createPulseGate(axis, theta, phase, stage.label));
+      continue;
+    }
+
+    const lengthFactor = stage.length > 0 ? 1 / (1 + stage.length) : 1;
+    const gain = safeNumber(stage.gain * lengthFactor);
+    if (!Number.isFinite(gain) || Math.abs(gain) <= 1e-12) {
+      continue;
+    }
+
+    const contribution = createPhaseAccumulator();
+    if (stage.index != null) {
+      contribution[stage.index] += gain * stage.spread;
+    } else {
+      const rng = createStageRng(baseSeed, stage);
+      for (let axis = 0; axis < VECTOR_DIM; axis++) {
+        const jitter = (rng() - 0.5) * stage.spread * 0.05;
+        contribution[axis] += gain * (1 + (axis - 3) * 0.02) + jitter;
+      }
+    }
+
+    for (let axis = 0; axis < VECTOR_DIM; axis++) {
+      phases[axis] += contribution[axis];
+    }
+    gates.push(createPhaseGate(contribution, stage.label));
+  }
+
+  const baseGain = Number.isFinite(params.gain) ? params.gain : 1;
+  const baseContribution = new Array(VECTOR_DIM).fill(baseGain);
+  for (let axis = 0; axis < VECTOR_DIM; axis++) {
+    phases[axis] += baseContribution[axis];
+  }
+  gates.push(createPhaseGate(baseContribution, 'baseGain'));
+
+  return {
+    gates,
+    phaseAngles: finalizePhaseAngles(phases),
+    pulseAngles: finalizePulseAngles(pulses),
+    baseGain,
+    chiralityPhase: 0,
+  };
+};
+
+const computeAdvancedGateComputation = (
+  params: Su7RuntimeParams,
+  schedule: Su7Schedule,
+  context: Su7ScheduleContext,
+): GateComputationResult => {
+  const axisAngles = new Float64Array(VECTOR_DIM);
+  for (let i = 0; i < VECTOR_DIM; i++) {
+    axisAngles[i] = (i / VECTOR_DIM) * TAU;
+  }
+
+  const phases = createPhaseAccumulator();
+  const pulses = createPhaseAccumulator();
+  const gates: Gate[] = [];
+  const macroEntries: MacroGateEntry[][] = Array.from({ length: VECTOR_DIM }, () => []);
+  const macroTotals = new Array(VECTOR_DIM).fill(0);
 
   const baseGain = Number.isFinite(params.gain) ? params.gain : 1;
   const dmt = clamp01(context.dmt ?? 0);
@@ -391,8 +1024,8 @@ const buildScheduledUnitaryAdvanced = (
   const modulationBase = 1 + 0.6 * dmt + 0.45 * arousal;
 
   const flow = context.flow ?? null;
-  const axisBias = new Float64Array(7);
-  for (let i = 0; i < 7; i++) {
+  const axisBias = new Float64Array(VECTOR_DIM);
+  for (let i = 0; i < VECTOR_DIM; i++) {
     axisBias[i] = 1;
   }
   let flowCoherence = 0;
@@ -403,9 +1036,9 @@ const buildScheduledUnitaryAdvanced = (
     flowCoherence = clamp01(flow.coherence);
     flowMagnitude = Math.tanh(flow.magnitude);
     flowAngle = flow.angle;
-    if (flow.axisBias.length === 7) {
+    if (flow.axisBias.length === VECTOR_DIM) {
       let maxBias = 0;
-      for (let i = 0; i < 7; i++) {
+      for (let i = 0; i < VECTOR_DIM; i++) {
         const value = Math.max(flow.axisBias[i], 0);
         axisBias[i] = value;
         if (value > maxBias) {
@@ -413,7 +1046,7 @@ const buildScheduledUnitaryAdvanced = (
         }
       }
       const scale = maxBias > EPSILON ? maxBias : 1;
-      for (let i = 0; i < 7; i++) {
+      for (let i = 0; i < VECTOR_DIM; i++) {
         axisBias[i] = 0.2 + 0.8 * clamp01(axisBias[i] / scale);
       }
     }
@@ -436,79 +1069,178 @@ const buildScheduledUnitaryAdvanced = (
   const parallaxBoost = 1 + parallaxMag * 0.35;
   const volumeBoost = 1 + volumeCoverage * 0.4;
 
-  const phases = new Float64Array(7);
-  const pulses = new Float64Array(7);
+  const baseSeed = (params.seed ?? 0) >>> 0;
+  const flowIndex =
+    ((Math.round(((((flowAngle % TAU) + TAU) % TAU) / TAU) * VECTOR_DIM) % VECTOR_DIM) +
+      VECTOR_DIM) %
+    VECTOR_DIM;
 
-  const rng = mulberry32((params.seed ?? 0) >>> 0);
-  const flowIndex = ((Math.round(((((flowAngle % TAU) + TAU) % TAU) / TAU) * 7) % 7) + 7) % 7;
+  const resolvedStages = resolveScheduleStages(schedule);
 
-  schedule.forEach((stage) => {
-    const gain = Number.isFinite(stage.gain) ? stage.gain : 0;
-    if (!Number.isFinite(gain) || gain === 0) return;
-    const spreadRaw =
-      Number.isFinite(stage.spread ?? NaN) && stage.spread != null
-        ? Math.max(0.05, stage.spread as number)
-        : 1;
-    const centerIndex =
-      typeof stage.index === 'number' && Number.isFinite(stage.index)
-        ? ((Math.trunc(stage.index) % 7) + 7) % 7
-        : flowIndex;
+  for (const stage of resolvedStages) {
+    if (stage.macro) {
+      const axis = stage.index ?? 0;
+      const amount = safeNumber(stage.gain * stage.spread);
+      const phase = safeNumber(stage.phase ?? 0);
+      const gate = createPulseGate(axis, amount, phase, stage.label);
+      if (gate.kind === 'pulse') {
+        macroEntries[axis].push({ amount, gate });
+      }
+      macroTotals[axis] += amount;
+      pulses[axis] += amount;
+      gates.push(gate);
+      continue;
+    }
+
+    const lengthFactor = stage.length > 0 ? 1 / (1 + stage.length) : 1;
+    const stageGain = safeNumber(stage.gain * lengthFactor);
+    if (!Number.isFinite(stageGain) || Math.abs(stageGain) <= 1e-12) {
+      continue;
+    }
+
+    const spreadRaw = Math.max(0.05, Math.abs(stage.spread));
+    const centerIndex = stage.index != null ? stage.index : flowIndex;
     const centerAngle = axisAngles[centerIndex];
-    const spreadAngle = spreadRaw * (TAU / 7);
-    const stageMod = gain * modulationBase * curvatureBoost * (0.7 + 0.3 * flowCoherence);
+    const spreadAngle = spreadRaw * (TAU / VECTOR_DIM);
+    const stageMod = stageGain * modulationBase * curvatureBoost * (0.7 + 0.3 * flowCoherence);
+    const contribution = createPhaseAccumulator();
+    const rng = createStageRng(baseSeed, stage);
 
-    for (let axis = 0; axis < 7; axis++) {
+    for (let axis = 0; axis < VECTOR_DIM; axis++) {
       const delta = wrapAngle(axisAngles[axis] - centerAngle);
       const gaussian = Math.exp(-0.5 * Math.pow(delta / (spreadAngle + 1e-6), 2));
       const weight = gaussian * (0.6 + 0.4 * axisBias[axis]);
-      phases[axis] += stageMod * weight;
-      const neighbor = (axis + 1) % 7;
+      const phaseDelta = stageMod * weight;
+      contribution[axis] += phaseDelta;
+      phases[axis] += phaseDelta;
+
+      const neighbor = (axis + 1) % VECTOR_DIM;
       const neighborDelta = wrapAngle(axisAngles[neighbor] - centerAngle);
       const neighborWeight =
         Math.exp(-0.5 * Math.pow(neighborDelta / (spreadAngle + 1e-6), 2)) *
         (0.6 + 0.4 * axisBias[neighbor]);
       const pairWeight = 0.5 * (weight + neighborWeight);
       const chiralityBias = stage.label && stage.label.toLowerCase().includes('vortex') ? 1.2 : 1;
-      pulses[axis] += pairWeight * gain * chiralityBias * (0.35 + 0.45 * flowCoherence);
+      pulses[axis] += pairWeight * stageGain * chiralityBias * (0.35 + 0.45 * flowCoherence);
     }
 
-    if (!Number.isFinite(stage.index)) {
-      for (let axis = 0; axis < 7; axis++) {
+    if (stage.index == null) {
+      for (let axis = 0; axis < VECTOR_DIM; axis++) {
         const jitter = (rng() - 0.5) * spreadRaw * 0.03;
-        phases[axis] += gain * 0.08 * modulationBase + jitter;
+        const addition = stageGain * 0.08 * modulationBase + jitter;
+        contribution[axis] += addition;
+        phases[axis] += addition;
       }
     }
-  });
 
-  for (let i = 0; i < 7; i++) {
-    phases[i] += baseGain;
+    gates.push(createPhaseGate(contribution, stage.label));
   }
 
-  const meanPhase = phases.reduce((acc, value) => acc + value, 0) / phases.length;
-  const diag = createIdentity7();
-  for (let i = 0; i < 7; i++) {
-    const theta = wrapAngle(phases[i] - meanPhase);
-    diag[i][i] = { re: Math.cos(theta), im: Math.sin(theta) };
+  const baseContribution = new Array(VECTOR_DIM).fill(baseGain);
+  for (let axis = 0; axis < VECTOR_DIM; axis++) {
+    phases[axis] += baseContribution[axis];
   }
+  gates.push(createPhaseGate(baseContribution, 'baseGain'));
 
-  let current = diag;
   const pulseScale =
     (0.35 + 0.4 * flowCoherence + 0.25 * gridEnergy) * modulationBase * parallaxBoost * volumeBoost;
   const chiralityPhase = (dmt - 0.5) * 0.9 + (arousal - 0.5) * 0.5 + flowMagnitude * 0.25;
+  const rawPulseTotals = Array.from(pulses);
 
-  for (let axis = 0; axis < 7; axis++) {
-    const neighbor = (axis + 1) % 7;
-    let theta = pulses[axis] * pulseScale;
-    if (!Number.isFinite(theta)) {
-      theta = 0;
-    }
+  for (let axis = 0; axis < VECTOR_DIM; axis++) {
+    const rawTotal = rawPulseTotals[axis];
+    let theta = safeNumber(rawTotal * pulseScale);
     theta = Math.tanh(theta);
-    if (Math.abs(theta) <= 1e-6) continue;
-    const rotation = createTwoPlanePulse(axis, neighbor, theta, chiralityPhase);
-    current = matrixMultiply(rotation, current);
+    pulses[axis] = theta;
+
+    const entries = macroEntries[axis];
+    let remaining = theta;
+
+    if (entries.length > 0) {
+      const macroTotal = macroTotals[axis];
+      for (const entry of entries) {
+        const weight =
+          Math.abs(rawTotal) > 1e-9
+            ? entry.amount / rawTotal
+            : Math.abs(macroTotal) > 1e-9
+              ? entry.amount / macroTotal
+              : 0;
+        const macroTheta = safeNumber(theta * weight);
+        entry.gate.theta = macroTheta;
+        remaining -= macroTheta;
+      }
+    }
+
+    if (Math.abs(remaining) > 1e-6) {
+      gates.push(createPulseGate(axis, remaining, chiralityPhase));
+    }
   }
 
-  return projectToSpecialUnitary(current);
+  return {
+    gates,
+    phaseAngles: finalizePhaseAngles(phases),
+    pulseAngles: finalizePulseAngles(pulses),
+    baseGain,
+    chiralityPhase,
+  };
+};
+
+export const createSu7GateList = (
+  params: Su7RuntimeParams,
+  context?: Su7ScheduleContext,
+): GateList => {
+  const seed = Math.trunc(Number.isFinite(params.seed) ? params.seed : 0);
+  const preset = typeof params.preset === 'string' ? params.preset : 'identity';
+  const projector = cloneSu7ProjectorDescriptor(params.projector);
+  const fallbackSchedule = createDefaultSu7RuntimeParams().schedule;
+  const effectiveSchedule = params.schedule.length > 0 ? params.schedule : fallbackSchedule;
+  const scheduleClone = cloneSu7Schedule(effectiveSchedule);
+
+  if (!params.enabled) {
+    const zero = toGatePhaseVector(new Array(VECTOR_DIM).fill(0));
+    return {
+      seed,
+      preset,
+      schedule: scheduleClone,
+      projector,
+      gains: {
+        baseGain: Number.isFinite(params.gain) ? params.gain : 0,
+        phaseAngles: zero,
+        pulseAngles: zero,
+        chiralityPhase: 0,
+      },
+      gates: [],
+      squashedAppends: 0,
+    };
+  }
+
+  const computation = context
+    ? computeAdvancedGateComputation(params, scheduleClone, context)
+    : computeLegacyGateComputation(params, scheduleClone);
+
+  return {
+    seed,
+    preset,
+    schedule: scheduleClone,
+    projector,
+    gains: {
+      baseGain: computation.baseGain,
+      phaseAngles: computation.phaseAngles,
+      pulseAngles: computation.pulseAngles,
+      chiralityPhase: computation.chiralityPhase,
+    },
+    gates: computation.gates,
+    squashedAppends: 0,
+  };
+};
+
+export const createSu7GateListSnapshot = (
+  params: Su7RuntimeParams,
+  context?: Su7ScheduleContext,
+): GateListSnapshot => {
+  const list = createSu7GateList(params, context);
+  const { gates: _gates, squashedAppends: _squashed, ...snapshot } = list;
+  return snapshot;
 };
 
 export const buildScheduledUnitary = (
@@ -518,10 +1250,114 @@ export const buildScheduledUnitary = (
   if (!params.enabled) {
     return createIdentity7();
   }
-  if (!context) {
-    return buildScheduledUnitaryLegacy(params);
+  const gateList = createSu7GateList(params, context);
+  const { gains } = gateList;
+  const diag = createIdentity7();
+  for (let i = 0; i < VECTOR_DIM; i++) {
+    const theta = gains.phaseAngles[i];
+    diag[i][i] = { re: Math.cos(theta), im: Math.sin(theta) };
   }
-  return buildScheduledUnitaryAdvanced(params, context);
+
+  let current = diag;
+  for (let axis = 0; axis < VECTOR_DIM; axis++) {
+    const theta = gains.pulseAngles[axis];
+    if (Math.abs(theta) <= 1e-6) continue;
+    const neighbor = (axis + 1) % VECTOR_DIM;
+    const rotation = createTwoPlanePulse(axis, neighbor, theta, gains.chiralityPhase);
+    current = matrixMultiply(rotation, current);
+  }
+
+  return projectToSpecialUnitary(current);
+};
+
+type UnitaryGuardrailOptions = {
+  threshold?: number;
+  force?: boolean;
+};
+
+export const enforceUnitaryGuardrail = (
+  matrix: Complex7x7,
+  options?: UnitaryGuardrailOptions,
+): {
+  unitary: Complex7x7;
+  unitaryError: number;
+  determinantDrift: number;
+  event: Extract<Su7GuardrailEvent, { kind: 'autoReorthon' }> | null;
+} => {
+  const threshold = options?.threshold ?? 1e-6;
+  const force = options?.force === true;
+  const baseline = cloneComplex7x7(matrix);
+  const rawError = computeUnitaryError(baseline);
+  if (!force && rawError <= threshold) {
+    return {
+      unitary: baseline,
+      unitaryError: rawError,
+      determinantDrift: computeDeterminantDrift(baseline),
+      event: null,
+    };
+  }
+  const corrected = polar_reunitarize(baseline);
+  const correctedError = computeUnitaryError(corrected);
+  const drift = computeDeterminantDrift(corrected);
+  const event: Extract<Su7GuardrailEvent, { kind: 'autoReorthon' }> = {
+    kind: 'autoReorthon',
+    before: rawError,
+    after: correctedError,
+    threshold,
+    forced: force,
+  };
+  return {
+    unitary: corrected,
+    unitaryError: correctedError,
+    determinantDrift: drift,
+    event,
+  };
+};
+
+type FlickerGuardrailOptions = {
+  ratioThreshold?: number;
+  frequencyThreshold?: number;
+  minEnergy?: number;
+};
+
+export const detectFlickerGuardrail = (
+  previousEnergy: number | null | undefined,
+  currentEnergy: number,
+  frameTimeMs: number,
+  options?: FlickerGuardrailOptions,
+): Extract<Su7GuardrailEvent, { kind: 'flicker' }> | null => {
+  const curr = Number.isFinite(currentEnergy) ? Math.max(currentEnergy, 0) : 0;
+  const prev =
+    previousEnergy != null && Number.isFinite(previousEnergy) ? Math.max(previousEnergy, 0) : null;
+  const minEnergy = options?.minEnergy ?? 0.05;
+  if (curr < minEnergy && (prev == null || prev < minEnergy)) {
+    return null;
+  }
+  if (prev == null) {
+    return null;
+  }
+  const ms = Number.isFinite(frameTimeMs) ? Math.max(frameTimeMs, 0) : 0;
+  if (ms <= 1e-6) {
+    return null;
+  }
+  const ratioThreshold = options?.ratioThreshold ?? 0.12;
+  const freqThreshold = options?.frequencyThreshold ?? 30;
+  const denom = Math.max(prev, 1e-6);
+  const delta = curr - prev;
+  const deltaRatio = Math.abs(delta) / denom;
+  if (deltaRatio <= ratioThreshold) {
+    return null;
+  }
+  const frequencyHz = 1000 / ms;
+  if (!Number.isFinite(frequencyHz) || frequencyHz < freqThreshold) {
+    return null;
+  }
+  return {
+    kind: 'flicker',
+    frequencyHz,
+    deltaRatio,
+    energy: curr,
+  };
 };
 
 export const computeSu7Telemetry = (
@@ -542,5 +1378,6 @@ export const computeSu7Telemetry = (
     normDeltaMax: max,
     normDeltaMean: mean,
     projectorEnergy,
+    geodesicFallbacks: 0,
   };
 };

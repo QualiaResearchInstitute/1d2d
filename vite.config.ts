@@ -93,21 +93,15 @@ const registerUploadMiddleware = (server: {
     use: (path: string, handler: (req: any, res: any, next: () => void) => void) => void;
   };
 }) => {
-  server.middlewares.use(UPLOAD_ENDPOINT, (req, res, next) => {
-    void handleUploadRequest(req, res)
-      .catch((error) => {
-        console.error('[upload] unexpected error', error);
-        if (!res.writableEnded) {
-          res.statusCode = 500;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ error: 'Upload failed' }));
-        }
-      })
-      .finally(() => {
-        if (!res.writableEnded) {
-          next();
-        }
-      });
+  server.middlewares.use(UPLOAD_ENDPOINT, (req, res) => {
+    void handleUploadRequest(req, res).catch((error) => {
+      console.error('[upload] unexpected error', error);
+      if (!res.writableEnded) {
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ error: 'Upload failed' }));
+      }
+    });
   });
 };
 

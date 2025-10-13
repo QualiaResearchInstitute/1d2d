@@ -10,6 +10,7 @@ import {
   type PairwiseKey,
   type TierId,
 } from '../src/validation/crossTierValidation.js';
+import { hashCanonicalJson } from '../src/serialization/canonicalJson.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -38,6 +39,23 @@ const outputPath = join(__dirname, '..', '..', 'dist', 'cross-tier', 'latest.jso
 const ensureDir = (filePath: string) => {
   const dir = dirname(filePath);
   mkdirSync(dir, { recursive: true });
+};
+
+const sanitizeForCanonicalJson = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeForCanonicalJson(entry));
+  }
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = sanitizeForCanonicalJson(entry);
+    }
+    return result;
+  }
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : null;
+  }
+  return value;
 };
 
 const computeDiff = (
@@ -107,7 +125,11 @@ const main = () => {
   const report = runCrossTierValidation();
 
   ensureDir(outputPath);
-  writeFileSync(outputPath, JSON.stringify(report, null, 2));
+  const canonicalPayload = sanitizeForCanonicalJson(report);
+  const { json: canonicalReport, hash: reportHash } = hashCanonicalJson(canonicalPayload, {
+    indent: 2,
+  });
+  writeFileSync(outputPath, canonicalReport);
 
   const baselineExists = existsSync(baselinePath);
   let tolerance = DEFAULT_TOLERANCE;
@@ -143,6 +165,8 @@ const main = () => {
   if (!baselineExists) {
     console.log('Tip: capture baseline via `npm run cross-tier:update`.');
   }
+
+  console.log('Cross-tier canonical hash (BLAKE3-256):', reportHash);
 };
 
 main();

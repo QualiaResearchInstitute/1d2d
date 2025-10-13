@@ -18,6 +18,9 @@
     "scripts/checkBaseline.ts",
     "scripts/runCrossTierValidation.ts",
     "scripts/updateCrossTierBaseline.ts",
-    "types/node-shim.d.ts"
+    "scripts/videoPipeline.ts",
+    "scripts/videoUtils.ts",
+    "types/node-shim.d.ts",
+    "types/raw-shaders.d.ts"
   ]
 }

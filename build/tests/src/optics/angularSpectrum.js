@@ -1,4 +1,4 @@
-import { OpticalFieldManager } from "../fields/opticalField.js";
+import { OpticalFieldManager } from '../fields/opticalField.js';
 export class AngularSpectrumSolver {
     constructor(config) {
         Object.defineProperty(this, "manager", {
@@ -15,19 +15,19 @@ export class AngularSpectrumSolver {
         });
         this.config = config;
         this.manager = new OpticalFieldManager({
-            solver: "angularSpectrum",
-            solverInstanceId: "angularSpectrum-main",
+            solver: 'angularSpectrum',
+            solverInstanceId: 'angularSpectrum-main',
             resolution: { width: config.width, height: config.height },
             defaultWavelengthNm: config.wavelengthNm,
             defaultPixelPitchMeters: config.pixelPitchMeters,
             defaultDt: config.dzMeters,
-            initialFrameId: 0
+            initialFrameId: 0,
         });
     }
     propagate(input, options) {
         const frame = this.manager.acquireFrame({
             dt: options?.dzMeters ?? this.config.dzMeters,
-            timestamp: options?.timestamp
+            timestamp: options?.timestamp,
         });
         frame.real.set(input.real);
         frame.imag.set(input.imag);
@@ -44,7 +44,7 @@ export class AngularSpectrumSolver {
         }
         this.manager.stampFrame(frame, {
             dt: options?.dzMeters ?? this.config.dzMeters,
-            timestamp: options?.timestamp
+            timestamp: options?.timestamp,
         });
         return frame;
     }

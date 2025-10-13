@@ -1,0 +1,12 @@
+{
+  "gains": {
+    "baseGain": 1,
+    "chiralityPhase": 0,
+    "phaseAngles": [0, 0, 0, 0, 0, 0, 0],
+    "pulseAngles": [0, 0, 0, 0, 0, 0, 0]
+  },
+  "preset": "identity",
+  "projector": { "id": "identity" },
+  "schedule": [],
+  "seed": 0
+}

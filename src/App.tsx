@@ -31,6 +31,8 @@ import {
   kEff,
   deriveSu7ScheduleContext,
   renderRainbowFrame,
+  resolveSu7Runtime,
+  buildSu7UnitaryFromGains,
   toGpuOps,
   COMPOSER_FIELD_LIST,
   type RainbowFrameMetrics,
@@ -49,23 +51,64 @@ import {
   cloneSu7RuntimeParams,
   createDefaultSu7RuntimeParams,
   sanitizeSu7RuntimeParams,
+  sanitizeGateList,
+  type Gate,
+  type GateList,
+  type HopfLensControlTarget,
+  type HopfLensDescriptor,
   type Su7ProjectorDescriptor,
   type Su7RuntimeParams,
   type Su7Schedule,
   type Su7Telemetry,
+  type Su7GuardrailEvent,
+  type Su7GuardrailStatus,
 } from './pipeline/su7/types.js';
+import { DEFAULT_HOPF_LENSES, resolveHopfLenses } from './pipeline/su7/projector.js';
 import { embedToC7 } from './pipeline/su7/embed.js';
-import { buildScheduledUnitary } from './pipeline/su7/math.js';
+import { detectFlickerGuardrail } from './pipeline/su7/math.js';
+import {
+  computeFluxOverlayState,
+  type FluxOverlayFrameData,
+  type FluxSource,
+} from './qcd/overlays';
+import {
+  initializeQcdRuntime,
+  restoreQcdRuntime,
+  runGpuSubstep,
+  runCpuSweep,
+  runTemperatureScan,
+  buildQcdOverlay,
+  buildQcdProbeFrame,
+  buildQcdSnapshot,
+  hashQcdSnapshot,
+  deriveLatticeResolution,
+  type QcdRuntimeState,
+  type QcdSnapshot,
+  type QcdAnnealConfig,
+  type QcdObservables,
+} from './qcd/runtime';
+import type { ProbeTransportFrameData } from './qcd/probeTransport.js';
+import { mulberry32 } from './qcd/updateCpu';
 import {
   ensureSu7TileBuffer,
   ensureSu7VectorBuffers,
   fillSu7TileBuffer,
   fillSu7VectorBuffers,
+  fillSu7VectorBuffersFromPacked,
   SU7_TILE_SIZE,
   SU7_TILE_TEXTURE_ROWS_PER_TILE,
   SU7_TILE_TEXTURE_WIDTH,
   type Su7VectorBuffers,
 } from './pipeline/su7/gpuPacking.js';
+import {
+  Su7GpuKernel,
+  packSu7Unitary,
+  packSu7Vectors,
+  SU7_GPU_KERNEL_VECTOR_STRIDE,
+  Su7GpuKernelStats,
+  Su7GpuKernelProfile,
+  Su7GpuKernelWarningEvent,
+} from './pipeline/su7/gpuKernel.js';
 import {
   createHyperbolicAtlas,
   mapHyperbolicPolarToPixel,
@@ -119,6 +162,13 @@ import {
   type TracerConfig,
 } from './pipeline/tracerFeedback';
 import { DEFAULT_SYNTHETIC_SIZE, SYNTHETIC_CASES, type SyntheticCaseId } from './dev/syntheticDeck';
+import {
+  Timeline,
+  TimelinePlayer,
+  type TimelineFrameEvaluation,
+  serializeTimeline,
+  deriveSeedFromHash,
+} from './timeline/index.js';
 
 type KurRegime = 'locked' | 'highEnergy' | 'chaotic' | 'custom';
 
@@ -146,6 +196,201 @@ type PresetParams = {
   su7Schedule: Su7Schedule;
   su7Projector: Su7ProjectorDescriptor;
   su7ScheduleStrength: number;
+  su7GateAppends: Gate[];
+};
+
+type HopfLensControlsProps = {
+  lenses: HopfLensDescriptor[];
+  metrics?: RainbowFrameMetrics['hopf']['lenses'];
+  onAxisChange: (index: number, which: 'a' | 'b', value: number) => void;
+  onBaseMixChange: (index: number, value: number) => void;
+  onFiberMixChange: (index: number, value: number) => void;
+  onControlTargetChange: (index: number, target: HopfLensControlTarget) => void;
+};
+
+const HopfLensControls: React.FC<HopfLensControlsProps> = ({
+  lenses,
+  metrics,
+  onAxisChange,
+  onBaseMixChange,
+  onFiberMixChange,
+  onControlTargetChange,
+}) => {
+  const axisOptions = useMemo(() => Array.from({ length: 7 }, (_, idx) => idx), []);
+  return (
+    <div
+      className="control"
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '0.75rem',
+        background: 'rgba(15,23,42,0.35)',
+        borderRadius: '0.85rem',
+        padding: '0.75rem',
+      }}
+    >
+      <h3 style={{ margin: 0, fontSize: '1rem', color: '#e2e8f0' }}>Hopf lenses</h3>
+      {lenses.map((lens, index) => {
+        const metric = metrics?.find((entry) => entry.index === index) ?? null;
+        const baseText = metric
+          ? metric.base.map((component) => component.toFixed(2)).join(', ')
+          : '–';
+        const fiberDeg = metric ? (metric.fiber * 180) / Math.PI : 0;
+        const shareText = metric ? metric.share.toFixed(3) : '—';
+        return (
+          <div
+            key={`hopf-lens-${index}`}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.55rem',
+              background: 'rgba(15,23,42,0.45)',
+              borderRadius: '0.65rem',
+              padding: '0.6rem 0.6rem 0.7rem',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'baseline',
+                color: '#cbd5f5',
+                fontSize: '0.85rem',
+                fontWeight: 600,
+              }}
+            >
+              <span>Lens {index + 1}</span>
+              <span style={{ fontSize: '0.72rem', color: '#94a3b8' }}>
+                {(lens.label ?? '').trim()}
+              </span>
+            </div>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(2, minmax(5rem, 1fr))',
+                gap: '0.45rem',
+                fontSize: '0.72rem',
+                color: '#cbd5f5',
+              }}
+            >
+              <label htmlFor={`hopf-axis-a-${index}`}>Axis A</label>
+              <select
+                id={`hopf-axis-a-${index}`}
+                value={lens.axes[0]}
+                onChange={(event) => onAxisChange(index, 'a', Number(event.target.value))}
+                style={{
+                  background: 'rgba(15,23,42,0.7)',
+                  border: '1px solid rgba(148,163,184,0.35)',
+                  color: '#e2e8f0',
+                  borderRadius: '0.45rem',
+                  padding: '0.3rem 0.45rem',
+                }}
+              >
+                {axisOptions.map((axis) => (
+                  <option key={`hopf-axis-a-${index}-${axis}`} value={axis}>
+                    {axis + 1}
+                  </option>
+                ))}
+              </select>
+              <label htmlFor={`hopf-axis-b-${index}`}>Axis B</label>
+              <select
+                id={`hopf-axis-b-${index}`}
+                value={lens.axes[1]}
+                onChange={(event) => onAxisChange(index, 'b', Number(event.target.value))}
+                style={{
+                  background: 'rgba(15,23,42,0.7)',
+                  border: '1px solid rgba(148,163,184,0.35)',
+                  color: '#e2e8f0',
+                  borderRadius: '0.45rem',
+                  padding: '0.3rem 0.45rem',
+                }}
+              >
+                {axisOptions.map((axis) => (
+                  <option key={`hopf-axis-b-${index}-${axis}`} value={axis}>
+                    {axis + 1}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+              <label style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Base mix</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem' }}>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={lens.baseMix ?? 1}
+                  onChange={(event) => onBaseMixChange(index, Number(event.target.value))}
+                />
+                <span style={{ fontSize: '0.7rem', color: '#cbd5f5' }}>
+                  {(lens.baseMix ?? 1).toFixed(2)}
+                </span>
+              </div>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+              <label style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Fiber mix</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem' }}>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={lens.fiberMix ?? 1}
+                  onChange={(event) => onFiberMixChange(index, Number(event.target.value))}
+                />
+                <span style={{ fontSize: '0.7rem', color: '#cbd5f5' }}>
+                  {(lens.fiberMix ?? 1).toFixed(2)}
+                </span>
+              </div>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+              <label style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Control target</label>
+              <select
+                value={lens.controlTarget ?? 'none'}
+                onChange={(event) =>
+                  onControlTargetChange(index, event.target.value as HopfLensControlTarget)
+                }
+                style={{
+                  background: 'rgba(15,23,42,0.7)',
+                  border: '1px solid rgba(148,163,184,0.35)',
+                  color: '#e2e8f0',
+                  borderRadius: '0.45rem',
+                  padding: '0.3rem 0.45rem',
+                }}
+              >
+                <option value="none">None</option>
+                <option value="base">Base (S²)</option>
+                <option value="fiber">Fiber (S¹)</option>
+              </select>
+            </div>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                gap: '0.5rem',
+                fontSize: '0.7rem',
+                color: '#94a3b8',
+              }}
+            >
+              <div>
+                <strong style={{ color: '#cbd5f5' }}>Base</strong>
+                <div>{baseText}</div>
+              </div>
+              <div>
+                <strong style={{ color: '#cbd5f5' }}>Fiber</strong>
+                <div>{metric ? `${fiberDeg.toFixed(1)}°` : '–'}</div>
+              </div>
+              <div>
+                <strong style={{ color: '#cbd5f5' }}>Share</strong>
+                <div>{shareText}</div>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 };
 
 type PresetSurface = {
@@ -166,6 +411,64 @@ type PresetDisplay = {
   hyperbolicGuideSpacing: number;
 };
 
+type Su7GpuFrameResult = {
+  width: number;
+  height: number;
+  vectors: Float32Array;
+  norms: Float32Array;
+  profile: Su7GpuKernelProfile | null;
+  timestamp: number;
+};
+
+type GuardrailAuditKind = Su7GuardrailEvent['kind'] | 'manualReorthon' | 'manualAutoGain';
+
+type GuardrailAuditEntry = {
+  id: number;
+  kind: GuardrailAuditKind;
+  message: string;
+  severity: 'info' | 'warn';
+  timestamp: number;
+};
+
+type GuardrailConsoleState = {
+  unitaryError: number;
+  determinantDrift: number;
+  frameTimeMs: number;
+  energyEma: number;
+  lastEnergy: number | null;
+  auditLog: GuardrailAuditEntry[];
+};
+
+type GuardrailSummary = {
+  message: string;
+  severity: 'info' | 'warn';
+};
+
+const summarizeGuardrailEvent = (event: Su7GuardrailEvent): GuardrailSummary => {
+  switch (event.kind) {
+    case 'autoReorthon': {
+      const before = event.before.toExponential(2);
+      const after = event.after.toExponential(2);
+      const message = event.forced
+        ? `Manual re-orthon completed (${before} → ${after})`
+        : `Auto re-orthon corrected unitary (${before} → ${after})`;
+      return { message, severity: event.forced ? 'info' : 'warn' };
+    }
+    case 'autoGain': {
+      const message = `Auto gain correction ${event.before.toFixed(3)} → ${event.after.toFixed(
+        3,
+      )} (target ${event.target.toFixed(3)})`;
+      return { message, severity: 'info' };
+    }
+    case 'flicker': {
+      const message = `Flicker guardrail ${event.frequencyHz.toFixed(1)} Hz Δ ${(event.deltaRatio * 100).toFixed(1)}%`;
+      return { message, severity: 'warn' };
+    }
+    default:
+      return { message: 'Guardrail event', severity: 'info' };
+  }
+};
+
 const MAX_CURVATURE_STRENGTH = 0.95;
 const HYPERBOLIC_GUIDE_SPACING_MIN = 0.25;
 const HYPERBOLIC_GUIDE_SPACING_MAX = 2.5;
@@ -184,6 +487,8 @@ type PresetRuntime = {
   telemetryEnabled: boolean;
   telemetryOverlayEnabled: boolean;
   frameLoggingEnabled: boolean;
+  macroBinding: MacroBinding | null;
+  macroKnobValue: number;
 };
 
 type PresetKuramoto = {
@@ -205,8 +510,33 @@ type PresetKuramoto = {
   smallWorldDegree: number;
 };
 
+type PresetQcd = {
+  beta: number;
+  stepsPerSecond: number;
+  smearingAlpha: number;
+  smearingIterations: number;
+  overRelaxationSteps: number;
+  baseSeed: number;
+  depth: number;
+  temporalExtent: number;
+  batchLayers: number;
+  temperatureSchedule: number[];
+  snapshot: {
+    data: QcdSnapshot;
+    hash: string;
+  } | null;
+};
+
 type PresetDeveloper = {
   selectedSyntheticCase: SyntheticCaseId;
+};
+
+type MacroBinding = {
+  gateLabel: string;
+  axis: number;
+  thetaScale: number;
+  phiScale: number;
+  phiBase: number;
 };
 
 type PresetMedia = {
@@ -235,6 +565,7 @@ type Preset = {
   coupling: CouplingConfig;
   composer: ComposerConfig;
   couplingToggles: CouplingToggleState;
+  qcd: PresetQcd;
 };
 
 type CouplingToggleState = {
@@ -435,6 +766,7 @@ const SU7_PROJECTOR_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'composerweights', label: 'Composer weights' },
   { value: 'overlaysplit', label: 'Overlay split overlays' },
   { value: 'directrgb', label: 'Direct RGB primaries' },
+  { value: 'hopflens', label: 'Hopf lens overlays' },
 ];
 
 const cloneSu7Schedule = (schedule: Su7Schedule): Su7Schedule =>
@@ -578,6 +910,7 @@ const PRESETS: Preset[] = [
       su7Schedule: [],
       su7Projector: { id: 'identity' },
       su7ScheduleStrength: 1,
+      su7GateAppends: [],
     },
     surface: {
       surfEnabled: false,
@@ -609,6 +942,8 @@ const PRESETS: Preset[] = [
       telemetryEnabled: false,
       telemetryOverlayEnabled: false,
       frameLoggingEnabled: true,
+      macroBinding: null,
+      macroKnobValue: 0,
     },
     kuramoto: {
       kurEnabled: false,
@@ -646,6 +981,19 @@ const PRESETS: Preset[] = [
     },
     composer: createDefaultComposerConfig(),
     couplingToggles: DEFAULT_COUPLING_TOGGLES,
+    qcd: {
+      beta: 5.25,
+      stepsPerSecond: 3,
+      smearingAlpha: 0.5,
+      smearingIterations: 1,
+      overRelaxationSteps: 1,
+      baseSeed: 2024,
+      depth: 1,
+      temporalExtent: 1,
+      batchLayers: 1,
+      temperatureSchedule: [],
+      snapshot: null,
+    },
   },
 ];
 
@@ -709,6 +1057,22 @@ const RIM_HIST_BINS = 64;
 const SURFACE_HIST_BINS = 32;
 const PHASE_HIST_BINS = 64;
 const PHASE_HIST_SCALE = 2.5;
+const TAU = Math.PI * 2;
+
+const wrapAngle = (value: number): number => {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  let angle = value % TAU;
+  if (angle <= -Math.PI) {
+    angle += TAU;
+  } else if (angle > Math.PI) {
+    angle -= TAU;
+  }
+  return angle;
+};
+
+const radiansToDegrees = (value: number): number => (value / Math.PI) * 180;
 
 const COMPOSER_FIELD_LABELS: Record<ComposerFieldId, string> = {
   surface: 'Surface',
@@ -790,6 +1154,63 @@ const sanitizeCouplingConfig = (
   };
 };
 
+const cloneMacroBinding = (binding: MacroBinding | null): MacroBinding | null => {
+  if (!binding) return null;
+  return {
+    gateLabel: binding.gateLabel,
+    axis: binding.axis,
+    thetaScale: binding.thetaScale,
+    phiScale: binding.phiScale,
+    phiBase: binding.phiBase,
+  };
+};
+
+const sanitizeMacroBinding = (
+  value: unknown,
+  fallback: MacroBinding | null,
+): MacroBinding | null => {
+  if (!value || typeof value !== 'object') {
+    return fallback ? cloneMacroBinding(fallback) : null;
+  }
+  const source = value as Partial<MacroBinding> & { [key: string]: unknown };
+  const labelSource = source.gateLabel;
+  const gateLabel =
+    typeof labelSource === 'string' && labelSource.length > 0
+      ? labelSource
+      : (fallback?.gateLabel ?? '');
+  if (!gateLabel) {
+    return fallback ? cloneMacroBinding(fallback) : null;
+  }
+  const axisSource = source.axis;
+  const axis =
+    typeof axisSource === 'number' && Number.isFinite(axisSource)
+      ? Math.max(0, Math.min(6, Math.trunc(axisSource)))
+      : (fallback?.axis ?? 0);
+  const thetaScaleSource = source.thetaScale;
+  const phiScaleSource = source.phiScale;
+  const phiBaseSource = source.phiBase;
+  const thetaScale =
+    typeof thetaScaleSource === 'number' && Number.isFinite(thetaScaleSource)
+      ? thetaScaleSource
+      : (fallback?.thetaScale ?? 0);
+  const phiScale =
+    typeof phiScaleSource === 'number' && Number.isFinite(phiScaleSource)
+      ? phiScaleSource
+      : (fallback?.phiScale ?? 0);
+  const phiBaseValue =
+    typeof phiBaseSource === 'number' && Number.isFinite(phiBaseSource)
+      ? phiBaseSource
+      : (fallback?.phiBase ?? 0);
+  const phiBase = wrapAngle(phiBaseValue);
+  return {
+    gateLabel,
+    axis,
+    thetaScale,
+    phiScale,
+    phiBase,
+  };
+};
+
 const clampComposerValue = (value: number, min: number, max: number, fallback: number) => {
   if (!Number.isFinite(value)) {
     return fallback;
@@ -866,6 +1287,97 @@ const sanitizePresetMedia = (media: unknown, fallback: PresetMedia | null): Pres
   };
 };
 
+const sanitizeQcdSnapshot = (
+  raw: unknown,
+  fallback: PresetQcd['snapshot'],
+): PresetQcd['snapshot'] => {
+  if (!raw || typeof raw !== 'object') {
+    return fallback ?? null;
+  }
+  const source = raw as { data?: unknown; hash?: unknown };
+  if (!source.data || typeof source.data !== 'object') {
+    return fallback ?? null;
+  }
+  try {
+    const snapshot = source.data as QcdSnapshot;
+    restoreQcdRuntime(snapshot);
+    const hash = typeof source.hash === 'string' ? (source.hash as string) : (fallback?.hash ?? '');
+    return {
+      data: snapshot,
+      hash,
+    };
+  } catch {
+    return fallback ?? null;
+  }
+};
+
+const sanitizePresetQcd = (raw: unknown, fallback: PresetQcd): PresetQcd => {
+  if (!raw || typeof raw !== 'object') {
+    return fallback;
+  }
+  const source = raw as Record<string, unknown>;
+  const beta = sanitizeNumber(source.beta, fallback.beta);
+  const steps = sanitizeNumber(source.stepsPerSecond, fallback.stepsPerSecond);
+  const smearingAlpha = sanitizeNumber(source.smearingAlpha, fallback.smearingAlpha);
+  const smearingIterations = clampInt(
+    sanitizeNumber(source.smearingIterations, fallback.smearingIterations),
+    0,
+    32,
+  );
+  const overRelaxationSteps = clampInt(
+    sanitizeNumber(source.overRelaxationSteps, fallback.overRelaxationSteps),
+    0,
+    16,
+  );
+  const baseSeed = clampInt(
+    sanitizeNumber(source.baseSeed, fallback.baseSeed),
+    0,
+    Number.MAX_SAFE_INTEGER,
+  );
+  const depth = clampInt(sanitizeNumber(source.depth, fallback.depth), 1, 64);
+  const temporalExtent = clampInt(
+    sanitizeNumber(source.temporalExtent, fallback.temporalExtent),
+    1,
+    256,
+  );
+  const planeCap = Math.max(1, depth * temporalExtent);
+  const batchLayers = clampInt(
+    sanitizeNumber(source.batchLayers, fallback.batchLayers),
+    1,
+    planeCap,
+  );
+  const scheduleSource = Array.isArray(source.temperatureSchedule)
+    ? (source.temperatureSchedule as unknown[])
+    : fallback.temperatureSchedule;
+  const temperatureSchedule = Array.isArray(scheduleSource)
+    ? scheduleSource
+        .map((value) => {
+          if (typeof value === 'number') return value;
+          if (typeof value === 'string') {
+            const parsed = Number.parseFloat(value);
+            return Number.isFinite(parsed) ? parsed : null;
+          }
+          return null;
+        })
+        .filter((value): value is number => value != null)
+        .slice(0, 64)
+    : [...fallback.temperatureSchedule];
+  const snapshot = sanitizeQcdSnapshot(source.snapshot, fallback.snapshot);
+  return {
+    beta,
+    stepsPerSecond: clamp(steps, 0.1, 60),
+    smearingAlpha: clamp(smearingAlpha, 0, 1),
+    smearingIterations,
+    overRelaxationSteps,
+    baseSeed,
+    depth,
+    temporalExtent,
+    batchLayers,
+    temperatureSchedule,
+    snapshot,
+  };
+};
+
 const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null => {
   if (!raw || typeof raw !== 'object') return null;
   const source = raw as Record<string, unknown>;
@@ -873,6 +1385,7 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
   const kernelSource = (paramsSource.kernel as Record<string, unknown>) ?? {};
   const surfaceSource = (source.surface as Record<string, unknown>) ?? {};
   const displaySource = (source.display as Record<string, unknown>) ?? {};
+  const tracerSource = source.tracer as TracerConfig | undefined;
   const runtimeSource = (source.runtime as Record<string, unknown>) ?? {};
   const kuramotoSource = (source.kuramoto as Record<string, unknown>) ?? {};
   const developerSource = (source.developer as Record<string, unknown>) ?? {};
@@ -884,6 +1397,7 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
   const fallbackRuntime = fallback.runtime;
   const fallbackKuramoto = fallback.kuramoto;
   const fallbackDeveloper = fallback.developer;
+  const fallbackQcd = fallback.qcd;
   const fallbackToggles = fallback.couplingToggles;
   const fallbackSu7: Su7RuntimeParams = {
     enabled: fallbackParams.su7Enabled,
@@ -892,6 +1406,7 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
     seed: fallbackParams.su7Seed,
     schedule: fallbackParams.su7Schedule,
     projector: fallbackParams.su7Projector,
+    gateAppends: fallbackParams.su7GateAppends,
   };
   const sanitizedSu7 = sanitizeSu7RuntimeParams(
     {
@@ -901,7 +1416,8 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
       seed: paramsSource.su7Seed,
       schedule: paramsSource.su7Schedule as unknown,
       projector: paramsSource.su7Projector,
-    },
+      gateAppends: paramsSource.su7GateAppends,
+    } as Partial<Su7RuntimeParams>,
     fallbackSu7,
   );
 
@@ -950,6 +1466,7 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
           fallbackParams.su7ScheduleStrength ?? SU7_SCHEDULE_STRENGTH_DEFAULT,
         ),
       ),
+      su7GateAppends: sanitizedSu7.gateAppends,
     },
     surface: {
       surfEnabled: sanitizeBoolean(surfaceSource.surfEnabled, fallbackSurface.surfEnabled),
@@ -994,6 +1511,7 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
         HYPERBOLIC_GUIDE_SPACING_MAX,
       ),
     },
+    tracer: sanitizeTracerConfig(tracerSource ?? fallback.tracer),
     runtime: {
       renderBackend: sanitizeEnum(
         runtimeSource.renderBackend,
@@ -1031,6 +1549,14 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
       frameLoggingEnabled: sanitizeBoolean(
         runtimeSource.frameLoggingEnabled,
         fallbackRuntime.frameLoggingEnabled,
+      ),
+      macroBinding: sanitizeMacroBinding(
+        runtimeSource.macroBinding,
+        fallbackRuntime.macroBinding ?? null,
+      ),
+      macroKnobValue: sanitizeNumber(
+        runtimeSource.macroKnobValue,
+        typeof fallbackRuntime.macroKnobValue === 'number' ? fallbackRuntime.macroKnobValue : 0,
       ),
     },
     kuramoto: {
@@ -1083,6 +1609,7 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
       rimToSurface: sanitizeBoolean(togglesSource.rimToSurface, fallbackToggles.rimToSurface),
       surfaceToRim: sanitizeBoolean(togglesSource.surfaceToRim, fallbackToggles.surfaceToRim),
     },
+    qcd: sanitizePresetQcd(source.qcd, fallbackQcd),
   };
 
   return sanitized;
@@ -1124,8 +1651,16 @@ const writeOctal = (buffer: Uint8Array, offset: number, length: number, value: n
 };
 
 const createTarBlob = (entries: TarEntry[]): Blob => {
-  const parts: Uint8Array[] = [];
+  const parts: BlobPart[] = [];
   const nowSeconds = Math.floor(Date.now() / 1000);
+  const pushBytes = (bytes: Uint8Array) => {
+    const needsCopy = bytes.byteOffset !== 0 || bytes.byteLength !== bytes.buffer.byteLength;
+    if (needsCopy) {
+      parts.push(bytes.slice().buffer as ArrayBuffer);
+    } else {
+      parts.push(bytes.buffer as ArrayBuffer);
+    }
+  };
 
   entries.forEach(({ name, content, mode = 0o644, mtime = nowSeconds }) => {
     const header = new Uint8Array(TAR_BLOCK_SIZE);
@@ -1154,16 +1689,16 @@ const createTarBlob = (entries: TarEntry[]): Blob => {
     }
     header[154] = 0;
     header[155] = 0x20;
-    parts.push(header);
-    parts.push(content);
+    pushBytes(header);
+    pushBytes(content);
     const remainder = content.length % TAR_BLOCK_SIZE;
     if (remainder !== 0) {
-      parts.push(new Uint8Array(TAR_BLOCK_SIZE - remainder));
+      pushBytes(new Uint8Array(TAR_BLOCK_SIZE - remainder));
     }
   });
 
-  parts.push(new Uint8Array(TAR_BLOCK_SIZE));
-  parts.push(new Uint8Array(TAR_BLOCK_SIZE));
+  pushBytes(new Uint8Array(TAR_BLOCK_SIZE));
+  pushBytes(new Uint8Array(TAR_BLOCK_SIZE));
 
   return new Blob(parts, { type: 'application/x-tar' });
 };
@@ -1195,8 +1730,10 @@ const downloadBlob = (blob: Blob, filename: string) => {
   URL.revokeObjectURL(url);
 };
 
-const formatCouplingKey = (key: keyof CouplingConfig) =>
-  key.replace(/([A-Z])/g, ' $1').replace(/^./, (ch) => ch.toUpperCase());
+const formatCouplingKey = (key: keyof CouplingConfig) => {
+  const label = String(key);
+  return label.replace(/([A-Z])/g, ' $1').replace(/^./, (ch) => ch.toUpperCase());
+};
 
 type KurFrameView = {
   buffer: ArrayBuffer;
@@ -1324,26 +1861,6 @@ const formatBytes = (bytes: number) => {
   return `${value.toFixed(precision)} ${units[idx]}`;
 };
 const clamp01 = (v: number) => clamp(v, 0, 1);
-const useRandN = () => {
-  const spareRef = useRef<number | null>(null);
-  return useCallback(() => {
-    if (spareRef.current != null) {
-      const value = spareRef.current;
-      spareRef.current = null;
-      return value;
-    }
-    let u = 0;
-    let v = 0;
-    while (u === 0) u = Math.random();
-    while (v === 0) v = Math.random();
-    const mag = Math.sqrt(-2.0 * Math.log(u));
-    const z0 = mag * Math.cos(2 * Math.PI * v);
-    const z1 = mag * Math.sin(2 * Math.PI * v);
-    spareRef.current = z1;
-    return z0;
-  }, []);
-};
-
 const displayModeToEnum = (mode: DisplayMode) => {
   switch (mode) {
     case 'grayBaseColorRims':
@@ -1400,6 +1917,8 @@ const surfaceRegionToEnum = (region: SurfaceRegion) => {
   }
 };
 
+const FALLBACK_TIMELINE_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const hyperbolicGridCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1408,6 +1927,15 @@ export default function App() {
   const pendingStaticUploadRef = useRef(true);
   const su7VectorBuffersRef = useRef<Su7VectorBuffers | null>(null);
   const su7TileBufferRef = useRef<Float32Array | null>(null);
+  const su7GpuKernelRef = useRef<Su7GpuKernel | null>(null);
+  const su7GpuPackedMatrixRef = useRef<Float32Array | null>(null);
+  const su7GpuPackedInputRef = useRef<Float32Array | null>(null);
+  const su7GpuTransformedRef = useRef<Float32Array | null>(null);
+  const su7GpuPendingRef = useRef<Promise<void> | null>(null);
+  const su7GpuReadyRef = useRef<Su7GpuFrameResult | null>(null);
+  const su7GpuStatsRef = useRef<Su7GpuKernelStats | null>(null);
+  const su7GpuWarningRef = useRef<Su7GpuKernelWarningEvent | null>(null);
+  const su7GpuLastProfileRef = useRef<Su7GpuKernelProfile | null>(null);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const captureStreamRef = useRef<MediaStream | null>(null);
@@ -1441,6 +1969,107 @@ export default function App() {
   const basePixelsRef = useRef<ImageData | null>(null);
   const surfaceFieldRef = useRef<SurfaceField | null>(null);
   const rimFieldRef = useRef<RimField | null>(null);
+  const timelinePlayerRef = useRef<TimelinePlayer | null>(null);
+  const timelineEvaluationRef = useRef<TimelineFrameEvaluation | null>(null);
+  const timelineHashRef = useRef<string>(FALLBACK_TIMELINE_HASH);
+  const timelineActiveRef = useRef(false);
+  const timelineLastFrameRef = useRef<number | null>(null);
+
+  const getTimelineNumber = (id: string, fallback: number): number => {
+    const evaluation = timelineEvaluationRef.current;
+    const value = evaluation?.values[id];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    return fallback;
+  };
+
+  const getTimelineBoolean = (id: string, fallback: boolean): boolean => {
+    const evaluation = timelineEvaluationRef.current;
+    const value = evaluation?.values[id];
+    if (typeof value === 'boolean') {
+      return value;
+    }
+    return fallback;
+  };
+
+  const getTimelineString = <T extends string>(id: string, fallback: T): T => {
+    const evaluation = timelineEvaluationRef.current;
+    const value = evaluation?.values[id];
+    if (typeof value === 'string') {
+      return value as T;
+    }
+    return fallback;
+  };
+
+  const updateTimelineForTime = useCallback(
+    (timeSeconds: number): TimelineFrameEvaluation | null => {
+      const player = timelinePlayerRef.current;
+      if (!player || !timelineActiveRef.current) {
+        timelineEvaluationRef.current = null;
+        timelineLastFrameRef.current = null;
+        return null;
+      }
+      const evaluation = player.evaluateAtTimeSeconds(timeSeconds);
+      if (timelineLastFrameRef.current !== evaluation.frameIndex) {
+        timelineEvaluationRef.current = evaluation;
+        timelineLastFrameRef.current = evaluation.frameIndex;
+      }
+      return timelineEvaluationRef.current;
+    },
+    [],
+  );
+
+  const getTimelineSeed = useCallback((scope: string, timeSeconds: number): number => {
+    const player = timelinePlayerRef.current;
+    if (player && timelineActiveRef.current) {
+      return player.getSeedAtTime(scope, timeSeconds);
+    }
+    const frame =
+      player && timelineActiveRef.current
+        ? player.getFrameForTime(timeSeconds)
+        : Math.max(0, Math.round(timeSeconds * RECORDING_FPS));
+    return deriveSeedFromHash(timelineHashRef.current, scope, frame);
+  }, []);
+
+  const loadTimeline = useCallback((timeline: Timeline) => {
+    const player = new TimelinePlayer(timeline);
+    timelinePlayerRef.current = player;
+    timelineHashRef.current = player.hash;
+    timelineActiveRef.current = true;
+    timelineEvaluationRef.current = player.evaluateAtFrame(0);
+    timelineLastFrameRef.current = null;
+    console.info(
+      `[timeline] loaded hash=${player.hash} fps=${player.fps} frames=${player.durationFrames}`,
+    );
+    return { hash: player.hash, fps: player.fps, durationFrames: player.durationFrames };
+  }, []);
+
+  const clearTimeline = useCallback(() => {
+    timelinePlayerRef.current = null;
+    timelineActiveRef.current = false;
+    timelineEvaluationRef.current = null;
+    timelineLastFrameRef.current = null;
+    timelineHashRef.current = FALLBACK_TIMELINE_HASH;
+    console.info('[timeline] cleared');
+  }, []);
+
+  const exportTimeline = useCallback(() => {
+    const player = timelinePlayerRef.current;
+    if (!player) {
+      return null;
+    }
+    const { json, hash } = serializeTimeline(player.timeline, { indent: 2 });
+    return { json, hash, fps: player.fps, durationFrames: player.durationFrames };
+  }, []);
+
+  const loadTimelineFromJson = useCallback(
+    (json: string) => {
+      const parsed = JSON.parse(json) as Timeline;
+      return loadTimeline(parsed);
+    },
+    [loadTimeline],
+  );
 
   const [edgeThreshold, setEdgeThreshold] = useState(0.22);
   const [blend, setBlend] = useState(0.65);
@@ -1470,6 +2099,129 @@ export default function App() {
   const [su7ScheduleStrength, setSu7ScheduleStrength] = useState<number>(
     SU7_SCHEDULE_STRENGTH_DEFAULT,
   );
+  const gateLabelCounterRef = useRef(0);
+  const [macroBinding, setMacroBinding] = useState<MacroBinding | null>(null);
+  const [macroKnobValue, setMacroKnobValue] = useState(0);
+  const [macroLearnMode, setMacroLearnMode] = useState(false);
+  const guardrailAuditIdRef = useRef(0);
+  const guardrailFrameTimeRef = useRef(0);
+  const guardrailCommandsRef = useRef<{ forceReorthon: boolean }>({ forceReorthon: false });
+  const [guardrailConsoleInternal, setGuardrailConsoleInternal] = useState<GuardrailConsoleState>({
+    unitaryError: 0,
+    determinantDrift: 0,
+    frameTimeMs: 0,
+    energyEma: 0,
+    lastEnergy: null,
+    auditLog: [],
+  });
+  const guardrailConsoleRef = useRef(guardrailConsoleInternal);
+  useEffect(() => {
+    guardrailConsoleRef.current = guardrailConsoleInternal;
+  }, [guardrailConsoleInternal]);
+  const setGuardrailConsole = useCallback(
+    (updater: (prev: GuardrailConsoleState) => GuardrailConsoleState) => {
+      setGuardrailConsoleInternal((prev) => {
+        const next = updater(prev);
+        guardrailConsoleRef.current = next;
+        return next;
+      });
+    },
+    [setGuardrailConsoleInternal],
+  );
+  const guardrailConsole = guardrailConsoleInternal;
+  const nextGateLabel = useCallback((prefix: string) => {
+    const id = gateLabelCounterRef.current++;
+    return `${prefix}-${id}`;
+  }, []);
+  const updateSu7GateAppends = useCallback(
+    (mutator: (gates: Gate[]) => Gate[]) => {
+      setSu7Params((prev) => {
+        const current = prev.gateAppends ?? [];
+        const next = mutator(current);
+        if (next === current) {
+          return prev;
+        }
+        return {
+          ...prev,
+          gateAppends: next,
+        };
+      });
+    },
+    [setSu7Params],
+  );
+  const clearSu7GateAppends = useCallback(() => {
+    setSu7Params((prev) => ({ ...prev, gateAppends: [] }));
+    setMacroBinding(null);
+    setMacroKnobValue(0);
+  }, [setSu7Params, setMacroBinding, setMacroKnobValue]);
+  const removeSu7Gate = useCallback(
+    (label: string | null, index: number) => {
+      updateSu7GateAppends((current) => {
+        if (label) {
+          return current.filter((gate) => gate.label !== label);
+        }
+        return current.filter((_, idx) => idx !== index);
+      });
+      if (label && macroBinding?.gateLabel === label) {
+        setMacroBinding(null);
+        setMacroKnobValue(0);
+      }
+    },
+    [macroBinding, setMacroBinding, setMacroKnobValue, updateSu7GateAppends],
+  );
+  const applyMacroGateValue = useCallback(
+    (value: number, binding: MacroBinding | null) => {
+      if (!binding) {
+        return;
+      }
+      const theta = binding.thetaScale * value;
+      const phase = wrapAngle(binding.phiBase + binding.phiScale * value);
+      updateSu7GateAppends((current) => {
+        let found = false;
+        let changed = false;
+        const next = current.map((gate) => {
+          if (gate.label === binding.gateLabel && gate.kind === 'pulse') {
+            found = true;
+            const thetaChanged = Math.abs(gate.theta - theta) > 1e-6;
+            const axisChanged = gate.axis !== binding.axis;
+            const phaseChanged = Math.abs(wrapAngle(gate.phase - phase)) > 1e-6;
+            if (!thetaChanged && !axisChanged && !phaseChanged) {
+              return gate;
+            }
+            changed = true;
+            return {
+              kind: 'pulse' as const,
+              axis: binding.axis,
+              theta,
+              phase,
+              label: binding.gateLabel,
+            };
+          }
+          return gate;
+        });
+        if (!found) {
+          changed = true;
+          next.push({
+            kind: 'pulse',
+            axis: binding.axis,
+            theta,
+            phase,
+            label: binding.gateLabel,
+          });
+        }
+        return changed ? next : current;
+      });
+    },
+    [updateSu7GateAppends],
+  );
+  useEffect(() => {
+    applyMacroGateValue(macroKnobValue, macroBinding);
+  }, [applyMacroGateValue, macroBinding, macroKnobValue]);
+  const su7DisplayGateList = useMemo(
+    () => resolveSu7Runtime(su7Params, undefined, { emitGuardrailEvents: false }).gateList,
+    [su7Params],
+  );
+  const su7SquashedGateCount = su7DisplayGateList?.squashedAppends ?? 0;
   const handleSu7EnabledChange = useCallback(
     (value: boolean) => {
       setSu7Params((prev) => ({ ...prev, enabled: value }));
@@ -1485,6 +2237,85 @@ export default function App() {
     },
     [setSu7Params],
   );
+  const handleGuardrailReorthon = useCallback(() => {
+    guardrailCommandsRef.current.forceReorthon = true;
+    setGuardrailConsole((prev) => {
+      const now = Date.now();
+      const message = 'Manual re-orthonormalization requested';
+      const lastEntry = prev.auditLog[prev.auditLog.length - 1];
+      if (lastEntry && lastEntry.message === message && now - lastEntry.timestamp < 250) {
+        return prev;
+      }
+      const nextLog = [
+        ...prev.auditLog,
+        {
+          id: guardrailAuditIdRef.current++,
+          kind: 'manualReorthon' as GuardrailAuditKind,
+          message,
+          severity: 'info' as const,
+          timestamp: now,
+        },
+      ];
+      if (nextLog.length > 12) {
+        nextLog.shift();
+      }
+      return { ...prev, auditLog: nextLog };
+    });
+  }, [setGuardrailConsole]);
+  const handleGuardrailAutoGain = useCallback(() => {
+    const ema = guardrailConsoleRef.current.energyEma;
+    if (!Number.isFinite(ema) || ema <= 1e-6) {
+      setGuardrailConsole((prev) => {
+        const now = Date.now();
+        const message = 'Auto-gain skipped: insufficient energy samples';
+        const lastEntry = prev.auditLog[prev.auditLog.length - 1];
+        if (lastEntry && lastEntry.message === message && now - lastEntry.timestamp < 250) {
+          return prev;
+        }
+        const nextLog = [
+          ...prev.auditLog,
+          {
+            id: guardrailAuditIdRef.current++,
+            kind: 'manualAutoGain' as GuardrailAuditKind,
+            message,
+            severity: 'info' as const,
+            timestamp: now,
+          },
+        ];
+        if (nextLog.length > 12) {
+          nextLog.shift();
+        }
+        return { ...prev, auditLog: nextLog };
+      });
+      return;
+    }
+    const correction = ema > 0 ? clamp(1 / ema, 0.2, 5) : 1;
+    setSu7Params((prev) => {
+      const nextGain = clamp(prev.gain * correction, 0.05, 5);
+      if (!Number.isFinite(nextGain)) {
+        return prev;
+      }
+      return { ...prev, gain: nextGain };
+    });
+    setGuardrailConsole((prev) => {
+      const now = Date.now();
+      const message = `Manual auto-gain applied (×${correction.toFixed(2)})`;
+      const nextLog = [
+        ...prev.auditLog,
+        {
+          id: guardrailAuditIdRef.current++,
+          kind: 'manualAutoGain' as GuardrailAuditKind,
+          message,
+          severity: 'info' as const,
+          timestamp: now,
+        },
+      ];
+      if (nextLog.length > 12) {
+        nextLog.shift();
+      }
+      return { ...prev, auditLog: nextLog };
+    });
+  }, [setGuardrailConsole, setSu7Params]);
   const handleSu7SeedChange = useCallback(
     (value: number) => {
       setSu7Params((prev) => ({
@@ -1496,13 +2327,28 @@ export default function App() {
   );
   const handleSu7ProjectorChange = useCallback(
     (value: string) => {
-      setSu7Params((prev) => ({
-        ...prev,
-        projector: {
-          ...prev.projector,
-          id: value.toLowerCase(),
-        },
-      }));
+      const id = value.toLowerCase();
+      setSu7Params((prev) => {
+        const previousProjector = prev.projector ?? { id };
+        let nextHopf = previousProjector.hopf;
+        if (id === 'hopflens') {
+          const sanitized = resolveHopfLenses(previousProjector);
+          nextHopf =
+            sanitized.length > 0
+              ? { lenses: sanitized.map((lens) => ({ ...lens })) }
+              : {
+                  lenses: DEFAULT_HOPF_LENSES.map((lens) => ({ ...lens })),
+                };
+        }
+        return {
+          ...prev,
+          projector: {
+            ...previousProjector,
+            id,
+            hopf: nextHopf,
+          },
+        };
+      });
     },
     [setSu7Params],
   );
@@ -1528,7 +2374,11 @@ export default function App() {
               ? definition.projectorWeight
               : prev.projector.weight,
         },
+        gateAppends: [],
       }));
+      setMacroBinding(null);
+      setMacroKnobValue(0);
+      setMacroLearnMode(false);
     },
     [setSu7Params, setSu7ScheduleStrength],
   );
@@ -1545,6 +2395,54 @@ export default function App() {
     },
     [setSu7Params, setSu7ScheduleStrength],
   );
+  const handleMacroKnobChange = useCallback(
+    (value: number) => {
+      const clamped = Math.max(-2, Math.min(2, value));
+      setMacroKnobValue(clamped);
+      applyMacroGateValue(clamped, macroBinding);
+    },
+    [applyMacroGateValue, macroBinding, setMacroKnobValue],
+  );
+  const handleEdgeGesture = useCallback(
+    ({ axis, deltaTheta, deltaPhi }: { axis: number; deltaTheta: number; deltaPhi: number }) => {
+      const theta = Math.max(-Math.PI, Math.min(Math.PI, deltaTheta));
+      const phase = wrapAngle(deltaPhi);
+      const label = nextGateLabel('edge');
+      updateSu7GateAppends((current) => [
+        ...current,
+        {
+          kind: 'pulse' as const,
+          axis,
+          theta,
+          phase,
+          label,
+        },
+      ]);
+      if (macroLearnMode) {
+        const binding: MacroBinding = {
+          gateLabel: label,
+          axis,
+          thetaScale: theta,
+          phiScale: deltaPhi,
+          phiBase: 0,
+        };
+        const initialValue = Math.abs(theta) > 1e-6 || Math.abs(deltaPhi) > 1e-6 ? 1 : 0;
+        setMacroBinding(binding);
+        setMacroKnobValue(initialValue);
+        applyMacroGateValue(initialValue, binding);
+        setMacroLearnMode(false);
+      }
+    },
+    [
+      applyMacroGateValue,
+      macroLearnMode,
+      nextGateLabel,
+      setMacroBinding,
+      setMacroKnobValue,
+      setMacroLearnMode,
+      updateSu7GateAppends,
+    ],
+  );
   const su7PresetOptions = useMemo(() => {
     if (su7Params.preset && !isSu7PresetId(su7Params.preset)) {
       const label = su7Params.preset.length > 0 ? su7Params.preset : 'Custom preset';
@@ -1552,6 +2450,7 @@ export default function App() {
     }
     return SU7_PRESET_OPTIONS;
   }, [su7Params.preset]);
+  const su7GateAppends = su7Params.gateAppends ?? [];
   const su7PresetSelectValue =
     typeof su7Params.preset === 'string' && su7Params.preset.length > 0
       ? su7Params.preset
@@ -1574,6 +2473,184 @@ export default function App() {
     return SU7_PROJECTOR_OPTIONS;
   }, [su7ProjectorId]);
   const su7ProjectorSelectValue = su7ProjectorId ?? SU7_PROJECTOR_OPTIONS[0].value;
+  const hopfLenses = useMemo(() => resolveHopfLenses(su7Params.projector), [su7Params.projector]);
+  const updateHopfLenses = useCallback(
+    (mutator: (lenses: HopfLensDescriptor[]) => boolean | void) => {
+      setSu7Params((prev) => {
+        const current = resolveHopfLenses(prev.projector);
+        const next = current.map((lens) => ({ ...lens }));
+        const result = mutator(next);
+        if (result === false) {
+          return prev;
+        }
+        return {
+          ...prev,
+          projector: {
+            ...prev.projector,
+            hopf: { lenses: next },
+          },
+        };
+      });
+    },
+    [setSu7Params],
+  );
+  const handleHopfAxisChange = useCallback(
+    (index: number, which: 'a' | 'b', value: number) => {
+      const axis = Math.max(0, Math.min(6, Math.trunc(value)));
+      updateHopfLenses((lenses) => {
+        const lens = lenses[index];
+        if (!lens) return false;
+        const axes = [...lens.axes] as [number, number];
+        const position = which === 'a' ? 0 : 1;
+        if (axes[position] === axis) {
+          return false;
+        }
+        axes[position] = axis;
+        lenses[index] = { ...lens, axes };
+        return true;
+      });
+    },
+    [updateHopfLenses],
+  );
+  const handleHopfBaseMixChange = useCallback(
+    (index: number, value: number) => {
+      const mix = Math.max(0, Math.min(1, value));
+      updateHopfLenses((lenses) => {
+        const lens = lenses[index];
+        if (!lens) return false;
+        const previous = lens.baseMix ?? 1;
+        if (Math.abs(previous - mix) <= 1e-6) {
+          return false;
+        }
+        lenses[index] = { ...lens, baseMix: mix };
+        return true;
+      });
+    },
+    [updateHopfLenses],
+  );
+  const handleHopfFiberMixChange = useCallback(
+    (index: number, value: number) => {
+      const mix = Math.max(0, Math.min(1, value));
+      updateHopfLenses((lenses) => {
+        const lens = lenses[index];
+        if (!lens) return false;
+        const previous = lens.fiberMix ?? 1;
+        if (Math.abs(previous - mix) <= 1e-6) {
+          return false;
+        }
+        lenses[index] = { ...lens, fiberMix: mix };
+        return true;
+      });
+    },
+    [updateHopfLenses],
+  );
+  const handleHopfControlTargetChange = useCallback(
+    (index: number, target: HopfLensControlTarget) => {
+      updateHopfLenses((lenses) => {
+        let changed = false;
+        for (let i = 0; i < lenses.length; i++) {
+          const lens = lenses[i];
+          if (!lens) continue;
+          if (i === index) {
+            if (lens.controlTarget !== target) {
+              lenses[i] = { ...lens, controlTarget: target };
+              changed = true;
+            }
+          } else if (target !== 'none' && lens.controlTarget !== 'none') {
+            lenses[i] = { ...lens, controlTarget: 'none' };
+            changed = true;
+          }
+        }
+        return changed;
+      });
+    },
+    [updateHopfLenses],
+  );
+  useEffect(() => {
+    if (su7ProjectorId !== 'hopflens') {
+      if (macroBinding && macroBinding.gateLabel.startsWith('hopf-')) {
+        setMacroBinding(null);
+        setMacroKnobValue(0);
+      }
+      return;
+    }
+    const activeIndex = hopfLenses.findIndex(
+      (lens) => lens.controlTarget && lens.controlTarget !== 'none',
+    );
+    if (activeIndex === -1) {
+      if (macroBinding && macroBinding.gateLabel.startsWith('hopf-')) {
+        setMacroBinding(null);
+        setMacroKnobValue(0);
+      }
+      return;
+    }
+    const lens = hopfLenses[activeIndex];
+    const target = lens.controlTarget ?? 'none';
+    if (target === 'none') {
+      return;
+    }
+    if (macroBinding && !macroBinding.gateLabel.startsWith('hopf-')) {
+      return;
+    }
+    const label = `hopf-${target}-${activeIndex}`;
+    const axis = lens.axes[0];
+    const thetaScale = target === 'base' ? 1 : 0;
+    const phiScale = target === 'fiber' ? 1 : 0;
+    if (
+      macroBinding &&
+      macroBinding.gateLabel === label &&
+      macroBinding.axis === axis &&
+      macroBinding.thetaScale === thetaScale &&
+      macroBinding.phiScale === phiScale
+    ) {
+      return;
+    }
+    setMacroBinding({
+      gateLabel: label,
+      axis,
+      thetaScale,
+      phiScale,
+      phiBase: 0,
+    });
+    setMacroKnobValue(0);
+  }, [hopfLenses, macroBinding, setMacroBinding, setMacroKnobValue, su7ProjectorId]);
+
+  useEffect(() => {
+    let canceled = false;
+    void Su7GpuKernel.create({
+      backend: 'auto',
+      label: 'su7-transform-kernel',
+      onWarning: (event) => {
+        if (canceled) return;
+        su7GpuWarningRef.current = { ...event };
+        console.warn(
+          `[su7-gpu] median frame time drift ${(event.drift * 100).toFixed(1)}% (median ${event.medianMs.toFixed(3)}ms)`,
+        );
+      },
+    })
+      .then((kernelInstance) => {
+        if (canceled) {
+          kernelInstance.dispose();
+          return;
+        }
+        su7GpuKernelRef.current = kernelInstance;
+      })
+      .catch((error) => {
+        console.warn('[su7-gpu] kernel unavailable', error);
+      });
+    return () => {
+      canceled = true;
+      if (su7GpuKernelRef.current) {
+        su7GpuKernelRef.current.dispose();
+        su7GpuKernelRef.current = null;
+      }
+      su7GpuReadyRef.current = null;
+      su7GpuPendingRef.current = null;
+      su7GpuStatsRef.current = null;
+      su7GpuWarningRef.current = null;
+      su7GpuLastProfileRef.current = null;
+    };
+  }, []);
 
   const [kernel, setKernel] = useState<KernelSpec>(() => getDefaultKernelSpec());
   const updateKernel = useCallback(
@@ -1949,6 +3026,61 @@ export default function App() {
   const [epsKur, setEpsKur] = useState(0.002);
   const [fluxX, setFluxX] = useState(0);
   const [fluxY, setFluxY] = useState(0);
+  const [fluxSources, setFluxSources] = useState<FluxSource[]>([]);
+  const [qcdBeta, setQcdBeta] = useState(5.25);
+  const [qcdStepsPerSecond, setQcdStepsPerSecond] = useState(3);
+  const [qcdSmearingAlpha, setQcdSmearingAlpha] = useState(0.5);
+  const [qcdSmearingIterations, setQcdSmearingIterations] = useState(1);
+  const [qcdBaseSeed, setQcdBaseSeed] = useState(2024);
+  const [qcdDepth, setQcdDepth] = useState(1);
+  const [qcdTemporalExtent, setQcdTemporalExtent] = useState(1);
+  const [qcdBatchLayers, setQcdBatchLayers] = useState(1);
+  const [qcdTemperatureScheduleText, setQcdTemperatureScheduleText] = useState('');
+  const [qcdPolyakovSchedule, setQcdPolyakovSchedule] = useState<number[]>([]);
+  const [qcdPerfLog, setQcdPerfLog] = useState<string[]>([]);
+  const [qcdRunning, setQcdRunning] = useState(false);
+  const [qcdObservables, setQcdObservables] = useState<QcdObservables | null>(null);
+  const [qcdSnapshotHash, setQcdSnapshotHash] = useState<string | null>(null);
+  const [qcdOverlayState, setQcdOverlayState] = useState<FluxOverlayFrameData | null>(null);
+  const [qcdProbeFrame, setQcdProbeFrame] = useState<ProbeTransportFrameData | null>(null);
+  const qcdTemperatureSchedule = useMemo(() => {
+    if (!qcdTemperatureScheduleText.trim()) {
+      return [] as number[];
+    }
+    const tokens = qcdTemperatureScheduleText
+      .split(/[\s,]+/)
+      .map((token) => Number.parseFloat(token))
+      .filter((value) => Number.isFinite(value));
+    return tokens.slice(0, 64);
+  }, [qcdTemperatureScheduleText]);
+  const qcdDepthInt = Math.max(1, Math.floor(qcdDepth));
+  const qcdTemporalExtentInt = Math.max(1, Math.floor(qcdTemporalExtent));
+  useEffect(() => {
+    setQcdBatchLayers((prev) => {
+      const normalized = Math.max(1, Math.floor(prev));
+      const maxLayers = Math.max(1, qcdDepthInt * qcdTemporalExtentInt);
+      const clamped = Math.min(normalized, maxLayers);
+      return clamped === prev ? prev : clamped;
+    });
+  }, [qcdDepthInt, qcdTemporalExtentInt]);
+  const qcdBatchLayersInt = Math.max(1, Math.floor(qcdBatchLayers));
+  const appendQcdPerfLog = useCallback((entry: string) => {
+    setQcdPerfLog((prev) => {
+      const next = [...prev, entry];
+      return next.length > 12 ? next.slice(next.length - 12) : next;
+    });
+  }, []);
+  const schedulesEqual = (left: readonly number[], right: readonly number[]): boolean => {
+    if (left.length !== right.length) {
+      return false;
+    }
+    for (let i = 0; i < left.length; i++) {
+      if (Math.abs(left[i]! - right[i]!) > 1e-6) {
+        return false;
+      }
+    }
+    return true;
+  };
   const [qInit, setQInit] = useState(1);
   const [smallWorldEnabled, setSmallWorldEnabled] = useState(false);
   const [smallWorldWeight, setSmallWorldWeight] = useState(0.75);
@@ -1993,6 +3125,16 @@ export default function App() {
   const [syntheticBaselines, setSyntheticBaselines] = useState<
     Partial<Record<SyntheticCaseId, { metrics: RainbowFrameMetrics; timestamp: number }>>
   >({});
+  const fluxOverlayFallback = useMemo<FluxOverlayFrameData | null>(() => {
+    if (width <= 0 || height <= 0) {
+      return null;
+    }
+    if (fluxSources.length < 2) {
+      return null;
+    }
+    return computeFluxOverlayState({ width, height, sources: fluxSources }) ?? null;
+  }, [width, height, fluxSources]);
+  const activeFluxOverlay = qcdOverlayState ?? fluxOverlayFallback;
   const markFieldFresh = useCallback(
     (kind: FieldKind, resolution: FieldResolution, source: string) => {
       const now = performance.now();
@@ -2059,6 +3201,10 @@ export default function App() {
   }, [recordingFormatId]);
 
   useEffect(() => {
+    qcdRunningRef.current = qcdRunning;
+  }, [qcdRunning]);
+
+  useEffect(() => {
     if (!tracerRuntime.enabled) {
       resetTracerState();
     }
@@ -2068,8 +3214,438 @@ export default function App() {
     resetTracerState();
   }, [width, height, resetTracerState]);
 
+  const nextFluxChargeRef = useRef<1 | -1>(1);
   const normTargetRef = useRef(0.6);
   const lastObsRef = useRef(0.6);
+  const qcdRuntimeRef = useRef<QcdRuntimeState | null>(null);
+  const qcdSnapshotRef = useRef<QcdSnapshot | null>(null);
+  const qcdTimerRef = useRef<number | null>(null);
+  const qcdRunningRef = useRef(false);
+  const qcdStepInFlightRef = useRef(false);
+  const qcdCpuRngRef = useRef<(() => number) | null>(null);
+  const qcdBaseSeedRef = useRef(qcdBaseSeed);
+  const qcdSweeps = qcdRuntimeRef.current?.sweepIndex ?? 0;
+  const cloneQcdObservables = (obs: QcdObservables): QcdObservables => ({
+    averagePlaquette: obs.averagePlaquette,
+    plaquetteHistory: [...obs.plaquetteHistory],
+    plaquetteEstimate: { ...obs.plaquetteEstimate },
+    wilsonLoops: obs.wilsonLoops.map((entry) => ({ ...entry })),
+    creutzRatio: obs.creutzRatio ? { ...obs.creutzRatio } : undefined,
+    polyakovSamples: obs.polyakovSamples
+      ? obs.polyakovSamples.map((sample) => ({
+          axis: sample.axis,
+          extent: sample.extent,
+          magnitude: sample.magnitude,
+          sampleCount: sample.sampleCount,
+          average: { ...sample.average },
+        }))
+      : undefined,
+  });
+
+  const removeFluxSource = useCallback((index: number) => {
+    setFluxSources((prev) => prev.filter((_, idx) => idx !== index));
+  }, []);
+
+  const flipFluxSourceCharge = useCallback((index: number) => {
+    setFluxSources((prev) =>
+      prev.map((entry, idx) =>
+        idx === index ? { ...entry, charge: entry.charge >= 0 ? -1 : 1 } : entry,
+      ),
+    );
+  }, []);
+
+  const clearFluxSources = useCallback(() => {
+    setFluxSources([]);
+    nextFluxChargeRef.current = 1;
+  }, []);
+
+  const handleCanvasPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLCanvasElement>) => {
+      const canvas = canvasRef.current;
+      if (!canvas || width <= 0 || height <= 0) return;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
+      const pointerX = ((event.clientX - rect.left) / rect.width) * width;
+      const pointerY = ((event.clientY - rect.top) / rect.height) * height;
+      if (!Number.isFinite(pointerX) || !Number.isFinite(pointerY)) return;
+      const clampedX = clamp(Math.round(pointerX), 0, width - 1);
+      const clampedY = clamp(Math.round(pointerY), 0, height - 1);
+      const searchRadius = Math.max(6, Math.min(width, height) * 0.04);
+      let nearestIndex = -1;
+      let nearestDistance = Number.POSITIVE_INFINITY;
+      for (let idx = 0; idx < fluxSources.length; idx++) {
+        const source = fluxSources[idx]!;
+        const dx = source.x - clampedX;
+        const dy = source.y - clampedY;
+        const dist = Math.hypot(dx, dy);
+        if (dist < nearestDistance) {
+          nearestDistance = dist;
+          nearestIndex = idx;
+        }
+      }
+      const removing = event.button === 2 || event.shiftKey;
+      if (removing) {
+        if (nearestIndex >= 0 && nearestDistance <= searchRadius) {
+          removeFluxSource(nearestIndex);
+        }
+        event.preventDefault();
+        return;
+      }
+      if (nearestIndex >= 0 && nearestDistance <= Math.max(3, searchRadius * 0.35)) {
+        flipFluxSourceCharge(nearestIndex);
+        event.preventDefault();
+        return;
+      }
+      const explicitCharge = event.altKey || event.metaKey ? -1 : event.ctrlKey ? 1 : null;
+      const charge =
+        explicitCharge != null ? (explicitCharge > 0 ? 1 : -1) : nextFluxChargeRef.current;
+      setFluxSources((prev) => [...prev, { x: clampedX, y: clampedY, charge, strength: 1 }]);
+      if (explicitCharge == null) {
+        nextFluxChargeRef.current = charge === 1 ? -1 : 1;
+      }
+      event.preventDefault();
+    },
+    [fluxSources, flipFluxSourceCharge, height, removeFluxSource, width],
+  );
+
+  const handleCanvasContextMenu = useCallback((event: React.MouseEvent<HTMLCanvasElement>) => {
+    event.preventDefault();
+  }, []);
+
+  const getQcdConfig = useCallback((): QcdAnnealConfig => {
+    const maxBatchLayers = Math.max(1, qcdDepthInt * qcdTemporalExtentInt);
+    const batchLayers = Math.min(qcdBatchLayersInt, maxBatchLayers);
+    return {
+      beta: qcdBeta,
+      overRelaxationSteps: 1,
+      smearing: {
+        alpha: clamp(qcdSmearingAlpha, 0, 1),
+        iterations: Math.max(0, Math.floor(qcdSmearingIterations)),
+      },
+      depth: qcdDepthInt,
+      temporalExtent: qcdTemporalExtentInt,
+      batchLayers,
+      temperatureSchedule: qcdTemperatureSchedule.length > 0 ? [...qcdTemperatureSchedule] : [],
+    };
+  }, [
+    qcdBeta,
+    qcdSmearingAlpha,
+    qcdSmearingIterations,
+    qcdDepthInt,
+    qcdTemporalExtentInt,
+    qcdBatchLayersInt,
+    qcdTemperatureSchedule,
+  ]);
+
+  const ensureQcdRuntime = useCallback(
+    (options?: {
+      reinitialize?: boolean;
+      snapshot?: QcdSnapshot;
+      sourcesOverride?: FluxSource[];
+    }) => {
+      const sourceList = options?.sourcesOverride ?? fluxSources;
+
+      const applyPolyakovSchedule = (
+        runtime: QcdRuntimeState,
+        schedule: readonly number[],
+        reason: string,
+      ): boolean => {
+        if (!schedule || schedule.length === 0) {
+          const hadSamples =
+            runtime.polyakovScan.length > 0 ||
+            (runtime.observables.polyakovSamples?.length ?? 0) > 0;
+          runtime.polyakovScan = [];
+          runtime.observables.polyakovSamples = undefined;
+          setQcdPolyakovSchedule([]);
+          if (hadSamples) {
+            appendQcdPerfLog(`[polyakov] ${reason}: cleared`);
+            return true;
+          }
+          return false;
+        }
+        const axis = runtime.lattice.axes.includes('t') ? ('t' as const) : runtime.lattice.axes[0];
+        if (!axis) {
+          runtime.polyakovScan = [];
+          runtime.observables.polyakovSamples = undefined;
+          setQcdPolyakovSchedule([]);
+          appendQcdPerfLog(`[polyakov] ${reason}: skipped (no active axis)`);
+          return true;
+        }
+        runTemperatureScan(runtime, schedule, axis);
+        setQcdPolyakovSchedule([...schedule]);
+        appendQcdPerfLog(`[polyakov] ${reason}: ${schedule.length} β along ${axis}`);
+        return true;
+      };
+
+      if (options?.snapshot) {
+        try {
+          const runtime = restoreQcdRuntime(options.snapshot);
+          const restoredSchedule = Array.isArray(runtime.config.temperatureSchedule)
+            ? runtime.config.temperatureSchedule.filter((value) => Number.isFinite(value))
+            : [];
+          const latticeAxisCount = Math.max(
+            1,
+            runtime.lattice.depth * runtime.lattice.temporalExtent,
+          );
+          const restoredBatchLayers = Math.max(
+            1,
+            Math.min(Math.floor(runtime.config.batchLayers ?? qcdBatchLayersInt), latticeAxisCount),
+          );
+          runtime.config = {
+            ...runtime.config,
+            beta: qcdBeta,
+            overRelaxationSteps: runtime.config.overRelaxationSteps ?? 1,
+            smearing: {
+              alpha: clamp(qcdSmearingAlpha, 0, 1),
+              iterations: Math.max(0, Math.floor(qcdSmearingIterations)),
+            },
+            depth: runtime.lattice.depth,
+            temporalExtent: runtime.lattice.temporalExtent,
+            batchLayers: restoredBatchLayers,
+            temperatureSchedule: restoredSchedule,
+          };
+          qcdRuntimeRef.current = runtime;
+          qcdCpuRngRef.current = mulberry32(runtime.baseSeed >>> 0);
+          setQcdDepth(runtime.lattice.depth);
+          setQcdTemporalExtent(runtime.lattice.temporalExtent);
+          setQcdBatchLayers(restoredBatchLayers);
+          setQcdTemperatureScheduleText(
+            restoredSchedule.length > 0
+              ? restoredSchedule.map((value) => value.toFixed(3)).join(', ')
+              : '',
+          );
+          setQcdPerfLog([]);
+          const mutated = applyPolyakovSchedule(runtime, restoredSchedule, 'restored');
+          const overlay = buildQcdOverlay(runtime, sourceList, width, height);
+          setQcdOverlayState(overlay);
+          const probeFrame = buildQcdProbeFrame(runtime, sourceList);
+          setQcdProbeFrame(probeFrame);
+          setQcdObservables(cloneQcdObservables(runtime.observables));
+          if (!mutated && restoredSchedule.length === 0) {
+            appendQcdPerfLog('[polyakov] restored: no schedule');
+          }
+          qcdSnapshotRef.current = options.snapshot;
+          const { hash } = hashQcdSnapshot(options.snapshot);
+          setQcdSnapshotHash(hash);
+          return runtime;
+        } catch (error) {
+          console.error('[qcd] failed to restore snapshot', error);
+          return null;
+        }
+      }
+
+      if (width <= 0 || height <= 0) {
+        return null;
+      }
+
+      const config = getQcdConfig();
+      const baseSeed = qcdBaseSeed >>> 0;
+      const latticeSize = deriveLatticeResolution(width, height);
+      const existing = qcdRuntimeRef.current;
+      if (
+        existing &&
+        existing.baseSeed === baseSeed &&
+        existing.lattice.width > 0 &&
+        !options?.reinitialize
+      ) {
+        const dimensionChanged =
+          existing.lattice.width !== latticeSize.width ||
+          existing.lattice.height !== latticeSize.height ||
+          existing.lattice.depth !== config.depth ||
+          existing.lattice.temporalExtent !== config.temporalExtent;
+        if (!dimensionChanged) {
+          const currentSchedule = existing.config.temperatureSchedule ?? [];
+          const scheduleChanged = !schedulesEqual(currentSchedule, config.temperatureSchedule);
+          existing.config = config;
+          if (scheduleChanged) {
+            const mutated = applyPolyakovSchedule(existing, config.temperatureSchedule, 'updated');
+            if (mutated || currentSchedule.length > 0 || config.temperatureSchedule.length > 0) {
+              setQcdObservables(cloneQcdObservables(existing.observables));
+            }
+          }
+          return existing;
+        }
+      }
+
+      setQcdPerfLog([]);
+      const runtime = initializeQcdRuntime({
+        latticeSize,
+        config,
+        baseSeed,
+        startMode: 'cold',
+      });
+      qcdRuntimeRef.current = runtime;
+      qcdCpuRngRef.current = mulberry32(baseSeed);
+      const overlay = buildQcdOverlay(runtime, sourceList, width, height);
+      setQcdOverlayState(overlay);
+      const probeFrame = buildQcdProbeFrame(runtime, sourceList);
+      setQcdProbeFrame(probeFrame);
+      applyPolyakovSchedule(runtime, config.temperatureSchedule, 'initialized');
+      setQcdObservables(cloneQcdObservables(runtime.observables));
+      const snapshot = buildQcdSnapshot(runtime, sourceList);
+      const { hash } = hashQcdSnapshot(snapshot);
+      qcdSnapshotRef.current = snapshot;
+      setQcdSnapshotHash(hash);
+      if (config.temperatureSchedule.length === 0) {
+        appendQcdPerfLog('[polyakov] initialized: no schedule');
+      }
+      return runtime;
+    },
+    [
+      appendQcdPerfLog,
+      cloneQcdObservables,
+      fluxSources,
+      getQcdConfig,
+      height,
+      qcdBaseSeed,
+      qcdBatchLayersInt,
+      qcdSmearingAlpha,
+      qcdSmearingIterations,
+      qcdBeta,
+      schedulesEqual,
+      width,
+    ],
+  );
+
+  const runQcdStep = useCallback(async () => {
+    if (qcdStepInFlightRef.current) {
+      return;
+    }
+    const runtime = ensureQcdRuntime();
+    if (!runtime) {
+      return;
+    }
+    qcdStepInFlightRef.current = true;
+    try {
+      let success = false;
+      const gpuState = gpuStateRef.current;
+      const axes = runtime.lattice.axes;
+      const axisIndex = axes.length > 0 ? Math.floor(runtime.phaseIndex / 2) % axes.length : -1;
+      const activeAxis = axisIndex >= 0 ? axes[axisIndex]! : null;
+      const parity = (runtime.phaseIndex % 2) as 0 | 1;
+      if (gpuState?.renderer) {
+        success = await runGpuSubstep(runtime, gpuState.renderer, 'interactive-qcd');
+      }
+      if (success) {
+        appendQcdPerfLog(
+          `[gpu] axis ${activeAxis ?? '?'} parity ${parity} batch ${runtime.config.batchLayers}`,
+        );
+      }
+      if (!success) {
+        appendQcdPerfLog('[gpu] sweep unavailable, fallback to CPU');
+        if (!qcdCpuRngRef.current) {
+          qcdCpuRngRef.current = mulberry32(runtime.baseSeed >>> 0);
+        }
+        runCpuSweep(runtime, qcdCpuRngRef.current!);
+        appendQcdPerfLog('[cpu] heatbath sweep completed');
+      }
+      if (runtime.phaseIndex === 0) {
+        setQcdObservables(cloneQcdObservables(runtime.observables));
+        const overlay = buildQcdOverlay(runtime, fluxSources, width, height);
+        setQcdOverlayState(overlay);
+        const probeFrame = buildQcdProbeFrame(runtime, fluxSources);
+        setQcdProbeFrame(probeFrame);
+        const snapshot = buildQcdSnapshot(runtime, fluxSources);
+        const { hash } = hashQcdSnapshot(snapshot);
+        qcdSnapshotRef.current = snapshot;
+        setQcdSnapshotHash(hash);
+      }
+    } catch (error) {
+      console.warn('[qcd] anneal step failed', error);
+    } finally {
+      qcdStepInFlightRef.current = false;
+    }
+  }, [appendQcdPerfLog, cloneQcdObservables, ensureQcdRuntime, fluxSources, height, width]);
+
+  const stopQcdAnneal = useCallback(() => {
+    if (qcdTimerRef.current != null) {
+      window.clearTimeout(qcdTimerRef.current);
+      qcdTimerRef.current = null;
+    }
+    qcdRunningRef.current = false;
+    setQcdRunning(false);
+  }, []);
+
+  const startQcdAnneal = useCallback(() => {
+    if (qcdRunningRef.current) {
+      return;
+    }
+    const runtime = ensureQcdRuntime();
+    if (!runtime) {
+      return;
+    }
+    qcdRunningRef.current = true;
+    setQcdRunning(true);
+    const loop = async () => {
+      if (!qcdRunningRef.current) {
+        return;
+      }
+      await runQcdStep();
+      if (!qcdRunningRef.current) {
+        return;
+      }
+      const intervalMs = Math.max(16, Math.round(1000 / clamp(qcdStepsPerSecond, 0.1, 60)));
+      qcdTimerRef.current = window.setTimeout(loop, intervalMs);
+    };
+    void loop();
+  }, [ensureQcdRuntime, qcdStepsPerSecond, runQcdStep]);
+
+  const handlePolyakovScan = useCallback(() => {
+    const schedule = qcdTemperatureSchedule;
+    if (schedule.length === 0) {
+      appendQcdPerfLog('[polyakov] manual scan skipped: empty schedule');
+      return;
+    }
+    const runtime = ensureQcdRuntime();
+    if (!runtime) {
+      appendQcdPerfLog('[polyakov] manual scan skipped: runtime unavailable');
+      return;
+    }
+    const axis = runtime.lattice.axes.includes('t') ? ('t' as const) : runtime.lattice.axes[0];
+    if (!axis) {
+      appendQcdPerfLog('[polyakov] manual scan skipped: no active axis');
+      return;
+    }
+    runTemperatureScan(runtime, schedule, axis);
+    setQcdPolyakovSchedule([...schedule]);
+    setQcdObservables(cloneQcdObservables(runtime.observables));
+    appendQcdPerfLog(`[polyakov] manual scan: ${schedule.length} β along ${axis}`);
+  }, [appendQcdPerfLog, cloneQcdObservables, ensureQcdRuntime, qcdTemperatureSchedule]);
+
+  useEffect(() => {
+    if (!qcdRunning) {
+      ensureQcdRuntime();
+    }
+  }, [ensureQcdRuntime, qcdRunning, fluxSources, width, height]);
+
+  useEffect(() => stopQcdAnneal, [stopQcdAnneal]);
+
+  useEffect(() => {
+    if (qcdRuntimeRef.current && !qcdRunning) {
+      const overlay = buildQcdOverlay(qcdRuntimeRef.current, fluxSources, width, height);
+      setQcdOverlayState(overlay);
+      const probeFrame = buildQcdProbeFrame(qcdRuntimeRef.current, fluxSources);
+      setQcdProbeFrame(probeFrame);
+      const snapshot = buildQcdSnapshot(qcdRuntimeRef.current, fluxSources);
+      const { hash } = hashQcdSnapshot(snapshot);
+      qcdSnapshotRef.current = snapshot;
+      setQcdSnapshotHash(hash);
+    }
+  }, [fluxSources, width, height, qcdRunning]);
+
+  useEffect(() => {
+    if (qcdBaseSeedRef.current === qcdBaseSeed) {
+      return;
+    }
+    qcdBaseSeedRef.current = qcdBaseSeed;
+    if (!qcdRuntimeRef.current) {
+      return;
+    }
+    if (qcdRunningRef.current) {
+      stopQcdAnneal();
+    }
+    ensureQcdRuntime({ reinitialize: true });
+  }, [ensureQcdRuntime, qcdBaseSeed, stopQcdAnneal]);
 
   const kurSyncRef = useRef(false);
   const kurStateRef = useRef<KuramotoState | null>(null);
@@ -2187,8 +3763,6 @@ export default function App() {
     frames: 0,
   });
 
-  const randn = useRandN();
-
   const logKurTelemetry = useCallback((telemetry: KuramotoTelemetrySnapshot | null) => {
     if (!telemetry) return;
     const last = kurLogRef.current;
@@ -2208,22 +3782,34 @@ export default function App() {
     kurLogRef.current = { kernelVersion: telemetry.kernelVersion, frameId: telemetry.frameId };
   }, []);
 
-  const recordTelemetry = useCallback((phase: TelemetryPhase, ms: number) => {
-    const tele = telemetryRef.current;
-    if (!tele.enabled) return;
-    const threshold = tele.thresholds[phase] ?? tele.thresholds.frame;
-    if (ms > threshold) {
-      const now = performance.now();
-      if (now - tele.lastLogTs > 1000) {
-        console.warn(`[telemetry] ${phase} ${ms.toFixed(2)}ms`);
-        tele.lastLogTs = now;
+  const recordTelemetry = useCallback(
+    (phase: TelemetryPhase, ms: number) => {
+      if (phase === 'frame') {
+        guardrailFrameTimeRef.current = ms;
+        setGuardrailConsole((prev) => {
+          if (Math.abs(prev.frameTimeMs - ms) <= 1e-3) {
+            return prev;
+          }
+          return { ...prev, frameTimeMs: ms };
+        });
       }
-    }
-    tele.history.push({ phase, ms, ts: performance.now() });
-    if (tele.history.length > 360) {
-      tele.history.shift();
-    }
-  }, []);
+      const tele = telemetryRef.current;
+      if (!tele.enabled) return;
+      const threshold = tele.thresholds[phase] ?? tele.thresholds.frame;
+      if (ms > threshold) {
+        const now = performance.now();
+        if (now - tele.lastLogTs > 1000) {
+          console.warn(`[telemetry] ${phase} ${ms.toFixed(2)}ms`);
+          tele.lastLogTs = now;
+        }
+      }
+      tele.history.push({ phase, ms, ts: performance.now() });
+      if (tele.history.length > 360) {
+        tele.history.shift();
+      }
+    },
+    [setGuardrailConsole],
+  );
 
   useEffect(() => {
     telemetryRef.current.enabled = telemetryEnabled;
@@ -2317,6 +3903,9 @@ export default function App() {
               Number.NEGATIVE_INFINITY,
             )
           : 0;
+      const su7GpuStats = su7GpuStatsRef.current;
+      const su7GpuWarning = su7GpuWarningRef.current;
+      const su7GpuProfile = su7GpuLastProfileRef.current;
       const snapshot: TelemetrySnapshot = {
         fields: {} as Record<ComposerFieldId, TelemetryFieldSnapshot>,
         coupling: {
@@ -2331,6 +3920,16 @@ export default function App() {
           normDeltaMean: su7Totals.normDeltaMean / count,
           projectorEnergy: su7Totals.projectorEnergy / count,
         },
+        hopf:
+          history.length > 0
+            ? {
+                lenses: history[history.length - 1].metrics.hopf.lenses.map((lens) => ({
+                  ...lens,
+                  axes: [lens.axes[0], lens.axes[1]] as [number, number],
+                  base: [lens.base[0], lens.base[1], lens.base[2]] as [number, number, number],
+                })),
+              }
+            : { lenses: [] },
         su7Histograms: {
           normDeltaMean: computeTelemetryHistogram(su7NormMeanValues, 16),
           normDeltaMax: computeTelemetryHistogram(su7NormMaxValues, 16),
@@ -2343,6 +3942,19 @@ export default function App() {
         },
         frameSamples: history.length,
         updatedAt: Date.now(),
+        su7Gpu: su7GpuStats
+          ? {
+              backend: su7GpuStats.backend,
+              medianMs: su7GpuStats.medianMs,
+              meanMs: su7GpuStats.meanMs,
+              sampleCount: su7GpuStats.sampleCount,
+              baselineMs: su7GpuStats.baselineMs,
+              drift: su7GpuStats.drift,
+              warning: su7GpuStats.warning,
+              lastProfile: su7GpuProfile,
+              warningEvent: su7GpuWarning ?? null,
+            }
+          : null,
       };
       COMPOSER_FIELD_LIST.forEach((field) => {
         snapshot.fields[field] = {
@@ -2481,9 +4093,13 @@ export default function App() {
     }
     const stub = volumeStubRef.current;
     if (!stub || stub.width !== width || stub.height !== height) {
-      volumeStubRef.current = createVolumeStubState(width, height);
+      volumeStubRef.current = createVolumeStubState(
+        width,
+        height,
+        getTimelineSeed('volumeNoise', 0),
+      );
     }
-  }, [width, height]);
+  }, [width, height, getTimelineSeed]);
 
   const ensureTracerBuffer = useCallback((): Float32Array | null => {
     if (width <= 0 || height <= 0) {
@@ -2549,17 +4165,11 @@ export default function App() {
       if (needsResize) {
         const phases = Array.from({ length: orientationCount }, () => new Float32Array(total));
         const magnitudes = Array.from({ length: orientationCount }, () => new Float32Array(total));
-        const flowVectors = {
-          x: new Float32Array(total),
-          y: new Float32Array(total),
-          hyperbolicScale: new Float32Array(total),
-        };
         buffers = {
           phases,
           magnitudes,
           magnitudeHist: new Float32Array(orientationCount * SURFACE_HIST_BINS),
           orientationCount,
-          flowVectors,
         };
         surfaceDebugRef.current = buffers;
       } else if (buffers) {
@@ -2851,23 +4461,32 @@ export default function App() {
   }, [volumeEnabled, ensureVolumeState, markFieldFresh, markFieldGone]);
 
   const stepKuramotoCpu = useCallback(
-    (dt: number) => {
+    (dt: number, tSeconds: number) => {
       if (!kurEnabled) return;
       ensureKurCpuState();
       if (!kurStateRef.current) return;
       const kernelSnapshot = kernelEventRef.current;
       kurAppliedKernelVersionRef.current = kernelSnapshot.version;
       const timestamp = typeof performance !== 'undefined' ? performance.now() : Date.now();
-      const result = stepKuramotoState(kurStateRef.current, getKurParams(), dt, randn, timestamp, {
-        kernel: kernelSnapshot.spec,
-        controls: { dmt },
-        telemetry: { kernelVersion: kernelSnapshot.version },
-      });
+      const seed = getTimelineSeed('kuramotoNoise', tSeconds);
+      const frameRand = createNormalGenerator(seed);
+      const result = stepKuramotoState(
+        kurStateRef.current,
+        getKurParams(),
+        dt,
+        frameRand,
+        timestamp,
+        {
+          kernel: kernelSnapshot.spec,
+          controls: { dmt },
+          telemetry: { kernelVersion: kernelSnapshot.version },
+        },
+      );
       kurTelemetryRef.current = result.telemetry;
       kurIrradianceRef.current = result.irradiance;
       logKurTelemetry(result.telemetry);
     },
-    [kurEnabled, ensureKurCpuState, getKurParams, randn, dmt, logKurTelemetry],
+    [kurEnabled, ensureKurCpuState, getKurParams, getTimelineSeed, dmt, logKurTelemetry],
   );
 
   const deriveKurFieldsCpu = useCallback(() => {
@@ -2875,22 +4494,27 @@ export default function App() {
     ensureKurCpuState();
     if (!kurStateRef.current || !cpuDerivedRef.current) return;
     const kernelSnapshot = kernelEventRef.current;
+    const activeDmt = getTimelineNumber('dmt', dmt);
     deriveKuramotoFieldsCore(kurStateRef.current, cpuDerivedRef.current, {
       kernel: kernelSnapshot.spec,
-      controls: { dmt },
+      controls: { dmt: activeDmt },
     });
     markFieldFresh('phase', cpuDerivedRef.current.resolution, 'cpu');
-  }, [kurEnabled, ensureKurCpuState, dmt, markFieldFresh]);
+  }, [kurEnabled, ensureKurCpuState, dmt, markFieldFresh, getTimelineNumber]);
 
   const resetKuramotoField = useCallback(() => {
     initKuramotoCpu(qInit);
     if (!kurSyncRef.current && workerRef.current && workerReadyRef.current) {
+      const currentEval = timelineEvaluationRef.current;
+      const fps = timelinePlayerRef.current?.fps ?? RECORDING_FPS;
+      const seedTime = currentEval && fps > 0 ? currentEval.frameIndex / fps : 0;
       workerRef.current.postMessage({
         kind: 'reset',
         qInit,
+        seed: getTimelineSeed('kuramotoNoise', seedTime),
       });
     }
-  }, [initKuramotoCpu, qInit]);
+  }, [initKuramotoCpu, qInit, getTimelineSeed]);
 
   const markKurCustom = useCallback(() => {
     setKurRegime('custom');
@@ -3080,6 +4704,9 @@ export default function App() {
     worker.onmessage = (event: MessageEvent<WorkerIncomingMessage>) => {
       handleWorkerMessage(event.data);
     };
+    const currentEval = timelineEvaluationRef.current;
+    const currentFps = timelinePlayerRef.current?.fps ?? RECORDING_FPS;
+    const seedTime = currentEval && currentFps > 0 ? currentEval.frameIndex / currentFps : 0;
     worker.postMessage(
       {
         kind: 'init',
@@ -3088,7 +4715,7 @@ export default function App() {
         params: getKurParams(),
         qInit,
         buffers,
-        seed: Math.floor(Math.random() * 1e9),
+        seed: getTimelineSeed('kuramotoNoise', seedTime),
       },
       buffers,
     );
@@ -3101,6 +4728,7 @@ export default function App() {
     qInit,
     stopKurWorker,
     width,
+    getTimelineSeed,
   ]);
 
   useEffect(() => {
@@ -3138,6 +4766,69 @@ export default function App() {
       params: getKurParams(),
     });
   }, [getKurParams, kurEnabled, kurSync]);
+
+  const processGuardrailFrame = useCallback(
+    (metrics: RainbowFrameMetrics | null, guardrails?: Su7GuardrailStatus) => {
+      if (!metrics) {
+        return;
+      }
+      const events = guardrails?.events ?? [];
+      const frameTimeMs = guardrailFrameTimeRef.current;
+      setGuardrailConsole((prev) => {
+        const energy = Number.isFinite(metrics.su7.projectorEnergy)
+          ? metrics.su7.projectorEnergy
+          : 0;
+        const alpha = 0.2;
+        const energyEma =
+          prev.lastEnergy == null ? energy : prev.energyEma + (energy - prev.energyEma) * alpha;
+        const entries: { kind: GuardrailAuditKind; summary: GuardrailSummary }[] = [];
+        for (const event of events) {
+          entries.push({ kind: event.kind, summary: summarizeGuardrailEvent(event) });
+        }
+        const flickerEvent = detectFlickerGuardrail(prev.lastEnergy, energy, frameTimeMs, {
+          ratioThreshold: 0.12,
+          frequencyThreshold: 30,
+          minEnergy: 0.02,
+        });
+        if (flickerEvent) {
+          entries.push({ kind: flickerEvent.kind, summary: summarizeGuardrailEvent(flickerEvent) });
+        }
+        let auditLog = prev.auditLog.slice();
+        if (entries.length > 0) {
+          const now = Date.now();
+          for (const { kind, summary } of entries) {
+            const message = summary.message;
+            const lastEntry = auditLog[auditLog.length - 1];
+            if (!lastEntry || lastEntry.message !== message || now - lastEntry.timestamp > 250) {
+              auditLog = [
+                ...auditLog,
+                {
+                  id: guardrailAuditIdRef.current++,
+                  kind,
+                  message,
+                  severity: summary.severity,
+                  timestamp: now,
+                },
+              ];
+              if (auditLog.length > 12) {
+                auditLog.shift();
+              }
+            }
+          }
+        }
+        return {
+          ...prev,
+          unitaryError: metrics.su7.unitaryError,
+          determinantDrift: metrics.su7.determinantDrift,
+          frameTimeMs: frameTimeMs > 0 ? frameTimeMs : prev.frameTimeMs,
+          energyEma,
+          lastEnergy: energy,
+          auditLog,
+        };
+      });
+    },
+    [setGuardrailConsole],
+  );
 
   const renderFrameCore = useCallback(
     (
@@ -3185,6 +4876,25 @@ export default function App() {
         }
       }
 
+      updateTimelineForTime(tSeconds);
+      const activeDmt = getTimelineNumber('dmt', dmt);
+      const activeArousal = getTimelineNumber('arousal', arousal);
+      const activeBlend = getTimelineNumber('blend', blend);
+      const activeNormPin = getTimelineBoolean('normPin', normPin);
+      const activeMicrosaccade = getTimelineBoolean('microsaccade', microsaccade);
+      const activePhasePin = getTimelineBoolean('phasePin', phasePin);
+      const activeEdgeThreshold = getTimelineNumber('edgeThreshold', edgeThreshold);
+      const activeJitter = getTimelineNumber('jitter', jitter);
+      const activeSigma = getTimelineNumber('sigma', sigma);
+      const activeContrast = getTimelineNumber('contrast', contrast);
+      const activeRimAlpha = getTimelineNumber('rimAlpha', rimAlpha);
+      const activeRimEnabled = getTimelineBoolean('rimEnabled', rimEnabled);
+      const activeBeta2 = getTimelineNumber('beta2', beta2);
+      const activeAlive = getTimelineBoolean('alive', alive);
+      const activeSurfaceBlend = getTimelineNumber('surfaceBlend', surfaceBlend);
+      const activeWarpAmp = getTimelineNumber('warpAmp', warpAmp);
+      const activeThetaMode = getTimelineString<'gradient' | 'global'>('thetaMode', thetaMode);
+      const activeThetaGlobal = getTimelineNumber('thetaGlobal', thetaGlobal);
       const rimDebugRequest = showRimDebug ? ensureRimDebugBuffers() : null;
       const surfaceDebugRequest =
         showSurfaceDebug && orientations.length > 0
@@ -3194,6 +4904,11 @@ export default function App() {
       const { base: couplingBase, effective: couplingEffective } = computeCouplingPair(
         options?.toggles,
       );
+
+      const guardrailForce = guardrailCommandsRef.current.forceReorthon;
+      const guardrailOpts = commitObs
+        ? { forceReorthon: guardrailForce, emitGuardrailEvents: true }
+        : { emitGuardrailEvents: false };
 
       const result = renderRainbowFrame({
         width,
@@ -3205,36 +4920,36 @@ export default function App() {
         phase: phaseField,
         volume: volumeField,
         kernel: kernelSpec,
-        dmt,
-        arousal,
-        blend,
-        normPin,
+        dmt: activeDmt,
+        arousal: activeArousal,
+        blend: activeBlend,
+        normPin: activeNormPin,
         normTarget: normTargetRef.current,
         lastObs: lastObsRef.current,
         lambdaRef,
         lambdas,
-        beta2,
-        microsaccade,
-        alive,
-        phasePin,
-        edgeThreshold,
+        beta2: activeBeta2,
+        microsaccade: activeMicrosaccade,
+        alive: activeAlive,
+        phasePin: activePhasePin,
+        edgeThreshold: activeEdgeThreshold,
         wallpaperGroup: wallGroup,
         surfEnabled,
         orientationAngles: orientations,
-        thetaMode,
-        thetaGlobal,
+        thetaMode: activeThetaMode,
+        thetaGlobal: activeThetaGlobal,
         polBins,
-        jitter,
+        jitter: activeJitter,
         coupling: couplingEffective,
         couplingBase,
-        sigma,
-        contrast,
-        rimAlpha,
-        rimEnabled,
+        sigma: activeSigma,
+        contrast: activeContrast,
+        rimAlpha: activeRimAlpha,
+        rimEnabled: activeRimEnabled,
         displayMode,
-        surfaceBlend,
+        surfaceBlend: activeSurfaceBlend,
         surfaceRegion,
-        warpAmp,
+        warpAmp: activeWarpAmp,
         curvatureStrength,
         curvatureMode,
         hyperbolicAtlas,
@@ -3247,8 +4962,10 @@ export default function App() {
               }
             : undefined,
         su7: su7Params,
+        guardrailOptions: guardrailOpts,
         composer,
         kurTelemetry: kurTelemetryRef.current ?? undefined,
+        fluxOverlay: activeFluxOverlay ?? undefined,
       });
       const shouldApplyTracer = tracerRuntime.enabled && (options?.applyTracer ?? true);
       if (shouldApplyTracer) {
@@ -3287,6 +5004,10 @@ export default function App() {
       }
       updateDebugSnapshots(commitObs, rimDebugRequest, surfaceDebugRequest, result.debug);
       updatePhaseDebug(commitObs, phaseField);
+      if (commitObs) {
+        processGuardrailFrame(result.metrics, result.guardrails);
+        guardrailCommandsRef.current.forceReorthon = false;
+      }
       return result.metrics;
     },
     [
@@ -3333,7 +5054,12 @@ export default function App() {
       ensureSurfaceDebugBuffers,
       updateDebugSnapshots,
       updatePhaseDebug,
+      activeFluxOverlay,
       basePixelsRef,
+      getTimelineNumber,
+      getTimelineBoolean,
+      getTimelineString,
+      updateTimelineForTime,
     ],
   );
 
@@ -3399,6 +5125,29 @@ export default function App() {
         return;
       }
 
+      updateTimelineForTime(tSeconds);
+      const activeDmt = getTimelineNumber('dmt', dmt);
+      const activeArousal = getTimelineNumber('arousal', arousal);
+      const activeBlend = getTimelineNumber('blend', blend);
+      const activeNormPin = getTimelineBoolean('normPin', normPin);
+      const activeBeta2 = getTimelineNumber('beta2', beta2);
+      const activeMicrosaccade = getTimelineBoolean('microsaccade', microsaccade);
+      const activeAlive = getTimelineBoolean('alive', alive);
+      const activePhasePin = getTimelineBoolean('phasePin', phasePin);
+      const activeEdgeThreshold = getTimelineNumber('edgeThreshold', edgeThreshold);
+      const activeJitter = getTimelineNumber('jitter', jitter);
+      const activeSigma = getTimelineNumber('sigma', sigma);
+      const activeContrast = getTimelineNumber('contrast', contrast);
+      const activeRimAlpha = getTimelineNumber('rimAlpha', rimAlpha);
+      const activeRimEnabled = getTimelineBoolean('rimEnabled', rimEnabled);
+      const activeThetaMode = getTimelineString<'gradient' | 'global'>('thetaMode', thetaMode);
+      const activeThetaGlobal = getTimelineNumber('thetaGlobal', thetaGlobal);
+      const activeSurfaceBlend = getTimelineNumber('surfaceBlend', surfaceBlend);
+      const activeWarpAmp = getTimelineNumber('warpAmp', warpAmp);
+
+      const guardrailForce = guardrailCommandsRef.current.forceReorthon;
+      const guardrailNeedsMetrics = su7Params.enabled && su7Params.gain > 1e-4;
+
       const rimDebugRequest = showRimDebug ? ensureRimDebugBuffers() : null;
       const surfaceDebugRequest =
         showSurfaceDebug && orientations.length > 0
@@ -3409,24 +5158,28 @@ export default function App() {
 
       const telemetryActive = telemetryRef.current.enabled && commitObs;
       const needsCpuCompositor =
-        commitObs && (telemetryActive || rimDebugRequest != null || surfaceDebugRequest != null);
+        commitObs &&
+        (telemetryActive ||
+          rimDebugRequest != null ||
+          surfaceDebugRequest != null ||
+          guardrailNeedsMetrics);
       const renderStart = telemetryActive ? performance.now() : 0;
 
-      const ke = kEff(kernelSpec, dmt);
-      const effectiveBlend = clamp01(blend + ke.transparency * 0.5);
+      const ke = kEff(kernelSpec, activeDmt);
+      const effectiveBlend = clamp01(activeBlend + ke.transparency * 0.5);
       const eps = 1e-6;
-      const frameGain = normPin
+      const frameGain = activeNormPin
         ? Math.pow((normTargetRef.current + eps) / (lastObsRef.current + eps), 0.5)
         : 1.0;
 
       const baseOffsets = {
-        L: beta2 * (lambdaRef / lambdas.L - 1),
-        M: beta2 * (lambdaRef / lambdas.M - 1),
-        S: beta2 * (lambdaRef / lambdas.S - 1),
+        L: activeBeta2 * (lambdaRef / lambdas.L - 1),
+        M: activeBeta2 * (lambdaRef / lambdas.M - 1),
+        S: activeBeta2 * (lambdaRef / lambdas.S - 1),
       } as const;
 
-      const jitterPhase = microsaccade ? tSeconds * 6.0 : 0.0;
-      const breath = alive ? 0.15 * Math.sin(2 * Math.PI * 0.55 * tSeconds) : 0.0;
+      const jitterPhase = activeMicrosaccade ? tSeconds * 6.0 : 0.0;
+      const breath = activeAlive ? 0.15 * Math.sin(2 * Math.PI * 0.55 * tSeconds) : 0.0;
 
       const rimField = rimFieldRef.current!;
       const { gx, gy, mag } = rimField;
@@ -3480,13 +5233,13 @@ export default function App() {
       const cx = width * 0.5;
       const cy = height * 0.5;
       let muJ = 0;
-      if (phasePin && microsaccade) {
+      if (activePhasePin && activeMicrosaccade) {
         let muSum = 0;
         let muCount = 0;
         for (let yy = 0; yy < height; yy += 8) {
           for (let xx = 0; xx < width; xx += 8) {
             const idx = yy * width + xx;
-            if (mag[idx] >= edgeThreshold) {
+            if (mag[idx] >= activeEdgeThreshold) {
               muSum += Math.sin(jitterPhase + hash2(xx, yy) * Math.PI * 2);
               muCount++;
             }
@@ -3496,6 +5249,7 @@ export default function App() {
       }
 
       let metricDebug: ReturnType<typeof renderRainbowFrame>['debug'] | null = null;
+      let guardrailMetrics: ReturnType<typeof renderRainbowFrame> | null = null;
       if (needsCpuCompositor) {
         if (!metricsScratchRef.current || metricsScratchRef.current.length !== width * height * 4) {
           metricsScratchRef.current = new Uint8ClampedArray(width * height * 4);
@@ -3511,36 +5265,36 @@ export default function App() {
           phase: phaseField,
           volume: volumeField,
           kernel: kernelSpec,
-          dmt,
-          arousal,
-          blend,
-          normPin,
+          dmt: activeDmt,
+          arousal: activeArousal,
+          blend: activeBlend,
+          normPin: activeNormPin,
           normTarget: normTargetRef.current,
           lastObs: lastObsRef.current,
           lambdaRef,
           lambdas,
-          beta2,
-          microsaccade,
-          alive,
-          phasePin,
-          edgeThreshold,
+          beta2: activeBeta2,
+          microsaccade: activeMicrosaccade,
+          alive: activeAlive,
+          phasePin: activePhasePin,
+          edgeThreshold: activeEdgeThreshold,
           wallpaperGroup: wallGroup,
           surfEnabled,
           orientationAngles: orientations,
-          thetaMode,
-          thetaGlobal,
+          thetaMode: activeThetaMode,
+          thetaGlobal: activeThetaGlobal,
           polBins,
-          jitter,
+          jitter: activeJitter,
           coupling: couplingEffective,
           couplingBase,
-          sigma,
-          contrast,
-          rimAlpha,
-          rimEnabled,
+          sigma: activeSigma,
+          contrast: activeContrast,
+          rimAlpha: activeRimAlpha,
+          rimEnabled: activeRimEnabled,
           displayMode,
-          surfaceBlend,
+          surfaceBlend: activeSurfaceBlend,
           surfaceRegion,
-          warpAmp,
+          warpAmp: activeWarpAmp,
           curvatureStrength,
           curvatureMode,
           hyperbolicAtlas,
@@ -3553,10 +5307,16 @@ export default function App() {
                 }
               : undefined,
           su7: su7Params,
+          guardrailOptions: {
+            forceReorthon: guardrailForce,
+            emitGuardrailEvents: true,
+          },
           composer,
           kurTelemetry: kurTelemetryRef.current ?? undefined,
+          fluxOverlay: activeFluxOverlay ?? undefined,
         });
         metricDebug = metricsResult.debug;
+        guardrailMetrics = metricsResult;
         if (telemetryActive) {
           metricsRef.current.push({
             backend: 'gpu',
@@ -3580,8 +5340,18 @@ export default function App() {
       );
       updatePhaseDebug(commitObs, phaseField);
 
+      if (commitObs && guardrailMetrics) {
+        processGuardrailFrame(guardrailMetrics.metrics, guardrailMetrics.guardrails);
+      }
+
+      guardrailCommandsRef.current.forceReorthon = false;
+
       renderer.uploadPhase(phaseField);
       renderer.uploadVolume(volumeField ?? null);
+
+      if (!su7Params.enabled) {
+        su7GpuReadyRef.current = null;
+      }
 
       let su7Uniforms: Su7Uniforms = {
         enabled: false,
@@ -3591,6 +5361,8 @@ export default function App() {
         projectorMode: 'identity',
         projectorWeight: 0,
         projectorMatrix: null,
+        pretransformed: false,
+        hopfLenses: null,
       };
       let su7Payload: Su7TexturePayload | null = null;
       const texelCount = width * height;
@@ -3606,7 +5378,40 @@ export default function App() {
         });
         if (embedResult.vectors.length === texelCount) {
           const vectorBuffers = ensureSu7VectorBuffers(su7VectorBuffersRef.current, texelCount);
-          fillSu7VectorBuffers(embedResult.vectors, embedResult.norms, texelCount, vectorBuffers);
+          const kernel = su7GpuKernelRef.current;
+          const ready = su7GpuReadyRef.current;
+          if (
+            kernel &&
+            ready &&
+            ready.width === width &&
+            ready.height === height &&
+            ready.vectors.length >= texelCount * SU7_GPU_KERNEL_VECTOR_STRIDE
+          ) {
+            try {
+              fillSu7VectorBuffersFromPacked(ready.vectors, ready.norms, texelCount, vectorBuffers);
+              su7Uniforms.pretransformed = true;
+              su7GpuStatsRef.current = kernel.getStats();
+              su7GpuLastProfileRef.current = ready.profile ?? null;
+            } catch (error) {
+              console.warn('[su7-gpu] failed to apply pretransformed vectors', error);
+              su7Uniforms.pretransformed = false;
+              fillSu7VectorBuffers(
+                embedResult.vectors,
+                embedResult.norms,
+                texelCount,
+                vectorBuffers,
+              );
+            }
+          } else {
+            su7Uniforms.pretransformed = false;
+            fillSu7VectorBuffers(embedResult.vectors, embedResult.norms, texelCount, vectorBuffers);
+            if (
+              ready &&
+              (ready.width !== width || ready.height !== height || ready.vectors.length === 0)
+            ) {
+              su7GpuReadyRef.current = null;
+            }
+          }
           su7VectorBuffersRef.current = vectorBuffers;
           const su7ContextGpu =
             su7Params.enabled && su7Params.gain > 1e-4
@@ -3616,12 +5421,16 @@ export default function App() {
                   phase: phaseField,
                   rim: rimField,
                   volume: volumeField,
-                  dmt,
-                  arousal,
+                  dmt: activeDmt,
+                  arousal: activeArousal,
                   curvatureStrength,
                 })
               : null;
-          const unitary = buildScheduledUnitary(su7Params, su7ContextGpu ?? undefined);
+          const su7RuntimeGpu = resolveSu7Runtime(su7Params, su7ContextGpu ?? undefined, {
+            forceReorthon: guardrailForce,
+            emitGuardrailEvents: false,
+          });
+          const unitary = su7RuntimeGpu.unitary;
           const tileCols = Math.max(1, Math.ceil(width / SU7_TILE_SIZE));
           const tileRows = Math.max(1, Math.ceil(height / SU7_TILE_SIZE));
           const tileBuffer = ensureSu7TileBuffer(su7TileBufferRef.current, tileCols, tileRows);
@@ -3657,11 +5466,22 @@ export default function App() {
             projectorMode = 'overlaySplit';
           } else if (projectorId === 'directrgb') {
             projectorMode = 'directRgb';
+          } else if (projectorId === 'hopflens') {
+            projectorMode = 'hopfLens';
           }
           const projectorWeight = Math.min(
             1,
             Math.max(0, Math.abs(su7Params.projector?.weight ?? 1)),
           );
+          const pretransformedFlag = su7Uniforms.pretransformed ?? false;
+          const hopfLensUniforms =
+            projectorMode === 'hopfLens'
+              ? resolveHopfLenses(su7Params.projector).map((lens) => ({
+                  axes: lens.axes,
+                  baseMix: lens.baseMix ?? 1,
+                  fiberMix: lens.fiberMix ?? 1,
+                }))
+              : null;
           su7Uniforms = {
             enabled: true,
             gain: su7Params.gain,
@@ -3670,6 +5490,8 @@ export default function App() {
             projectorMode,
             projectorWeight,
             projectorMatrix: null,
+            pretransformed: pretransformedFlag,
+            hopfLenses: hopfLensUniforms,
           };
           su7Payload = {
             width,
@@ -3686,13 +5508,53 @@ export default function App() {
             tileSize: SU7_TILE_SIZE,
             tileTexWidth: SU7_TILE_TEXTURE_WIDTH,
             tileTexRowsPerTile: SU7_TILE_TEXTURE_ROWS_PER_TILE,
+            pretransformed: pretransformedFlag,
           };
+          if (kernel && !su7GpuPendingRef.current) {
+            const packedUnitary = packSu7Unitary(unitary, su7GpuPackedMatrixRef.current);
+            su7GpuPackedMatrixRef.current = packedUnitary;
+            const packedVectors = packSu7Vectors(embedResult.vectors, su7GpuPackedInputRef.current);
+            su7GpuPackedInputRef.current = packedVectors;
+            const expectedFloats = packedVectors.length;
+            const outputBuffer =
+              su7GpuTransformedRef.current && su7GpuTransformedRef.current.length === expectedFloats
+                ? su7GpuTransformedRef.current
+                : new Float32Array(expectedFloats);
+            su7GpuTransformedRef.current = outputBuffer;
+            const normsCopy = embedResult.norms.slice();
+            su7GpuPendingRef.current = kernel
+              .dispatch({
+                unitary: packedUnitary,
+                input: packedVectors,
+                vectorCount: texelCount,
+                output: outputBuffer,
+              })
+              .then((result) => {
+                su7GpuReadyRef.current = {
+                  width,
+                  height,
+                  vectors: result,
+                  norms: normsCopy,
+                  profile: kernel.getLastProfile(),
+                  timestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+                };
+                su7GpuStatsRef.current = kernel.getStats();
+              })
+              .catch((error) => {
+                console.warn('[su7-gpu] dispatch failed', error);
+              })
+              .finally(() => {
+                su7GpuPendingRef.current = null;
+              });
+          } else if (!kernel) {
+            su7GpuReadyRef.current = null;
+          }
         }
       }
 
       renderer.uploadSu7(su7Payload);
 
-      const couplingScale = 1 + 0.65 * dmt;
+      const couplingScale = 1 + 0.65 * activeDmt;
 
       const lastGpuTracerTime = gpuTracerRef.current.lastTime;
       const tracerDelta = lastGpuTracerTime != null ? Math.max(0, tSeconds - lastGpuTracerTime) : 0;
@@ -3703,36 +5565,36 @@ export default function App() {
 
       renderer.render({
         time: tSeconds,
-        edgeThreshold,
+        edgeThreshold: activeEdgeThreshold,
         effectiveBlend,
         displayMode: displayModeToEnum(displayMode),
         baseOffsets: [baseOffsets.L, baseOffsets.M, baseOffsets.S],
-        sigma,
-        jitter,
+        sigma: activeSigma,
+        jitter: activeJitter,
         jitterPhase,
         breath,
         muJ,
-        phasePin,
-        microsaccade,
+        phasePin: activePhasePin,
+        microsaccade: activeMicrosaccade,
         polBins,
-        thetaMode: thetaMode === 'gradient' ? 0 : 1,
-        thetaGlobal,
-        contrast,
+        thetaMode: activeThetaMode === 'gradient' ? 0 : 1,
+        thetaGlobal: activeThetaGlobal,
+        contrast: activeContrast,
         frameGain,
-        rimAlpha,
-        rimEnabled,
-        warpAmp,
+        rimAlpha: activeRimAlpha,
+        rimEnabled: activeRimEnabled,
+        warpAmp: activeWarpAmp,
         curvatureStrength,
         curvatureMode,
-        surfaceBlend,
+        surfaceBlend: activeSurfaceBlend,
         surfaceRegion: surfaceRegionToEnum(surfaceRegion),
         surfEnabled,
         kurEnabled,
         volumeEnabled,
         useWallpaper,
         kernel: ke,
-        alive,
-        beta2,
+        alive: activeAlive,
+        beta2: activeBeta2,
         coupling: couplingEffective,
         couplingScale,
         composerExposure: composerUniforms.exposure,
@@ -3811,6 +5673,10 @@ export default function App() {
       logFrameMetrics,
       tracerRuntime,
       deriveSu7ScheduleContext,
+      getTimelineNumber,
+      getTimelineBoolean,
+      getTimelineString,
+      updateTimelineForTime,
     ],
   );
 
@@ -3833,8 +5699,9 @@ export default function App() {
     (dt: number, tSeconds: number) => {
       if (!kurEnabled) return;
       const teleStart = telemetryRef.current.enabled ? performance.now() : 0;
+      updateTimelineForTime(tSeconds);
       if (kurSyncRef.current) {
-        stepKuramotoCpu(dt);
+        stepKuramotoCpu(dt, tSeconds);
         deriveKurFieldsCpu();
       } else {
         const worker = workerRef.current;
@@ -3842,11 +5709,13 @@ export default function App() {
           const inflight = workerInflightRef.current;
           if (inflight < 2) {
             const frameId = workerNextFrameIdRef.current++;
+            const seed = getTimelineSeed('kuramotoNoise', tSeconds);
             worker.postMessage({
               kind: 'tick',
               dt,
               timestamp: tSeconds,
               frameId,
+              seed,
             });
             workerInflightRef.current = inflight + 1;
           }
@@ -3857,13 +5726,22 @@ export default function App() {
         recordTelemetry('kuramoto', performance.now() - teleStart);
       }
     },
-    [kurEnabled, stepKuramotoCpu, deriveKurFieldsCpu, swapWorkerFrame, recordTelemetry],
+    [
+      kurEnabled,
+      stepKuramotoCpu,
+      deriveKurFieldsCpu,
+      swapWorkerFrame,
+      recordTelemetry,
+      updateTimelineForTime,
+      getTimelineSeed,
+    ],
   );
 
   const drawFrameCpu = useCallback(
     (ctx: CanvasRenderingContext2D, tSeconds: number) => {
       const telemetryActive = telemetryRef.current.enabled;
-      const frameStart = telemetryActive ? performance.now() : 0;
+      const frameBegin = performance.now();
+      const frameStart = telemetryActive ? frameBegin : 0;
       const dt = 0.016 * speed;
       advanceKuramoto(dt, tSeconds);
       advanceVolume(dt);
@@ -3902,9 +5780,7 @@ export default function App() {
       }
       ctx.putImageData(buffer.image, 0, 0);
       logFrameMetrics(tSeconds);
-      if (frameStart) {
-        recordTelemetry('frame', performance.now() - frameStart);
-      }
+      recordTelemetry('frame', performance.now() - frameBegin);
     },
     [
       advanceKuramoto,
@@ -4558,6 +6434,12 @@ export default function App() {
       setTelemetryEnabled(Boolean(enabled));
     };
     w.__getTelemetryHistory = () => [...telemetryRef.current.history];
+    const loadTimelineHandler = (payload: Timeline | string) =>
+      typeof payload === 'string' ? loadTimelineFromJson(payload) : loadTimeline(payload);
+    w.__loadTimeline = loadTimelineHandler;
+    w.__clearTimeline = clearTimeline;
+    w.__exportTimeline = exportTimeline;
+    w.__getTimelineHash = () => timelineHashRef.current;
     return () => {
       if (w.__setFrameProfiler === setFrameProfiler) {
         delete w.__setFrameProfiler;
@@ -4580,6 +6462,18 @@ export default function App() {
       if (w.__getTelemetryHistory) {
         delete w.__getTelemetryHistory;
       }
+      if (w.__loadTimeline === loadTimelineHandler) {
+        delete w.__loadTimeline;
+      }
+      if (w.__clearTimeline === clearTimeline) {
+        delete w.__clearTimeline;
+      }
+      if (w.__exportTimeline === exportTimeline) {
+        delete w.__exportTimeline;
+      }
+      if (w.__getTimelineHash) {
+        delete w.__getTimelineHash;
+      }
     };
   }, [
     setFrameProfiler,
@@ -4588,6 +6482,10 @@ export default function App() {
     measureRenderPerformance,
     handleRendererToggle,
     setTelemetryEnabled,
+    loadTimeline,
+    loadTimelineFromJson,
+    clearTimeline,
+    exportTimeline,
   ]);
 
   useEffect(() => {
@@ -4598,25 +6496,24 @@ export default function App() {
     const start = performance.now();
 
     if (renderBackend === 'gpu') {
-      const render = () => {
+      const render = (timestamp: number) => {
         if (!anim) return;
         const state = ensureGpuRenderer();
         if (!state) {
           anim = false;
           return;
         }
-        const frameStart = telemetryRef.current.enabled ? performance.now() : 0;
-        const t = (performance.now() - start) * 0.001;
+        const frameBegin = performance.now();
+        const frameStart = telemetryRef.current.enabled ? frameBegin : 0;
+        const t = (timestamp - start) * 0.001;
         const dt = 0.016 * speed;
         advanceKuramoto(dt, t);
         advanceVolume(dt);
         drawFrameGpu(state, t, true);
-        if (frameStart) {
-          recordTelemetry('frame', performance.now() - frameStart);
-        }
+        recordTelemetry('frame', performance.now() - frameBegin);
         frameId = requestAnimationFrame(render);
       };
-      render();
+      frameId = requestAnimationFrame(render);
       return () => {
         anim = false;
         cancelAnimationFrame(frameId);
@@ -4627,13 +6524,13 @@ export default function App() {
     if (!ctx) return;
     canvas.width = width;
     canvas.height = height;
-    const renderCpu = () => {
+    const renderCpu = (timestamp: number) => {
       if (!anim) return;
-      const t = (performance.now() - start) * 0.001;
+      const t = (timestamp - start) * 0.001;
       drawFrameCpu(ctx, t);
       frameId = requestAnimationFrame(renderCpu);
     };
-    renderCpu();
+    frameId = requestAnimationFrame(renderCpu);
     return () => {
       anim = false;
       cancelAnimationFrame(frameId);
@@ -4977,6 +6874,13 @@ export default function App() {
       setTelemetryEnabled(runtime.telemetryEnabled);
       setTelemetryOverlayEnabled(runtime.telemetryOverlayEnabled);
       setFrameLoggingEnabled(runtime.frameLoggingEnabled);
+      setMacroBinding(cloneMacroBinding(runtime.macroBinding));
+      setMacroKnobValue(
+        typeof runtime.macroKnobValue === 'number' && Number.isFinite(runtime.macroKnobValue)
+          ? runtime.macroKnobValue
+          : 0,
+      );
+      setMacroLearnMode(false);
 
       setEdgeThreshold(params.edgeThreshold);
       setBlend(params.blend);
@@ -5017,6 +6921,7 @@ export default function App() {
           seed: params.su7Seed,
           schedule: params.su7Schedule,
           projector: projectorWithDefault,
+          gateAppends: params.su7GateAppends,
         }),
       );
 
@@ -5059,6 +6964,64 @@ export default function App() {
       setSmallWorldSeed(kuramoto.smallWorldSeed);
       setSmallWorldDegree(kuramoto.smallWorldDegree);
 
+      stopQcdAnneal();
+      setQcdBeta(preset.qcd.beta);
+      setQcdStepsPerSecond(preset.qcd.stepsPerSecond);
+      setQcdSmearingAlpha(preset.qcd.smearingAlpha);
+      setQcdSmearingIterations(preset.qcd.smearingIterations);
+      setQcdBaseSeed(preset.qcd.baseSeed);
+      const presetDepth = Math.max(1, Math.floor(preset.qcd.depth ?? 1));
+      const presetTemporal = Math.max(1, Math.floor(preset.qcd.temporalExtent ?? 1));
+      const presetBatch = Math.max(
+        1,
+        Math.min(Math.floor(preset.qcd.batchLayers ?? 1), presetDepth * presetTemporal),
+      );
+      const presetSchedule = Array.isArray(preset.qcd.temperatureSchedule)
+        ? preset.qcd.temperatureSchedule.filter((value) => Number.isFinite(value)).slice(0, 64)
+        : [];
+      setQcdDepth(presetDepth);
+      setQcdTemporalExtent(presetTemporal);
+      setQcdBatchLayers(presetBatch);
+      setQcdTemperatureScheduleText(
+        presetSchedule.length > 0 ? presetSchedule.map((value) => value.toFixed(3)).join(', ') : '',
+      );
+      setQcdPolyakovSchedule([]);
+      setQcdPerfLog([]);
+      if (preset.qcd.snapshot) {
+        const snapshotSources = preset.qcd.snapshot.data.sources.map((source) => ({
+          x: source.x,
+          y: source.y,
+          charge: source.charge,
+          strength: source.strength,
+        }));
+        setFluxSources(snapshotSources);
+        setQcdSnapshotHash(preset.qcd.snapshot.hash);
+        setTimeout(() => {
+          ensureQcdRuntime({
+            snapshot: preset.qcd.snapshot!.data,
+            sourcesOverride: snapshotSources,
+          });
+        }, 0);
+        const snapshotSchedule = Array.isArray(preset.qcd.snapshot.data.config.temperatureSchedule)
+          ? preset.qcd.snapshot.data.config.temperatureSchedule.filter((value) =>
+              Number.isFinite(value),
+            )
+          : [];
+        if (snapshotSchedule.length > 0) {
+          setQcdPolyakovSchedule([...snapshotSchedule]);
+        }
+      } else {
+        qcdRuntimeRef.current = null;
+        qcdSnapshotRef.current = null;
+        setQcdObservables(null);
+        setQcdOverlayState(null);
+        setQcdProbeFrame(null);
+        setQcdSnapshotHash(null);
+        setTimeout(() => {
+          ensureQcdRuntime({ reinitialize: true });
+        }, 0);
+      }
+
       setSelectedSyntheticCase(developer.selectedSyntheticCase);
       setIncludeImageInPreset(Boolean(preset.media?.imagePath));
       if (preset.media?.imagePath) {
@@ -5071,11 +7034,32 @@ export default function App() {
       setComposer(cloneComposerConfig(preset.composer));
       setCouplingToggles(cloneCouplingToggles(preset.couplingToggles));
     },
-    [handleRendererToggle, loadImageAsset, resetTracerState, setSu7ScheduleStrength, setSu7Params],
+    [
+      handleRendererToggle,
+      loadImageAsset,
+      resetTracerState,
+      setSu7ScheduleStrength,
+      setSu7Params,
+      stopQcdAnneal,
+      ensureQcdRuntime,
+    ],
   );
+
+  const applyPresetRef = useRef(applyPreset);
+
+  useEffect(() => {
+    applyPresetRef.current = applyPreset;
+  }, [applyPreset]);
 
   const buildCurrentPreset = useCallback((): Preset => {
     const su7Snapshot = cloneSu7RuntimeParams(su7Params);
+    let qcdSnapshotEntry: PresetQcd['snapshot'] = null;
+    const runtime = qcdRuntimeRef.current;
+    if (runtime) {
+      const snapshot = qcdSnapshotRef.current ?? buildQcdSnapshot(runtime, fluxSources);
+      const { hash } = hashQcdSnapshot(snapshot);
+      qcdSnapshotEntry = { data: snapshot, hash };
+    }
     return {
       name: PRESETS[presetIndex]?.name ?? 'Custom snapshot',
       params: {
@@ -5102,6 +7086,7 @@ export default function App() {
         su7Schedule: su7Snapshot.schedule,
         su7Projector: su7Snapshot.projector,
         su7ScheduleStrength,
+        su7GateAppends: su7Snapshot.gateAppends,
       },
       surface: {
         surfEnabled,
@@ -5133,6 +7118,8 @@ export default function App() {
         telemetryEnabled,
         telemetryOverlayEnabled,
         frameLoggingEnabled,
+        macroBinding: cloneMacroBinding(macroBinding),
+        macroKnobValue: Number.isFinite(macroKnobValue) ? macroKnobValue : 0,
       },
       kuramoto: {
         kurEnabled,
@@ -5165,6 +7152,19 @@ export default function App() {
       coupling: cloneCouplingConfig(coupling),
       composer: cloneComposerConfig(composer),
       couplingToggles: cloneCouplingToggles(couplingToggles),
+      qcd: {
+        beta: qcdBeta,
+        stepsPerSecond: qcdStepsPerSecond,
+        smearingAlpha: qcdSmearingAlpha,
+        smearingIterations: qcdSmearingIterations,
+        overRelaxationSteps: 1,
+        baseSeed: qcdBaseSeed,
+        depth: qcdDepthInt,
+        temporalExtent: qcdTemporalExtentInt,
+        batchLayers: qcdBatchLayersInt,
+        temperatureSchedule: qcdTemperatureSchedule.length > 0 ? [...qcdTemperatureSchedule] : [],
+        snapshot: qcdSnapshotEntry,
+      },
     };
   }, [
     presetIndex,
@@ -5227,6 +7227,16 @@ export default function App() {
     selectedSyntheticCase,
     includeImageInPreset,
     imageAsset,
+    qcdBeta,
+    qcdDepthInt,
+    qcdTemporalExtentInt,
+    qcdBatchLayersInt,
+    qcdTemperatureSchedule,
+    qcdStepsPerSecond,
+    qcdSmearingAlpha,
+    qcdSmearingIterations,
+    qcdBaseSeed,
+    fluxSources,
     su7ScheduleStrength,
     coupling,
     composer,
@@ -5340,13 +7350,17 @@ export default function App() {
 
       const files: TarEntry[] = [];
 
-      const localVolumeStub = volumeEnabled ? createVolumeStubState(width, height) : null;
+      updateTimelineForTime(0);
+      const initialDmt = getTimelineNumber('dmt', dmt);
+
+      const localVolumeStub = volumeEnabled
+        ? createVolumeStubState(width, height, getTimelineSeed('volumeNoise', 0))
+        : null;
       let localVolumeField =
         volumeEnabled && localVolumeStub ? snapshotVolumeStub(localVolumeStub) : null;
 
       let localKurState: KuramotoState | null = null;
       let localDerived: ReturnType<typeof createDerivedViews> | null = null;
-      let localRand: ReturnType<typeof createNormalGenerator> | null = null;
       const params = getKurParams();
       if (kurEnabled) {
         localKurState = createKuramotoState(width, height);
@@ -5355,9 +7369,8 @@ export default function App() {
         initKuramotoState(localKurState, qInit, localDerived);
         deriveKuramotoFieldsCore(localKurState, localDerived, {
           kernel: kernelSpec,
-          controls: { dmt },
+          controls: { dmt: initialDmt },
         });
-        localRand = createNormalGenerator(Math.floor(Math.random() * 1e9));
       }
 
       const metadataEntries: TarEntry[] = [];
@@ -5368,20 +7381,24 @@ export default function App() {
           throw new Error('Frame export cancelled');
         }
         const tSeconds = i * dt;
+        updateTimelineForTime(tSeconds);
+        const frameDmt = getTimelineNumber('dmt', dmt);
 
         if (volumeEnabled && localVolumeStub) {
           stepVolumeStub(localVolumeStub, dt);
           localVolumeField = snapshotVolumeStub(localVolumeStub);
         }
 
-        if (kurEnabled && localKurState && localDerived && localRand) {
+        if (kurEnabled && localKurState && localDerived) {
+          const frameSeed = getTimelineSeed('kuramotoNoise', tSeconds);
+          const localRand = createNormalGenerator(frameSeed);
           stepKuramotoState(localKurState, params, dt, localRand, (i + 1) * dt, {
             kernel: kernelSpec,
-            controls: { dmt },
+            controls: { dmt: frameDmt },
           });
           deriveKuramotoFieldsCore(localKurState, localDerived, {
             kernel: kernelSpec,
-            controls: { dmt },
+            controls: { dmt: frameDmt },
           });
         }
 
@@ -5412,6 +7429,7 @@ export default function App() {
         }
       }
 
+      const activeTimeline = timelinePlayerRef.current;
       const metadata = {
         width,
         height,
@@ -5429,11 +7447,28 @@ export default function App() {
             }
           : null,
         preset: buildCurrentPreset().name,
+        timeline: activeTimeline
+          ? {
+              hash: activeTimeline.hash,
+              fps: activeTimeline.fps,
+              durationFrames: activeTimeline.durationFrames,
+            }
+          : null,
       };
       metadataEntries.push({
         name: 'metadata.json',
         content: textEncoder.encode(JSON.stringify(metadata, null, 2)),
       });
+      if (activeTimeline) {
+        metadataEntries.push({
+          name: 'timeline.json',
+          content: textEncoder.encode(activeTimeline.json),
+        });
+        metadataEntries.push({
+          name: 'timeline.hash',
+          content: textEncoder.encode(`${activeTimeline.hash}\n`),
+        });
+      }
       const readme = `Rainbow Perimeter frame export\n\nGenerated ${metadata.timestamp}\nFrames: ${metadata.frameCount}\nResolution: ${width}x${height}\nFrame rate: ${RECORDING_FPS} fps\n\nUse ffmpeg to assemble:\nffmpeg -framerate ${RECORDING_FPS} -i frames/frame_%05d.png -c:v libx264 -pix_fmt yuv420p rainbow-output.mp4\n`;
       metadataEntries.push({ name: 'README.txt', content: textEncoder.encode(readme) });
 
@@ -5495,6 +7530,9 @@ export default function App() {
     includeImageInPreset,
     imageAsset,
     buildCurrentPreset,
+    updateTimelineForTime,
+    getTimelineNumber,
+    getTimelineSeed,
   ]);
 
   const cancelFrameExport = useCallback(() => {
@@ -5523,7 +7561,7 @@ export default function App() {
         return;
       }
       skipNextPresetApplyRef.current = true;
-      applyPreset(sharedPreset);
+      applyPresetRef.current(sharedPreset);
       params.delete('share');
       const newSearch = params.toString();
       const newUrl = `${window.location.pathname}${newSearch ? `?${newSearch}` : ''}${window.location.hash}`;
@@ -5531,15 +7569,15 @@ export default function App() {
     } catch (error) {
       console.error('[share] failed to apply shared preset', error);
     }
-  }, [applyPreset, buildCurrentPreset]);
+  }, [buildCurrentPreset]);
 
   useEffect(() => {
     if (skipNextPresetApplyRef.current) {
       skipNextPresetApplyRef.current = false;
       return;
     }
-    applyPreset(PRESETS[presetIndex]);
-  }, [presetIndex, applyPreset]);
+    applyPresetRef.current(PRESETS[presetIndex]);
+  }, [presetIndex]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -5570,9 +7608,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!su7Params.enabled) {
+      setGuardrailConsole((prev) => ({
+        ...prev,
+        unitaryError: 0,
+        determinantDrift: 0,
+        energyEma: 0,
+        lastEnergy: null,
+      }));
+    }
+  }, [su7Params.enabled, setGuardrailConsole]);
+
+  useEffect(() => {
     pendingStaticUploadRef.current = true;
-    refreshGpuStaticTextures();
-  }, [width, height, refreshGpuStaticTextures]);
+    if (renderBackend === 'gpu') {
+      const state = ensureGpuRenderer();
+      if (!state && pendingStaticUploadRef.current) {
+        refreshGpuStaticTextures();
+      }
+    } else {
+      refreshGpuStaticTextures();
+    }
+  }, [width, height, renderBackend, ensureGpuRenderer, refreshGpuStaticTextures]);
 
   return (
     <main
@@ -5872,6 +7929,114 @@ export default function App() {
                 </small>
               )}
             </div>
+            <div
+              className="control"
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.6rem',
+                background: 'rgba(15,23,42,0.45)',
+                borderRadius: '0.85rem',
+                padding: '0.8rem',
+                marginTop: '0.5rem',
+              }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'baseline',
+                  gap: '0.5rem',
+                }}
+              >
+                <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#e2e8f0' }}>
+                  SU7 Debug Console
+                </span>
+                <span style={{ fontSize: '0.65rem', color: '#94a3b8' }}>
+                  {su7Params.enabled ? 'Active' : 'SU7 disabled'}
+                </span>
+              </div>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  gap: '0.35rem 0.75rem',
+                  fontSize: '0.72rem',
+                  color: '#cbd5f5',
+                }}
+              >
+                <span>Unitary ε {guardrailConsole.unitaryError.toExponential(2)}</span>
+                <span>Det drift {guardrailConsole.determinantDrift.toExponential(2)}</span>
+                <span>Frame {guardrailConsole.frameTimeMs.toFixed(2)} ms</span>
+                <span>Energy EMA {guardrailConsole.energyEma.toFixed(3)}</span>
+              </div>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <button
+                  onClick={handleGuardrailReorthon}
+                  style={{
+                    padding: '0.45rem 0.7rem',
+                    borderRadius: '0.6rem',
+                    border: '1px solid rgba(148,163,184,0.35)',
+                    background: 'rgba(59,130,246,0.18)',
+                    color: '#e0f2fe',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Re-orthonormalize
+                </button>
+                <button
+                  onClick={handleGuardrailAutoGain}
+                  style={{
+                    padding: '0.45rem 0.7rem',
+                    borderRadius: '0.6rem',
+                    border: '1px solid rgba(148,163,184,0.35)',
+                    background: 'rgba(16,185,129,0.18)',
+                    color: '#bbf7d0',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Auto-gain
+                </button>
+              </div>
+              {guardrailConsole.auditLog.length > 0 ? (
+                <ul
+                  style={{
+                    listStyle: 'none',
+                    margin: 0,
+                    padding: 0,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.35rem',
+                    fontSize: '0.7rem',
+                  }}
+                >
+                  {guardrailConsole.auditLog.slice(-6).map((entry) => (
+                    <li
+                      key={entry.id}
+                      style={{
+                        color: entry.severity === 'warn' ? '#f97316' : '#cbd5f5',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        gap: '0.5rem',
+                      }}
+                    >
+                      <span>{entry.message}</span>
+                      <span style={{ opacity: 0.7 }}>
+                        {new Date(entry.timestamp).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        })}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <span style={{ fontSize: '0.7rem', color: '#64748b' }}>
+                  No guardrail events yet.
+                </span>
+              )}
+            </div>
             {(showRimDebug && rimDebugSnapshot) ||
             (showSurfaceDebug && surfaceDebugSnapshot) ||
             (showPhaseDebug && phaseDebugSnapshot) ? (
@@ -5981,6 +8146,16 @@ export default function App() {
                 );
               })}
             </div>
+            {su7ProjectorId === 'hopflens' ? (
+              <HopfLensControls
+                lenses={hopfLenses}
+                metrics={telemetrySnapshot?.hopf?.lenses}
+                onAxisChange={handleHopfAxisChange}
+                onBaseMixChange={handleHopfBaseMixChange}
+                onFiberMixChange={handleHopfFiberMixChange}
+                onControlTargetChange={handleHopfControlTargetChange}
+              />
+            ) : null}
           </section>
 
           <section className="panel">
@@ -6035,8 +8210,9 @@ export default function App() {
               options={su7ProjectorOptions}
             />
             <div className="control" style={!su7Params.enabled ? { opacity: 0.55 } : undefined}>
-              <label>Seed</label>
+              <label htmlFor="su7-seed-input">Seed</label>
               <input
+                id="su7-seed-input"
                 type="number"
                 value={su7Params.seed}
                 disabled={!su7Params.enabled}
@@ -6049,6 +8225,204 @@ export default function App() {
                   color: '#e2e8f0',
                 }}
               />
+            </div>
+            <div
+              className="control"
+              style={{
+                border: '1px solid rgba(148,163,184,0.2)',
+                borderRadius: '0.85rem',
+                padding: '0.75rem',
+                background: 'rgba(15,23,42,0.35)',
+              }}
+            >
+              <div
+                style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}
+              >
+                <h3 style={{ margin: 0, fontSize: '1rem', color: '#e2e8f0' }}>Glyph controls</h3>
+                {macroLearnMode ? (
+                  <span style={{ color: '#facc15', fontSize: '0.75rem' }}>Learn mode</span>
+                ) : null}
+              </div>
+              <Su7GlyphControl
+                gateList={su7DisplayGateList}
+                macroBinding={macroBinding}
+                macroLearnMode={macroLearnMode}
+                onEdgeGesture={handleEdgeGesture}
+              />
+              <div
+                style={{
+                  marginTop: '0.9rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.7rem',
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: '0.5rem',
+                    flexWrap: 'wrap',
+                  }}
+                >
+                  <button
+                    onClick={() => setMacroLearnMode((prev) => !prev)}
+                    aria-pressed={macroLearnMode}
+                    style={{
+                      padding: '0.4rem 0.65rem',
+                      borderRadius: '0.55rem',
+                      border: '1px solid rgba(148,163,184,0.35)',
+                      background: macroLearnMode
+                        ? 'rgba(250,204,21,0.18)'
+                        : 'rgba(59,130,246,0.18)',
+                      color: macroLearnMode ? '#facc15' : '#bfdbfe',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {macroLearnMode ? 'Cancel macro learn' : 'Macro learn mode'}
+                  </button>
+                  <button
+                    onClick={clearSu7GateAppends}
+                    disabled={su7GateAppends.length === 0}
+                    style={{
+                      padding: '0.4rem 0.65rem',
+                      borderRadius: '0.55rem',
+                      border: '1px solid rgba(148,163,184,0.35)',
+                      background:
+                        su7GateAppends.length === 0
+                          ? 'rgba(15,23,42,0.25)'
+                          : 'rgba(239,68,68,0.18)',
+                      color: su7GateAppends.length === 0 ? '#64748b' : '#fecaca',
+                      cursor: su7GateAppends.length === 0 ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    Clear appended gates
+                  </button>
+                </div>
+                <SliderControl
+                  label="Macro knob"
+                  value={macroKnobValue}
+                  min={-1.5}
+                  max={1.5}
+                  step={0.05}
+                  onChange={handleMacroKnobChange}
+                  format={(v) => v.toFixed(2)}
+                  disabled={!macroBinding}
+                />
+                <small style={{ color: '#94a3b8' }}>
+                  {macroBinding
+                    ? `Knob bound to edge ${macroBinding.axis + 1} (${macroBinding.gateLabel}).`
+                    : 'Enable learn mode then drag an edge to bind the knob.'}
+                </small>
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.45rem',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'baseline',
+                      justifyContent: 'space-between',
+                      fontWeight: 600,
+                      color: '#e2e8f0',
+                      fontSize: '0.85rem',
+                    }}
+                  >
+                    <span>Gate appends</span>
+                    {su7SquashedGateCount > 0 ? (
+                      <span style={{ color: '#fbbf24', fontSize: '0.7rem', fontWeight: 500 }}>
+                        {su7SquashedGateCount} squashed
+                      </span>
+                    ) : null}
+                  </div>
+                  {su7SquashedGateCount > 0 ? (
+                    <small style={{ color: '#fbbf24' }}>
+                      Oldest gates rebased into the preset for this session.
+                    </small>
+                  ) : null}
+                  {su7GateAppends.length === 0 ? (
+                    <small style={{ color: '#94a3b8' }}>No appended gates.</small>
+                  ) : (
+                    su7GateAppends.map((gate, index) => {
+                      if (gate.kind === 'phase') {
+                        return (
+                          <div
+                            key={`gate-${gate.label ?? index}`}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'space-between',
+                              background: 'rgba(15,23,42,0.45)',
+                              borderRadius: '0.6rem',
+                              padding: '0.4rem 0.6rem',
+                              fontSize: '0.8rem',
+                            }}
+                          >
+                            <span>Phase gate ({gate.label ?? `#${index + 1}`})</span>
+                            <button
+                              onClick={() => removeSu7Gate(gate.label ?? null, index)}
+                              style={{
+                                background: 'transparent',
+                                border: 'none',
+                                color: '#fca5a5',
+                                cursor: 'pointer',
+                                fontSize: '0.75rem',
+                              }}
+                              aria-label={`Remove phase gate ${gate.label ?? index + 1}`}
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        );
+                      }
+                      const thetaDeg = radiansToDegrees(gate.theta);
+                      const phiDeg = radiansToDegrees(gate.phase);
+                      const label = gate.label ?? `gate-${index + 1}`;
+                      return (
+                        <div
+                          key={`gate-${label}`}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            background:
+                              macroBinding?.gateLabel === gate.label
+                                ? 'rgba(250,204,21,0.12)'
+                                : 'rgba(15,23,42,0.45)',
+                            borderRadius: '0.6rem',
+                            padding: '0.4rem 0.6rem',
+                            fontSize: '0.8rem',
+                          }}
+                        >
+                          <div style={{ display: 'flex', flexDirection: 'column' }}>
+                            <span style={{ color: '#e2e8f0', fontWeight: 600 }}>
+                              Edge {gate.axis + 1}
+                            </span>
+                            <span style={{ color: '#94a3b8' }}>
+                              Δθ {thetaDeg.toFixed(2)}° · Δφ {phiDeg.toFixed(2)}°
+                            </span>
+                          </div>
+                          <button
+                            onClick={() => removeSu7Gate(gate.label ?? null, index)}
+                            style={{
+                              background: 'transparent',
+                              border: 'none',
+                              color: '#fca5a5',
+                              cursor: 'pointer',
+                              fontSize: '0.75rem',
+                            }}
+                            aria-label={`Remove gate ${label}`}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
             </div>
           </section>
 
@@ -7002,6 +9376,387 @@ export default function App() {
           </section>
 
           <section className="panel">
+            <h2>Quark Sources</h2>
+            <p style={{ color: '#94a3b8', marginTop: 0 }}>
+              Click the canvas to drop alternating quark/antiquark sources. Shift-click removes, Alt
+              (or ⌥) places a negative source.
+            </p>
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}
+            >
+              <button
+                type="button"
+                onClick={clearFluxSources}
+                disabled={fluxSources.length === 0}
+                style={{
+                  padding: '0.4rem 0.7rem',
+                  borderRadius: '0.55rem',
+                  border: '1px solid rgba(148,163,184,0.35)',
+                  background:
+                    fluxSources.length === 0 ? 'rgba(15,23,42,0.3)' : 'rgba(59,130,246,0.2)',
+                  color: fluxSources.length === 0 ? '#64748b' : '#bfdbfe',
+                  cursor: fluxSources.length === 0 ? 'not-allowed' : 'pointer',
+                }}
+              >
+                Clear sources
+              </button>
+              <span style={{ color: '#94a3b8', fontSize: '0.8rem' }}>
+                {fluxSources.length} active
+              </span>
+            </div>
+            {fluxSources.length > 0 ? (
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.35rem',
+                  marginTop: '0.6rem',
+                }}
+              >
+                {fluxSources.map((source, idx) => (
+                  <div
+                    key={`flux-source-row-${idx}`}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: '0.5rem',
+                      padding: '0.35rem 0.5rem',
+                      borderRadius: '0.55rem',
+                      background: 'rgba(15,23,42,0.4)',
+                      border: '1px solid rgba(71,85,105,0.4)',
+                    }}
+                  >
+                    <span style={{ color: '#e2e8f0', fontSize: '0.85rem' }}>
+                      {idx + 1}.{source.charge >= 0 ? ' +' : ' -'} ({Math.round(source.x)},{' '}
+                      {Math.round(source.y)})
+                    </span>
+                    <div style={{ display: 'flex', gap: '0.35rem' }}>
+                      <button
+                        type="button"
+                        onClick={() => flipFluxSourceCharge(idx)}
+                        style={{
+                          padding: '0.25rem 0.45rem',
+                          borderRadius: '0.45rem',
+                          border: '1px solid rgba(96,165,250,0.55)',
+                          background: 'rgba(59,130,246,0.15)',
+                          color: '#bfdbfe',
+                          cursor: 'pointer',
+                          fontSize: '0.75rem',
+                        }}
+                      >
+                        Flip
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => removeFluxSource(idx)}
+                        style={{
+                          padding: '0.25rem 0.45rem',
+                          borderRadius: '0.45rem',
+                          border: '1px solid rgba(248,113,113,0.5)',
+                          background: 'rgba(248,113,113,0.18)',
+                          color: '#fecaca',
+                          cursor: 'pointer',
+                          fontSize: '0.75rem',
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p style={{ color: '#64748b', marginTop: '0.6rem' }}>
+                Add at least two sources to form a flux tube overlay.
+              </p>
+            )}
+          </section>
+
+          <section className="panel">
+            <h2>QCD Anneal</h2>
+            <SliderControl
+              label="Heatbath β"
+              value={qcdBeta}
+              min={3}
+              max={7}
+              step={0.05}
+              onChange={setQcdBeta}
+              format={(v) => v.toFixed(2)}
+            />
+            <SliderControl
+              label="Steps per second"
+              value={qcdStepsPerSecond}
+              min={0.5}
+              max={20}
+              step={0.5}
+              onChange={setQcdStepsPerSecond}
+              format={(v) => v.toFixed(1)}
+            />
+            <SliderControl
+              label="Smearing α"
+              value={qcdSmearingAlpha}
+              min={0}
+              max={1}
+              step={0.02}
+              onChange={setQcdSmearingAlpha}
+              format={(v) => v.toFixed(2)}
+            />
+            <SliderControl
+              label="Smear iterations"
+              value={qcdSmearingIterations}
+              min={0}
+              max={8}
+              step={1}
+              onChange={setQcdSmearingIterations}
+              format={(v) => v.toFixed(0)}
+            />
+            <SliderControl
+              label="Lattice depth"
+              value={qcdDepthInt}
+              min={1}
+              max={16}
+              step={1}
+              onChange={(value) => setQcdDepth(Math.max(1, Math.round(value)))}
+              format={(v) => v.toFixed(0)}
+            />
+            <SliderControl
+              label="Temporal extent"
+              value={qcdTemporalExtentInt}
+              min={1}
+              max={24}
+              step={1}
+              onChange={(value) => setQcdTemporalExtent(Math.max(1, Math.round(value)))}
+              format={(v) => v.toFixed(0)}
+            />
+            <SliderControl
+              label="GPU batch planes"
+              value={qcdBatchLayersInt}
+              min={1}
+              max={Math.max(1, qcdDepthInt * qcdTemporalExtentInt)}
+              step={1}
+              onChange={(value) => setQcdBatchLayers(Math.max(1, Math.round(value)))}
+              format={(v) => v.toFixed(0)}
+            />
+            <small style={{ color: '#64748b', fontSize: '0.72rem' }}>
+              Plane budget: {qcdDepthInt} × {qcdTemporalExtentInt} ={' '}
+              {Math.max(1, qcdDepthInt * qcdTemporalExtentInt)}
+            </small>
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.35rem',
+                marginTop: '0.5rem',
+              }}
+            >
+              <label style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Seed</label>
+              <input
+                type="number"
+                value={qcdBaseSeed}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  if (Number.isFinite(value)) {
+                    setQcdBaseSeed(Math.max(0, Math.trunc(value)));
+                  }
+                }}
+                style={{
+                  background: 'rgba(15,23,42,0.7)',
+                  border: '1px solid rgba(148,163,184,0.35)',
+                  borderRadius: '0.5rem',
+                  color: '#e2e8f0',
+                  padding: '0.35rem 0.55rem',
+                  width: '100%',
+                }}
+              />
+            </div>
+            <div
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.35rem',
+                marginTop: '0.6rem',
+              }}
+            >
+              <label style={{ fontSize: '0.75rem', color: '#94a3b8' }}>
+                Temperature schedule (β list)
+              </label>
+              <textarea
+                value={qcdTemperatureScheduleText}
+                onChange={(event) => setQcdTemperatureScheduleText(event.target.value)}
+                rows={2}
+                placeholder="5.20, 5.25, 5.30"
+                style={{
+                  background: 'rgba(15,23,42,0.7)',
+                  border: '1px solid rgba(148,163,184,0.35)',
+                  borderRadius: '0.5rem',
+                  color: '#e2e8f0',
+                  padding: '0.45rem 0.55rem',
+                  width: '100%',
+                  fontFamily: 'monospace',
+                  fontSize: '0.75rem',
+                  resize: 'vertical',
+                }}
+              />
+              <small style={{ color: '#64748b', fontSize: '0.72rem' }}>
+                Parsed {qcdTemperatureSchedule.length}{' '}
+                {qcdTemperatureSchedule.length === 1 ? 'β' : 'β values'} · Axis{' '}
+                {qcdTemporalExtentInt > 1 ? 't' : 'spatial'}
+              </small>
+              <div style={{ display: 'flex', gap: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={handlePolyakovScan}
+                  disabled={qcdTemperatureSchedule.length === 0 || qcdRunning}
+                  style={{
+                    padding: '0.4rem 0.65rem',
+                    borderRadius: '0.5rem',
+                    border: '1px solid rgba(147,197,253,0.45)',
+                    background:
+                      qcdTemperatureSchedule.length === 0 || qcdRunning
+                        ? 'rgba(71,85,105,0.35)'
+                        : 'rgba(59,130,246,0.2)',
+                    color: '#bfdbfe',
+                    cursor:
+                      qcdTemperatureSchedule.length === 0 || qcdRunning ? 'not-allowed' : 'pointer',
+                    fontWeight: 600,
+                  }}
+                >
+                  Run temperature scan
+                </button>
+              </div>
+            </div>
+            <div
+              style={{
+                display: 'flex',
+                gap: '0.6rem',
+                alignItems: 'center',
+                marginTop: '0.75rem',
+              }}
+            >
+              <button
+                type="button"
+                onClick={startQcdAnneal}
+                disabled={qcdRunning}
+                style={{
+                  padding: '0.45rem 0.7rem',
+                  borderRadius: '0.55rem',
+                  border: '1px solid rgba(74,222,128,0.35)',
+                  background: qcdRunning ? 'rgba(21,94,32,0.25)' : 'rgba(34,197,94,0.2)',
+                  color: qcdRunning ? '#4ade80' : '#bbf7d0',
+                  cursor: qcdRunning ? 'not-allowed' : 'pointer',
+                  fontWeight: 600,
+                }}
+              >
+                Start anneal
+              </button>
+              <button
+                type="button"
+                onClick={stopQcdAnneal}
+                disabled={!qcdRunning}
+                style={{
+                  padding: '0.45rem 0.7rem',
+                  borderRadius: '0.55rem',
+                  border: '1px solid rgba(248,113,113,0.45)',
+                  background: qcdRunning ? 'rgba(248,113,113,0.22)' : 'rgba(71,85,105,0.4)',
+                  color: qcdRunning ? '#fecaca' : '#cbd5f5',
+                  cursor: qcdRunning ? 'pointer' : 'not-allowed',
+                  fontWeight: 600,
+                }}
+              >
+                Stop
+              </button>
+              <span style={{ color: '#94a3b8', fontSize: '0.78rem' }}>
+                Status: {qcdRunning ? 'Annealing' : 'Idle'} · Sweeps {qcdSweeps.toLocaleString()}
+              </span>
+            </div>
+            {qcdObservables ? (
+              <div
+                style={{
+                  display: 'grid',
+                  gap: '0.35rem',
+                  marginTop: '0.75rem',
+                  fontSize: '0.8rem',
+                  color: '#cbd5f5',
+                }}
+              >
+                <div>⟨P⟩ {qcdObservables.averagePlaquette.toFixed(4)}</div>
+                <div>
+                  σ<sub>P</sub> {qcdObservables.plaquetteEstimate.standardError.toExponential(2)}
+                </div>
+                {qcdObservables.creutzRatio ? (
+                  <div>
+                    χ
+                    <sub>{`${qcdObservables.creutzRatio.extentX}×${qcdObservables.creutzRatio.extentY}`}</sub>{' '}
+                    {qcdObservables.creutzRatio.value.toFixed(3)}
+                  </div>
+                ) : null}
+                {qcdObservables.polyakovSamples && qcdObservables.polyakovSamples.length > 0 ? (
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '0.15rem',
+                    }}
+                  >
+                    <span>Polyakov |P|</span>
+                    {qcdObservables.polyakovSamples.map((sample, idx) => {
+                      const beta = qcdPolyakovSchedule[idx];
+                      return (
+                        <span key={`polyakov-${sample.axis}-${idx}`}>
+                          β {beta != null ? beta.toFixed(3) : `#${idx + 1}`} · |P|{' '}
+                          {sample.magnitude.toFixed(3)} (axis {sample.axis})
+                        </span>
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {qcdObservables.wilsonLoops.slice(0, 2).map((loop) => (
+                  <div key={`wilson-${loop.extentX}x${loop.extentY}`}>
+                    W<sub>{`${loop.extentX}×${loop.extentY}`}</sub> {loop.value.toFixed(3)}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p style={{ color: '#64748b', marginTop: '0.75rem' }}>
+                Run the annealer to accumulate Wilson loop statistics.
+              </p>
+            )}
+            <div
+              style={{
+                marginTop: '0.6rem',
+                color: '#94a3b8',
+                fontSize: '0.75rem',
+                wordBreak: 'break-all',
+              }}
+            >
+              Snapshot hash: {qcdSnapshotHash ?? '–'}
+            </div>
+            {qcdPerfLog.length > 0 ? (
+              <div
+                style={{
+                  marginTop: '0.6rem',
+                  color: '#94a3b8',
+                  fontSize: '0.72rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.2rem',
+                }}
+              >
+                <div style={{ color: '#cbd5f5', fontWeight: 600 }}>QCD perf log</div>
+                {qcdPerfLog
+                  .slice(-10)
+                  .reverse()
+                  .map((entry, idx) => (
+                    <span key={`qcd-perf-${idx}`} style={{ fontFamily: 'monospace' }}>
+                      {entry}
+                    </span>
+                  ))}
+              </div>
+            ) : null}
+          </section>
+
+          <section className="panel">
             <h2>Display</h2>
             <SelectControl
               label="Display mode"
@@ -7149,10 +9904,13 @@ export default function App() {
               ref={canvasRef}
               width={width}
               height={height}
+              onPointerDown={handleCanvasPointerDown}
+              onContextMenu={handleCanvasContextMenu}
               style={{
                 width: '100%',
                 height: '100%',
                 display: 'block',
+                cursor: 'crosshair',
               }}
             />
             <canvas
@@ -7170,6 +9928,113 @@ export default function App() {
                 mixBlendMode: 'screen',
               }}
             />
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                pointerEvents: 'none',
+              }}
+            >
+              {qcdProbeFrame ? (
+                <svg
+                  width={width}
+                  height={height}
+                  viewBox={`0 0 ${Math.max(1, qcdProbeFrame.latticeWidth)} ${Math.max(1, qcdProbeFrame.latticeHeight)}`}
+                  preserveAspectRatio="none"
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    width: '100%',
+                    height: '100%',
+                    mixBlendMode: 'screen',
+                    filter: 'drop-shadow(0 0 4px rgba(15,23,42,0.45))',
+                  }}
+                >
+                  {qcdProbeFrame.segments.map((segment) => {
+                    const from = qcdProbeFrame.nodes[segment.fromIndex];
+                    const to = qcdProbeFrame.nodes[segment.toIndex];
+                    if (!from || !to) {
+                      return null;
+                    }
+                    const color = `rgba(${Math.round(segment.rgb[0] * 255)}, ${Math.round(segment.rgb[1] * 255)}, ${Math.round(segment.rgb[2] * 255)}, 0.88)`;
+                    const strokeWidth = Math.max(
+                      0.18,
+                      Math.min(
+                        0.45,
+                        Math.min(qcdProbeFrame.latticeWidth, qcdProbeFrame.latticeHeight) * 0.01,
+                      ),
+                    );
+                    return (
+                      <line
+                        key={`probe-segment-${segment.stepIndex}`}
+                        x1={from.coord.x + 0.5}
+                        y1={from.coord.y + 0.5}
+                        x2={to.coord.x + 0.5}
+                        y2={to.coord.y + 0.5}
+                        stroke={color}
+                        strokeWidth={strokeWidth}
+                        strokeLinecap="round"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    );
+                  })}
+                  {qcdProbeFrame.nodes.map((node, idx) => {
+                    const fill = `rgba(${Math.round(node.rgb[0] * 255)}, ${Math.round(node.rgb[1] * 255)}, ${Math.round(node.rgb[2] * 255)}, 0.95)`;
+                    const radius = Math.max(
+                      0.22,
+                      Math.min(
+                        0.55,
+                        Math.min(qcdProbeFrame.latticeWidth, qcdProbeFrame.latticeHeight) * 0.012,
+                      ),
+                    );
+                    return (
+                      <circle
+                        key={`probe-node-${idx}`}
+                        cx={node.coord.x + 0.5}
+                        cy={node.coord.y + 0.5}
+                        r={radius}
+                        fill={fill}
+                        stroke="rgba(15,23,42,0.65)"
+                        strokeWidth={radius * 0.35}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                    );
+                  })}
+                </svg>
+              ) : null}
+              {fluxSources.map((source, idx) => {
+                const denomX = Math.max(width - 1, 1);
+                const denomY = Math.max(height - 1, 1);
+                const leftPercent = (source.x / denomX) * 100;
+                const topPercent = (source.y / denomY) * 100;
+                const tint = source.charge >= 0 ? 'rgba(96,165,250,0.9)' : 'rgba(248,113,113,0.9)';
+                return (
+                  <div
+                    key={`flux-source-${idx}`}
+                    style={{
+                      position: 'absolute',
+                      left: `${leftPercent}%`,
+                      top: `${topPercent}%`,
+                      transform: 'translate(-50%, -50%)',
+                      width: '0.85rem',
+                      height: '0.85rem',
+                      borderRadius: '9999px',
+                      border: '1px solid rgba(15,23,42,0.55)',
+                      background: tint,
+                      boxShadow: '0 0 6px rgba(15,23,42,0.45)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      color: '#0f172a',
+                      fontSize: '0.55rem',
+                      fontWeight: 600,
+                    }}
+                  >
+                    {source.charge >= 0 ? '+' : '-'}
+                  </div>
+                );
+              })}
+            </div>
             <div
               style={{
                 position: 'absolute',
@@ -7320,6 +10185,9 @@ export default function App() {
                   <span style={{ fontSize: '0.8rem', color: '#eab308' }}>
                     Projector energy {telemetrySnapshot.su7.projectorEnergy.toFixed(3)}
                   </span>
+                  <span style={{ fontSize: '0.8rem', color: '#f87171' }}>
+                    Geodesic fallbacks {telemetrySnapshot.su7.geodesicFallbacks}
+                  </span>
                 </div>
                 <div
                   style={{
@@ -7459,6 +10327,7 @@ type TelemetrySnapshot = {
     effective: CouplingConfig;
   };
   su7: Su7Telemetry;
+  hopf: RainbowFrameMetrics['hopf'];
   su7Histograms: {
     normDeltaMean: TelemetryHistogramSnapshot;
     normDeltaMax: TelemetryHistogramSnapshot;
@@ -7471,6 +10340,17 @@ type TelemetrySnapshot = {
   };
   frameSamples: number;
   updatedAt: number;
+  su7Gpu: {
+    backend: 'gpu' | 'cpu';
+    medianMs: number;
+    meanMs: number;
+    sampleCount: number;
+    baselineMs: number | null;
+    drift: number | null;
+    warning: boolean;
+    lastProfile: Su7GpuKernelProfile | null;
+    warningEvent: Su7GpuKernelWarningEvent | null;
+  } | null;
 };
 
 const HistogramPanel = ({
@@ -7620,7 +10500,7 @@ function TinyHistogram({ bins, color = '#38bdf8', height = 36 }: TinyHistogramPr
 }
 
 function TelemetryOverlayContents({ snapshot }: { snapshot: TelemetrySnapshot }) {
-  const { su7, su7Histograms, su7Unitary, frameSamples } = snapshot;
+  const { su7, su7Histograms, su7Unitary, frameSamples, su7Gpu } = snapshot;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
       <div
@@ -7635,10 +10515,90 @@ function TelemetryOverlayContents({ snapshot }: { snapshot: TelemetrySnapshot })
         <span>SU7 overlay</span>
         <span style={{ fontSize: '0.65rem', color: '#cbd5f5' }}>n={frameSamples}</span>
       </div>
+      {su7Gpu ? (
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '0.25rem',
+            fontSize: '0.62rem',
+            color: '#cbd5f5',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'baseline',
+            }}
+          >
+            <span>GPU transform ({su7Gpu.backend})</span>
+            <span>samples {su7Gpu.sampleCount}</span>
+          </div>
+          <div>
+            Median {su7Gpu.medianMs.toFixed(3)} ms · Mean {su7Gpu.meanMs.toFixed(3)} ms
+          </div>
+          {su7Gpu.baselineMs != null && <div>Baseline {su7Gpu.baselineMs.toFixed(3)} ms</div>}
+          {su7Gpu.drift != null && <div>Drift {(su7Gpu.drift * 100).toFixed(1)}%</div>}
+          {su7Gpu.lastProfile && (
+            <div>
+              Last dispatch {su7Gpu.lastProfile.timeMs.toFixed(3)} ms ·{' '}
+              {su7Gpu.lastProfile.vectorCount.toLocaleString()} vectors
+            </div>
+          )}
+          {su7Gpu.warning && (
+            <div style={{ color: '#f97316', fontWeight: 600 }}>
+              Warning: performance drift
+              {su7Gpu.warningEvent
+                ? ` ${(su7Gpu.warningEvent.drift * 100).toFixed(1)}%`
+                : su7Gpu.drift != null
+                  ? ` ${(su7Gpu.drift * 100).toFixed(1)}%`
+                  : ''}
+              {su7Gpu.warningEvent
+                ? ` · baseline ${su7Gpu.warningEvent.baselineMs.toFixed(3)} ms`
+                : ''}
+            </div>
+          )}
+        </div>
+      ) : null}
       <div style={{ fontSize: '0.65rem', color: '#cbd5f5' }}>
         Unitary frame {su7Unitary.latest.toExponential(2)} · μ {su7.unitaryError.toExponential(2)} ·
         max {su7Unitary.max.toExponential(2)}
       </div>
+      {snapshot.hopf.lenses.length > 0 ? (
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '0.25rem',
+            fontSize: '0.62rem',
+            color: '#a5f3fc',
+          }}
+        >
+          <span style={{ fontWeight: 600, fontSize: '0.65rem', color: '#67e8f9' }}>
+            Hopf lenses
+          </span>
+          {snapshot.hopf.lenses.map((lens) => (
+            <div
+              key={`overlay-hopf-${lens.index}`}
+              style={{
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.15rem',
+                background: 'rgba(14,24,42,0.55)',
+                borderRadius: '0.45rem',
+                padding: '0.35rem 0.45rem',
+              }}
+            >
+              <span style={{ color: '#e2e8f0', fontWeight: 600 }}>
+                Lens {lens.index + 1} · share {lens.share.toFixed(3)}
+              </span>
+              <span>Base ({lens.base.map((value) => value.toFixed(2)).join(', ')})</span>
+              <span>Fiber {((lens.fiber * 180) / Math.PI).toFixed(1)}°</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
         <div
           style={{
@@ -7691,6 +10651,363 @@ const phaseHeatmapColor = (t: number): [number, number, number] => {
   const g = Math.round(255 * Math.sin(clamped * Math.PI));
   const b = Math.round(255 * (1 - clamped * 0.85));
   return [r, g, b];
+};
+
+type Su7GlyphControlProps = {
+  gateList: GateList | null;
+  macroBinding: MacroBinding | null;
+  macroLearnMode: boolean;
+  onEdgeGesture: (args: { axis: number; deltaTheta: number; deltaPhi: number }) => void;
+};
+
+type DragPreview = {
+  axis: number;
+  deltaTheta: number;
+  deltaPhi: number;
+  x: number;
+  y: number;
+};
+
+const EDGE_THETA_SCALE = Math.PI;
+const KEY_THETA_STEP = 0.18;
+const KEY_PHI_STEP = 0.14;
+const NODE_RADIUS = 82;
+
+const phaseStrokeFor = (phase: number): { color: string; dash: string } => {
+  const magnitude = Math.min(1, Math.abs(phase) / Math.PI);
+  if (Math.abs(phase) < 1e-3) {
+    return { color: '#a3a3a3', dash: '1 4' };
+  }
+  if (phase >= 0) {
+    return {
+      color: `rgba(59,130,246,${0.45 + 0.45 * magnitude})`,
+      dash: '0',
+    };
+  }
+  return {
+    color: `rgba(248,113,113,${0.45 + 0.45 * magnitude})`,
+    dash: '4 2',
+  };
+};
+
+const formatDegrees = (value: number): string => `${value >= 0 ? '+' : ''}${value.toFixed(1)}°`;
+
+const Su7GlyphControl: React.FC<Su7GlyphControlProps> = ({
+  gateList,
+  macroBinding,
+  macroLearnMode,
+  onEdgeGesture,
+}) => {
+  const svgRef = React.useRef<SVGSVGElement | null>(null);
+  const pointerStateRef = React.useRef<{
+    axis: number;
+    startX: number;
+    startY: number;
+    tangent: { x: number; y: number };
+    normal: { x: number; y: number };
+    length: number;
+    pointerId: number;
+  } | null>(null);
+  const [dragPreview, setDragPreview] = React.useState<DragPreview | null>(null);
+
+  const phases = gateList ? Array.from(gateList.gains.phaseAngles) : new Array(7).fill(0);
+  const pulses = gateList ? Array.from(gateList.gains.pulseAngles) : new Array(7).fill(0);
+
+  const nodes = React.useMemo(() => {
+    return Array.from({ length: 7 }, (_, axis) => {
+      const angle = (axis / 7) * TAU - Math.PI / 2;
+      return {
+        axis,
+        angle,
+        x: NODE_RADIUS * Math.cos(angle),
+        y: NODE_RADIUS * Math.sin(angle),
+      };
+    });
+  }, []);
+
+  const getLocalPoint = (event: React.PointerEvent<Element>) => {
+    const svg = svgRef.current;
+    if (!svg) {
+      return { x: 0, y: 0 };
+    }
+    const rect = svg.getBoundingClientRect();
+    const nx = (event.clientX - rect.left) / rect.width;
+    const ny = (event.clientY - rect.top) / rect.height;
+    return {
+      x: nx * 240 - 120,
+      y: ny * 240 - 120,
+    };
+  };
+
+  const computePreview = (local: { x: number; y: number }) => {
+    const state = pointerStateRef.current;
+    if (!state) return null;
+    const dx = local.x - state.startX;
+    const dy = local.y - state.startY;
+    const projT = dx * state.tangent.x + dy * state.tangent.y;
+    const projN = dx * state.normal.x + dy * state.normal.y;
+    const deltaTheta = (projT / state.length) * EDGE_THETA_SCALE;
+    const deltaPhi = (projN / state.length) * EDGE_THETA_SCALE;
+    return {
+      axis: state.axis,
+      deltaTheta,
+      deltaPhi,
+      x: local.x,
+      y: local.y,
+    } satisfies DragPreview;
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<Element>) => {
+    if (!pointerStateRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const preview = computePreview(getLocalPoint(event));
+    if (preview) {
+      setDragPreview(preview);
+    }
+  };
+
+  const finishPointerGesture = (event: React.PointerEvent<Element>, cancel = false) => {
+    const state = pointerStateRef.current;
+    if (!state) return;
+    const svg = svgRef.current;
+    if (svg) {
+      try {
+        svg.releasePointerCapture(state.pointerId);
+      } catch {
+        // ignore
+      }
+    }
+    if (!cancel) {
+      const preview = computePreview(getLocalPoint(event));
+      if (preview) {
+        onEdgeGesture({
+          axis: preview.axis,
+          deltaTheta: preview.deltaTheta,
+          deltaPhi: preview.deltaPhi,
+        });
+      }
+    }
+    pointerStateRef.current = null;
+    setDragPreview(null);
+  };
+
+  const beginPointerGesture = (axis: number, event: React.PointerEvent<SVGLineElement>) => {
+    if (!svgRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const local = getLocalPoint(event);
+    const current = nodes[axis];
+    const next = nodes[(axis + 1) % nodes.length];
+    const edgeX = next.x - current.x;
+    const edgeY = next.y - current.y;
+    const length = Math.hypot(edgeX, edgeY);
+    if (length <= 1e-3) return;
+    const tangent = { x: edgeX / length, y: edgeY / length };
+    const normal = { x: -tangent.y, y: tangent.x };
+    pointerStateRef.current = {
+      axis,
+      startX: local.x,
+      startY: local.y,
+      tangent,
+      normal,
+      length,
+      pointerId: event.pointerId,
+    };
+    svgRef.current!.setPointerCapture(event.pointerId);
+  };
+
+  const handlePointerDown = (axis: number) => (event: React.PointerEvent<SVGLineElement>) => {
+    beginPointerGesture(axis, event);
+  };
+
+  const handlePointerUp = (event: React.PointerEvent<Element>) => {
+    if (pointerStateRef.current) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    finishPointerGesture(event, false);
+  };
+
+  const handlePointerCancel = (event: React.PointerEvent<Element>) => {
+    finishPointerGesture(event, true);
+  };
+
+  const handleEdgeKeyDown = (axis: number) => (event: React.KeyboardEvent<SVGLineElement>) => {
+    if (event.defaultPrevented) return;
+    const key = event.key;
+    let handled = false;
+    if (key === 'ArrowRight') {
+      onEdgeGesture({ axis, deltaTheta: KEY_THETA_STEP, deltaPhi: 0 });
+      handled = true;
+    } else if (key === 'ArrowLeft') {
+      onEdgeGesture({ axis, deltaTheta: -KEY_THETA_STEP, deltaPhi: 0 });
+      handled = true;
+    } else if (key === 'ArrowUp') {
+      onEdgeGesture({ axis, deltaTheta: 0, deltaPhi: KEY_PHI_STEP });
+      handled = true;
+    } else if (key === 'ArrowDown') {
+      onEdgeGesture({ axis, deltaTheta: 0, deltaPhi: -KEY_PHI_STEP });
+      handled = true;
+    }
+    if (handled) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  };
+
+  const macroAxis = macroBinding?.axis ?? null;
+
+  const edgeSummary = (axis: number) => {
+    const thetaDeg = radiansToDegrees(pulses[axis]);
+    const phaseDeg = radiansToDegrees(phases[axis]);
+    return `Δθ ${thetaDeg.toFixed(1)}°, φ ${phaseDeg.toFixed(1)}°`;
+  };
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '0.75rem',
+      }}
+    >
+      <svg
+        ref={svgRef}
+        viewBox="-120 -120 240 240"
+        role="img"
+        aria-label="SU7 phase and pulse glyph"
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerCancel}
+        onPointerCancel={handlePointerCancel}
+        style={{ width: '100%', maxWidth: '260px', alignSelf: 'center' }}
+      >
+        <circle
+          cx={0}
+          cy={0}
+          r={110}
+          fill="rgba(15,23,42,0.4)"
+          stroke="rgba(148,163,184,0.35)"
+          strokeWidth={2}
+        />
+        {nodes.map((node) => {
+          const phase = phases[node.axis] ?? 0;
+          const pulse = pulses[node.axis] ?? 0;
+          const stroke = phaseStrokeFor(phase);
+          const isMacro = macroAxis === node.axis;
+          return (
+            <g key={`node-${node.axis}`}>
+              <circle
+                cx={node.x}
+                cy={node.y}
+                r={14}
+                fill={isMacro ? 'rgba(250,204,21,0.18)' : 'rgba(15,23,42,0.75)'}
+                stroke={stroke.color}
+                strokeWidth={3}
+                strokeDasharray={stroke.dash}
+              />
+              <text x={node.x} y={node.y - 24} textAnchor="middle" fontSize="9" fill="#cbd5f5">
+                {formatDegrees(radiansToDegrees(phase))}
+              </text>
+              <text x={node.x} y={node.y + 28} textAnchor="middle" fontSize="9" fill="#94a3b8">
+                {formatDegrees(radiansToDegrees(pulse))}
+              </text>
+            </g>
+          );
+        })}
+        {nodes.map((node) => {
+          const axis = node.axis;
+          const next = nodes[(axis + 1) % nodes.length];
+          const isMacro = macroAxis === axis;
+          const baseStroke = isMacro ? '#facc15' : '#94a3b8';
+          const strokeWidth = isMacro ? 4 : 3;
+          return (
+            <line
+              key={`edge-${axis}`}
+              x1={node.x}
+              y1={node.y}
+              x2={next.x}
+              y2={next.y}
+              stroke={baseStroke}
+              strokeWidth={strokeWidth}
+              strokeDasharray={isMacro ? 'none' : '6 4'}
+              opacity={macroLearnMode && !isMacro ? 0.55 : 0.8}
+              cursor="grab"
+              role="slider"
+              aria-label={`Edge ${axis + 1} control`}
+              aria-valuemin={-Math.PI}
+              aria-valuemax={Math.PI}
+              aria-valuenow={pulses[axis] ?? 0}
+              aria-valuetext={edgeSummary(axis)}
+              tabIndex={0}
+              onPointerDown={handlePointerDown(axis)}
+              onKeyDown={handleEdgeKeyDown(axis)}
+            />
+          );
+        })}
+        {dragPreview && (
+          <g>
+            <line
+              x1={nodes[dragPreview.axis].x}
+              y1={nodes[dragPreview.axis].y}
+              x2={dragPreview.x}
+              y2={dragPreview.y}
+              stroke="#38bdf8"
+              strokeWidth={2}
+              strokeDasharray="3 3"
+            />
+            <text
+              x={dragPreview.x}
+              y={dragPreview.y - 10}
+              textAnchor="middle"
+              fontSize="9"
+              fill="#38bdf8"
+            >
+              {`${formatDegrees(radiansToDegrees(dragPreview.deltaTheta))} | ${formatDegrees(radiansToDegrees(dragPreview.deltaPhi))}`}
+            </text>
+          </g>
+        )}
+      </svg>
+      <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>
+        <div>
+          Drag an edge to append a pulse gate using the captured tangential (Δθ) and normal (Δφ)
+          deltas.{' '}
+          {macroLearnMode
+            ? 'Macro learn is active — the next gesture will bind the knob.'
+            : 'Use arrow keys on an edge for keyboard adjustments.'}
+        </div>
+      </div>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(9rem, 1fr))',
+          gap: '0.5rem',
+          fontSize: '0.75rem',
+          color: '#cbd5f5',
+        }}
+      >
+        {nodes.map((node) => {
+          const thetaDeg = radiansToDegrees(pulses[node.axis] ?? 0);
+          const phaseDeg = radiansToDegrees(phases[node.axis] ?? 0);
+          return (
+            <div
+              key={`summary-${node.axis}`}
+              style={{
+                background: 'rgba(15,23,42,0.45)',
+                borderRadius: '0.5rem',
+                padding: '0.4rem 0.6rem',
+              }}
+            >
+              <div style={{ fontWeight: 600, color: '#e2e8f0' }}>Axis {node.axis + 1}</div>
+              <div>Δθ {thetaDeg.toFixed(1)}°</div>
+              <div>φ {phaseDeg.toFixed(1)}°</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 };
 
 const PhaseHeatmapPanel = ({ snapshot }: { snapshot: PhaseHeatmapSnapshot }) => {
@@ -7756,11 +11073,13 @@ function SliderControl({
   format,
   disabled = false,
 }: SliderProps) {
+  const inputId = React.useId();
   return (
     <div className="control" style={disabled ? { opacity: 0.55 } : undefined}>
-      <label>{label}</label>
+      <label htmlFor={inputId}>{label}</label>
       <div className="control-row">
         <input
+          id={inputId}
           type="range"
           min={min}
           max={max}
@@ -7783,11 +11102,13 @@ type ToggleProps = {
 };
 
 function ToggleControl({ label, value, onChange, disabled = false }: ToggleProps) {
+  const inputId = React.useId();
   return (
     <div className="control" style={disabled ? { opacity: 0.55 } : undefined}>
-      <label>{label}</label>
+      <label htmlFor={inputId}>{label}</label>
       <div className="control-row">
         <input
+          id={inputId}
           type="checkbox"
           checked={value}
           disabled={disabled}
@@ -7809,10 +11130,12 @@ type SelectProps = {
 };
 
 function SelectControl({ label, value, onChange, options }: SelectProps) {
+  const selectId = React.useId();
   return (
     <div className="control">
-      <label>{label}</label>
+      <label htmlFor={selectId}>{label}</label>
       <select
+        id={selectId}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         style={{

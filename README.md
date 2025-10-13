@@ -90,6 +90,14 @@ Document decisions & deltas in QA sign-off:
 - GPU vs CPU frame cost
 - Any telemetry warnings observed
 
+## QCD Annealer Acceptance Notes
+
+- The **QCD Anneal** panel now exposes lattice depth, temporal extent, GPU batch planes, and a temperature schedule editor. These values persist with presets and snapshot export so QA can reproduce anneals across sessions.
+- GPU sweeps operate on per-plane scratch buffers. `Batch planes` limits how many `(z,t)` slices are processed per request, keeping scratch memory to `width × height × siteStride × 4 bytes`. For example, a 128×128 lattice with the default x/y axes consumes ~2.3 MB per plane; keeping `batchLayers ≤ 4` stays well under the 16 MB budget on mid-tier GPUs.
+- Each anneal step emits a **QCD perf log** entry (`[gpu] axis …` or `[cpu] …`) so acceptance runs can verify that the GPU path is active and no unexpected CPU fallbacks occur. When the log shows continuous GPU entries the parity harness can be executed without triggering OOM.
+- The new **Run temperature scan** action applies the configured β schedule using the same scratch buffers and records Polyakov loop magnitudes alongside the schedule that generated them. The panel lists the last scan so QA can capture both the numeric output and the sweep cadence.
+- Temperatures, Polyakov results, and perf logs are reset whenever the lattice is reinitialised or a snapshot is restored, ensuring acceptance notes capture the exact configuration that produced a run.
+
 ## File Guide
 
 - `src/App.tsx` – runtime orchestration, UI, telemetry, and diagnostic toggles.
@@ -98,3 +106,7 @@ Document decisions & deltas in QA sign-off:
 - `overview.md` – in-depth description of the rim/wallpaper pipeline and controls.
 
 Happy rendering! For further tweaks, the shader uniforms are intentionally kept 1:1 with the CPU code so parity stays tractable. Pull the diagnostic toggles when experimenting—they exist so regression data is always one click away.
+
+## Developer Onboarding
+
+For build/test commands, baseline workflows, canonical serialization, performance budgets, and troubleshooting (Phase 10 scope), see [`docs/dev-onboarding.md`](docs/dev-onboarding.md).

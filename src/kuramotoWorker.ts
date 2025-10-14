@@ -12,6 +12,7 @@ import {
   type KuramotoParams,
   type KuramotoState,
   type KuramotoInstrumentationSnapshot,
+  type ThinElementSchedule,
 } from './kuramotoCore';
 import { assertPhaseField } from './fields/contracts.js';
 import { clampKernelSpec, KERNEL_SPEC_DEFAULT, type KernelSpec } from './kernel/kernelSpec';
@@ -25,6 +26,7 @@ type InitMessage = {
   qInit: number;
   buffers: ArrayBuffer[];
   seed?: number;
+  componentCount?: number;
 };
 
 type TickMessage = {
@@ -33,6 +35,8 @@ type TickMessage = {
   timestamp: number;
   frameId: number;
   seed?: number;
+  schedule?: ThinElementSchedule | null;
+  componentCount?: number;
 };
 
 type UpdateParamsMessage = {
@@ -66,6 +70,8 @@ type SimulateMessage = {
   height: number;
   qInit: number;
   seed?: number;
+  schedule?: ThinElementSchedule | null;
+  componentCount?: number;
 };
 
 type IncomingMessage =
@@ -106,6 +112,7 @@ let randn = createNormalGenerator();
 let bufferPool: ArrayBuffer[] = [];
 let width = 0;
 let height = 0;
+let componentCount = 1;
 let kernelSpec: KernelSpec | null = null;
 let kernelSpecVersion = 0;
 
@@ -120,9 +127,15 @@ const post = (
   }
 };
 
-const ensureState = (w: number, h: number) => {
-  if (!state || state.width !== w || state.height !== h) {
-    state = createKuramotoState(w, h);
+const ensureState = (w: number, h: number, requestedComponents: number) => {
+  if (
+    !state ||
+    state.width !== w ||
+    state.height !== h ||
+    state.componentCount !== requestedComponents
+  ) {
+    state = createKuramotoState(w, h, undefined, { componentCount: requestedComponents });
+    componentCount = requestedComponents;
   }
 };
 
@@ -138,6 +151,9 @@ const releaseBuffer = (buffer: ArrayBuffer) => {
 
 const handleTick = (msg: TickMessage) => {
   if (!state || !params) return;
+  const requestedComponents = msg.componentCount ?? componentCount;
+  ensureState(width, height, requestedComponents);
+  componentCount = requestedComponents;
   const buffer = acquireBuffer();
   if (!buffer) {
     post({
@@ -153,12 +169,14 @@ const handleTick = (msg: TickMessage) => {
   stepKuramotoState(state, params, msg.dt, randn, msg.timestamp, {
     kernel: activeKernel,
     telemetry: { kernelVersion: kernelSpecVersion },
+    schedule: msg.schedule ?? undefined,
   });
   const meta = state.field.getMeta();
   const derived = createDerivedViews(buffer, state.width, state.height);
   assertPhaseField(derived, 'worker:tick');
   deriveKuramotoFields(state, derived, {
     kernel: activeKernel,
+    schedule: msg.schedule ?? undefined,
   });
   const instrumentation = createKuramotoInstrumentationSnapshot(state);
   post(
@@ -180,7 +198,8 @@ const handleInit = (msg: InitMessage) => {
   width = msg.width;
   height = msg.height;
   params = { ...msg.params };
-  ensureState(width, height);
+  componentCount = msg.componentCount ?? componentCount;
+  ensureState(width, height, componentCount);
   ensureRand(msg.seed);
   bufferPool = [...msg.buffers];
   if (!state) return;
@@ -195,22 +214,27 @@ const handleReset = (msg: ResetMessage) => {
 };
 
 const handleSimulate = (msg: SimulateMessage) => {
-  const simState = createKuramotoState(msg.width, msg.height);
+  const simState = createKuramotoState(msg.width, msg.height, undefined, {
+    componentCount: msg.componentCount ?? 1,
+  });
   const simParams = { ...msg.params };
   const simRand = createNormalGenerator(msg.seed);
   initKuramotoState(simState, msg.qInit);
   const size = derivedBufferSize(msg.width, msg.height);
   const buffers: ArrayBuffer[] = [];
   const activeKernel = kernelSpec ?? KERNEL_SPEC_DEFAULT;
+  const schedule = msg.schedule ?? undefined;
   for (let frame = 0; frame < msg.frameCount; frame++) {
     stepKuramotoState(simState, simParams, msg.dt, simRand, msg.dt * (frame + 1), {
       kernel: activeKernel,
+      schedule,
     });
     const out = new ArrayBuffer(size);
     const derived = createDerivedViews(out, msg.width, msg.height);
     assertPhaseField(derived, 'worker:simulate');
     deriveKuramotoFields(simState, derived, {
       kernel: activeKernel,
+      schedule,
     });
     buffers.push(out);
   }

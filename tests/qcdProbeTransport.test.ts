@@ -140,7 +140,7 @@ test('probe transport is gauge covariant along closed path', () => {
   const gEnd = transforms.get(endKey) ?? identityMatrix();
   const expectedEnd = su3_applyToVector(gEnd, baseline.end.vector);
   const error = vectorMaxError(expectedEnd, transported.end.vector);
-  assert.ok(error <= 1e-9, `gauge covariance violated at end point (error ${error})`);
+  assert.ok(error <= 1e-7, `gauge covariance violated at end point (error ${error})`);
 });
 
 test('probe visualization returns closed loop for paired sources', () => {

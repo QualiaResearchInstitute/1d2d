@@ -1838,7 +1838,7 @@ Below is (i) a 60‑second summary of the paper, (ii) a one‑to‑one mapping i
   =
   ∑
   j
-  ≠
+  � 
   i
   k
 
@@ -1883,7 +1883,7 @@ i
 ​
 =
 j
-
+� 
 =i
 ∑
 ​
@@ -2559,7 +2559,7 @@ i
   )
 - ∑
   A
-  ≠
+  � 
   B
   k
   A
@@ -2634,7 +2634,7 @@ i
   ​
   )+
   A
-  
+  � 
   =B
   ∑
   ​

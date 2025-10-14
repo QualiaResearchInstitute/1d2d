@@ -18,12 +18,21 @@
     "cross-tier:update": "tsc -p tsconfig.baseline.json && node --loader ./scripts/tools/esm-extension-loader.mjs baseline-dist/scripts/updateCrossTierBaseline.js",
     "video:process": "tsc -p tsconfig.baseline.json && node --loader ./scripts/tools/esm-extension-loader.mjs baseline-dist/scripts/videoPipeline.js",
     "test": "tsc -p tsconfig.tests.json && node --test \"build/tests/tests/**/*.js\"",
-    "prepare": "husky install"
+    "prepare": "husky install",
+    "cli:build": "tsc -p tsconfig.cli.json",
+    "indra-cli": "node dist-cli/cli/indraCli.js",
+    "api:serve": "node dist-cli/server/index.js"
   },
   "dependencies": {
+    "@rjsf/core": "^5.15.0",
+    "@rjsf/utils": "^5.15.0",
+    "@rjsf/validator-ajv8": "^5.15.0",
+    "ajv": "^8.12.0",
+    "ajv-formats": "^2.1.1",
     "blake3": "^2.1.4",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "ws": "^8.16.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.7",
@@ -53,5 +62,8 @@
     "*.{ts,tsx,js,jsx,css,md,json,yml,yaml}": [
       "prettier --check"
     ]
+  },
+  "bin": {
+    "indra-cli": "./dist-cli/cli/indraCli.js"
   }
 }

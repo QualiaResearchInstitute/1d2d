@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Phase 12 launch hub for the 1d2d Perceptual Synthesis Studio – downloads, quick start, documentation, and community links."
+    />
+    <title>1d2d Perceptual Synthesis Studio · Phase 12 Launch</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container">
+        <div class="brand">
+          <span class="brand-mark">1d2d</span>
+          <span class="brand-sub">Perceptual Synthesis Studio</span>
+        </div>
+        <nav class="site-nav" aria-label="Main navigation">
+          <a href="#downloads">Downloads</a>
+          <a href="#quickstart">Quick Start</a>
+          <a href="#tutorial">Tutorial</a>
+          <a href="#docs">Docs</a>
+          <a href="#support">Support</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero" id="top">
+        <div class="container hero-content">
+          <div class="hero-copy">
+            <h1>
+              Launching the 1d2d Perceptual Synthesis Studio
+            </h1>
+            <p>
+              Phase&nbsp;12 ships symmetry, dynamics, and optics workflows in a single desktop studio,
+              backed by a scriptable CLI and a deep reference manual. Start composing SU7 gates,
+              inspect live telemetry, and export production-ready renders in minutes.
+            </p>
+            <div class="cta-buttons">
+              <a
+                class="button primary"
+                href="../release/phase12/mac/1d2d-macos-universal.dmg"
+              >
+                Download Desktop · macOS (Universal)
+              </a>
+              <a
+                class="button secondary"
+                href="../release/phase12/cli/1d2d-cli-macos-linux.zip"
+              >
+                Download CLI Bundle
+              </a>
+            </div>
+            <div class="hero-meta">
+              <span>Signed + notarised build</span>
+              <span>Kuramoto · optics · telemetry presets</span>
+              <span>CLI automation &amp; SDK bindings</span>
+            </div>
+          </div>
+          <div class="hero-card">
+            <h2>Launch Checklist</h2>
+            <ul>
+              <li>✅ Universal macOS installer with notarisation ticket</li>
+              <li>✅ CLI bundles + checksum manifest</li>
+              <li>✅ Quick start tutorial</li>
+              <li>✅ Support &amp; community links</li>
+              <li>✅ Opt-in telemetry plan</li>
+            </ul>
+            <p class="hero-note">
+              Need a full overview? Read the
+              <a href="../phase12_launch_preparation.md">Phase&nbsp;12 playbook</a>.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="downloads">
+        <div class="container">
+          <div class="section-header">
+            <h2>Downloads</h2>
+            <p>Grab the signed desktop studio or automate builds with the CLI bundle.</p>
+          </div>
+          <div class="card-grid">
+            <article class="card download-card">
+              <header>
+                <h3>Desktop Studio</h3>
+                <p>Notarised macOS universal app with bundled presets and guardrails.</p>
+              </header>
+              <ul class="badge-list">
+                <li>macOS 12+</li>
+                <li>Universal (arm64 · x64)</li>
+                <li>Metal GPU pipeline</li>
+              </ul>
+              <div class="card-actions">
+                <a
+                  class="button primary"
+                  href="../release/phase12/mac/1d2d-macos-universal.dmg"
+                >
+                  Download DMG
+                </a>
+                <a
+                  class="button tertiary"
+                  href="../release/phase12/mac/checksums.txt"
+                >
+                  Checksums
+                </a>
+              </div>
+              <p class="card-footnote">
+                Signature logs and first-run captures live in
+                <a href="../release/phase12/mac/first-run/">docs/release/phase12/mac/first-run/</a>.
+              </p>
+            </article>
+
+            <article class="card download-card">
+              <header>
+                <h3>CLI Bundle</h3>
+                <p>Package scenarios, automate render jobs, and integrate with CI pipelines.</p>
+              </header>
+              <ul class="badge-list">
+                <li>macOS (arm64 · x64)</li>
+                <li>Linux x64</li>
+                <li>Node 18 runtime</li>
+              </ul>
+              <div class="card-actions">
+                <a
+                  class="button primary"
+                  href="../release/phase12/cli/1d2d-cli-macos-linux.zip"
+                >
+                  Download Zip
+                </a>
+                <a
+                  class="button tertiary"
+                  href="../release/phase12/cli/checksums.txt"
+                >
+                  Checksums
+                </a>
+              </div>
+              <p class="card-footnote">
+                Smoke test transcripts ship with the bundle:
+                <a href="../release/phase12/cli/smoke-tests.md">smoke-tests.md</a>.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section alt" id="quickstart">
+        <div class="container">
+          <div class="section-header">
+            <h2>Quick Start</h2>
+            <p>Hit the ground running with the core SU7 + optics workflow.</p>
+          </div>
+          <ol class="step-list">
+            <li>
+              <h3>1. Load the canonical preset</h3>
+              <p>
+                Launch the studio, choose <strong>Presets → Phase 12 Launch</strong>, and explore the
+                curated Kuramoto + optics configuration.
+              </p>
+            </li>
+            <li>
+              <h3>2. Tweak the Kuramoto driver</h3>
+              <p>
+                Adjust <code>K₀</code> and <code>α</code> in the Dynamics panel to watch coupling
+                synchronization shift in real time.
+              </p>
+            </li>
+            <li>
+              <h3>3. Export an optical render</h3>
+              <p>
+                Head to <strong>Export → Thin Element Stack</strong> and generate amplitude + phase
+                passes for downstream compositing.
+              </p>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="section" id="tutorial">
+        <div class="container tutorial">
+          <div class="section-header">
+            <h2>Tutorial Walkthrough</h2>
+            <p>Watch a two-minute tour of the launch preset, core panels, and export flow.</p>
+          </div>
+          <div class="tutorial-media">
+            <video
+              controls
+              poster="./assets/tutorial-poster.svg"
+              src="../launch/phase12/media/launch-demo.mp4"
+            >
+              Your browser does not support embedded videos.
+              <a href="../launch/phase12/media/launch-demo.mp4">Download the walkthrough</a>.
+            </video>
+            <p class="media-caption">
+              Prefer to skim? Read the annotated script in
+              <a href="../launch/phase12/tutorial-script.md">tutorial-script.md</a>.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section alt" id="docs">
+        <div class="container">
+          <div class="section-header">
+            <h2>Documentation Hub</h2>
+            <p>Deep dives, API references, and SDK guides to help you extend the studio.</p>
+          </div>
+          <div class="card-grid docs-grid">
+            <article class="card docs-card">
+              <h3>User Manual</h3>
+              <p>Explore control panels, presets, and export formats in detail.</p>
+              <a class="button secondary" href="../manual/user-guide.md">Open manual</a>
+            </article>
+            <article class="card docs-card">
+              <h3>SDK · TypeScript</h3>
+              <p>Automate synth runs, manage presets, and pull telemetry programmatically.</p>
+              <a class="button secondary" href="../reference/sdk-typescript.md">Read SDK docs</a>
+            </article>
+            <article class="card docs-card">
+              <h3>Glossary &amp; Concepts</h3>
+              <p>Clarify jargon across symmetry, optics, and SU7 gate composition.</p>
+              <a class="button secondary" href="../manual/glossary.md">Browse glossary</a>
+            </article>
+            <article class="card docs-card">
+              <h3>REST &amp; CLI Reference</h3>
+              <p>Hook the CLI or HTTP endpoints into render farms and CI pipelines.</p>
+              <a class="button secondary" href="../reference/">Reference index</a>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="support">
+        <div class="container support-grid">
+          <div>
+            <div class="section-header">
+              <h2>Support &amp; Community</h2>
+              <p>Connect with the team, report issues, and follow the post-launch roadmap.</p>
+            </div>
+            <ul class="support-list">
+              <li>
+                <strong>Issues &amp; triage</strong> –
+                <a href="../support/labels.md">labeling guide</a> +
+                <a href="https://github.com/">GitHub Issues</a>
+                templates keep reports structured.
+              </li>
+              <li>
+                <strong>Community chat</strong> –
+                Join the Discord/Slack invite listed in
+                <a href="../support/community-guide.md">community-guide.md</a>.
+              </li>
+              <li>
+                <strong>FAQ &amp; troubleshooting</strong> –
+                Start with <a href="../support/faq.md">support/faq.md</a> for Gatekeeper, codecs, and
+                CLI PATH setup tips.
+              </li>
+              <li>
+                <strong>Telemetry insights</strong> –
+                Opt-in copy, schema, and dashboards live in
+                <a href="../telemetry/phase12/">docs/telemetry/phase12/</a>.
+              </li>
+            </ul>
+          </div>
+          <aside class="roadmap-card">
+            <h3>Up Next</h3>
+            <p>
+              Track the post-launch backlog, quick wins, and stretch goals in the public roadmap.
+            </p>
+            <a class="button secondary" href="../roadmap/postlaunch.md">View roadmap</a>
+            <p class="card-footnote">
+              Bi-weekly feedback digests are archived in
+              <a href="../support/feedback-digests/">support/feedback-digests/</a>.
+            </p>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="container">
+        <div class="footer-brand">
+          <span class="brand-mark">1d2d</span>
+          <span class="brand-sub">Perceptual Synthesis Studio</span>
+        </div>
+        <p>
+          Phase&nbsp;12 launch ·
+          <a href="../launch/phase12/announcement.md">Read the announcement</a> ·
+          <a href="mailto:studio@1d2d.dev">studio@1d2d.dev</a>
+        </p>
+        <p class="footer-note">
+          Built with ❤️ by the 1d2d team. Mirror this site with <code>npm run docs:build</code> when
+          the release artifacts are final.
+        </p>
+      </div>
+    </footer>
+  </body>
+</html>

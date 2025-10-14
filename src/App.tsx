@@ -7,12 +7,17 @@ import {
   deriveKuramotoFields as deriveKuramotoFieldsCore,
   initKuramotoState,
   stepKuramotoState,
+  createWavePlateStep,
+  createPolarizerStep,
+  createPolarizationMatrixStep,
   type PhaseField,
   type KuramotoParams,
   type KuramotoState,
   type KuramotoTelemetrySnapshot,
   type IrradianceFrameBuffer,
   type KuramotoInstrumentationSnapshot,
+  type ThinElementSchedule,
+  type PolarizationMatrix,
 } from './kuramotoCore';
 import {
   createGpuRenderer,
@@ -36,6 +41,7 @@ import {
   toGpuOps,
   COMPOSER_FIELD_LIST,
   type RainbowFrameMetrics,
+  type QualiaMetrics,
   type SurfaceRegion,
   type WallpaperGroup,
   type DisplayMode,
@@ -66,6 +72,7 @@ import {
 import { DEFAULT_HOPF_LENSES, resolveHopfLenses } from './pipeline/su7/projector.js';
 import { embedToC7 } from './pipeline/su7/embed.js';
 import { detectFlickerGuardrail } from './pipeline/su7/math.js';
+import { su7UnitaryColumnToPolarizationMatrix } from './pipeline/polarizationBridge.js';
 import {
   computeFluxOverlayState,
   type FluxOverlayFrameData,
@@ -166,6 +173,8 @@ import {
   Timeline,
   TimelinePlayer,
   type TimelineFrameEvaluation,
+  type TimelineInterpolation,
+  type TimelineValue,
   serializeTimeline,
   deriveSeedFromHash,
 } from './timeline/index.js';
@@ -197,6 +206,78 @@ type PresetParams = {
   su7Projector: Su7ProjectorDescriptor;
   su7ScheduleStrength: number;
   su7GateAppends: Gate[];
+};
+
+type TimelineParameterKind = 'number' | 'boolean' | 'enum';
+
+type TimelineParameterOption = {
+  value: string;
+  label: string;
+};
+
+type TimelineParameterConfig = {
+  id: string;
+  label: string;
+  kind: TimelineParameterKind;
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: TimelineParameterOption[];
+  getValue: () => TimelineValue;
+};
+
+type TimelineEditorKeyframe = {
+  frame: number;
+  value: TimelineValue;
+};
+
+type TimelineEditorLane = {
+  id: string;
+  label: string;
+  kind: TimelineParameterKind;
+  interpolation: TimelineInterpolation;
+  keyframes: TimelineEditorKeyframe[];
+};
+
+const sortTimelineKeyframes = (
+  entries: readonly TimelineEditorKeyframe[],
+): TimelineEditorKeyframe[] => [...entries].sort((a, b) => a.frame - b.frame);
+
+const formatTimelineValue = (value: TimelineValue | undefined): string => {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return 'NaN';
+    }
+    const abs = Math.abs(value);
+    const digits = abs >= 100 ? 0 : abs >= 10 ? 1 : abs >= 1 ? 2 : 3;
+    return value.toFixed(digits);
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'True' : 'False';
+  }
+  if (typeof value === 'string') {
+    return value;
+  }
+  return '—';
+};
+
+const coerceTimelineNumber = (value: TimelineValue, fallback = 0): number => {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  const next = Number(value);
+  return Number.isFinite(next) ? next : fallback;
+};
+
+type MacroEvent =
+  | { kind: 'set'; target: string; value: TimelineValue; at: number }
+  | { kind: 'action'; action: 'applyPreset'; presetName: string; at: number };
+
+type MacroScript = {
+  id: string;
+  label: string;
+  createdAt: string;
+  events: MacroEvent[];
 };
 
 type HopfLensControlsProps = {
@@ -474,6 +555,23 @@ const HYPERBOLIC_GUIDE_SPACING_MIN = 0.25;
 const HYPERBOLIC_GUIDE_SPACING_MAX = 2.5;
 const DEFAULT_HYPERBOLIC_GUIDE_SPACING = 0.75;
 
+type PresetEarlyVision = {
+  dogEnabled: boolean;
+  orientationEnabled: boolean;
+  motionEnabled: boolean;
+  opacity: number;
+  dogSigma: number;
+  dogRatio: number;
+  dogGain: number;
+  downsample: number;
+  orientationGain: number;
+  orientationSharpness: number;
+  orientationCount: number;
+  motionGain: number;
+  frameModulo: number;
+  viewMode: 'blend' | 'overlay';
+};
+
 type PresetRuntime = {
   renderBackend: 'gpu' | 'cpu';
   rimEnabled: boolean;
@@ -489,6 +587,7 @@ type PresetRuntime = {
   frameLoggingEnabled: boolean;
   macroBinding: MacroBinding | null;
   macroKnobValue: number;
+  earlyVision: PresetEarlyVision;
 };
 
 type PresetKuramoto = {
@@ -508,6 +607,17 @@ type PresetKuramoto = {
   p_sw: number;
   smallWorldSeed: number;
   smallWorldDegree: number;
+  polarizationEnabled: boolean;
+  wavePlateEnabled: boolean;
+  wavePlatePhaseDeg: number;
+  wavePlateOrientationDeg: number;
+  su7PolarizationEnabled: boolean;
+  su7PolarizationColumn: number;
+  su7PolarizationGain: number;
+  su7PolarizationBlend: number;
+  polarizerEnabled: boolean;
+  polarizerOrientationDeg: number;
+  polarizerExtinction: number;
 };
 
 type PresetQcd = {
@@ -598,6 +708,9 @@ const RECORDING_FALLBACK_PRESET: Record<RecordingPresetId, RecordingPresetId | n
   high: 'balanced',
   extreme: 'high',
 };
+
+const TELEMETRY_STREAM_QUEUE_LIMIT = 256;
+const TELEMETRY_RECORDING_LIMIT = 7200;
 
 type CaptureFormatConfig = {
   id: string;
@@ -944,6 +1057,22 @@ const PRESETS: Preset[] = [
       frameLoggingEnabled: true,
       macroBinding: null,
       macroKnobValue: 0,
+      earlyVision: {
+        dogEnabled: false,
+        orientationEnabled: false,
+        motionEnabled: false,
+        opacity: 0.65,
+        dogSigma: 1.2,
+        dogRatio: 1.6,
+        dogGain: 2.4,
+        downsample: 1,
+        orientationGain: 0.9,
+        orientationSharpness: 2,
+        orientationCount: 4,
+        motionGain: 6,
+        frameModulo: 1,
+        viewMode: 'blend',
+      },
     },
     kuramoto: {
       kurEnabled: false,
@@ -962,6 +1091,307 @@ const PRESETS: Preset[] = [
       p_sw: 0.05,
       smallWorldSeed: 1337,
       smallWorldDegree: 12,
+      polarizationEnabled: false,
+      wavePlateEnabled: true,
+      wavePlatePhaseDeg: 90,
+      wavePlateOrientationDeg: 0,
+      su7PolarizationEnabled: false,
+      su7PolarizationColumn: 0,
+      su7PolarizationGain: 1,
+      su7PolarizationBlend: 1,
+      polarizerEnabled: false,
+      polarizerOrientationDeg: 0,
+      polarizerExtinction: 0,
+    },
+    developer: {
+      selectedSyntheticCase: 'circles',
+    },
+    media: null,
+    coupling: {
+      rimToSurfaceBlend: 0.45,
+      rimToSurfaceAlign: 0.55,
+      surfaceToRimOffset: 0.4,
+      surfaceToRimSigma: 0.6,
+      surfaceToRimHue: 0.5,
+      kurToTransparency: 0.35,
+      kurToOrientation: 0.35,
+      kurToChirality: 0.6,
+      volumePhaseToHue: 0.35,
+      volumeDepthToWarp: 0.3,
+    },
+    composer: createDefaultComposerConfig(),
+    couplingToggles: DEFAULT_COUPLING_TOGGLES,
+    qcd: {
+      beta: 5.25,
+      stepsPerSecond: 3,
+      smearingAlpha: 0.5,
+      smearingIterations: 1,
+      overRelaxationSteps: 1,
+      baseSeed: 2024,
+      depth: 1,
+      temporalExtent: 1,
+      batchLayers: 1,
+      temperatureSchedule: [],
+      snapshot: null,
+    },
+  },
+  {
+    name: 'Polarization SU7 Demo',
+    params: {
+      edgeThreshold: 0.1,
+      blend: 0.42,
+      kernel: createKernelSpec({
+        gain: 2.6,
+        k0: 0.24,
+        Q: 4.2,
+        anisotropy: 0.9,
+        chirality: 1.25,
+        transparency: 0.35,
+      }),
+      dmt: 0.3,
+      arousal: 0.45,
+      thetaMode: 'gradient',
+      thetaGlobal: 0,
+      beta2: 1.5,
+      jitter: 0.9,
+      sigma: 3.6,
+      microsaccade: true,
+      speed: 1.05,
+      contrast: 1.55,
+      phasePin: true,
+      alive: true,
+      rimAlpha: 0.92,
+      su7Enabled: true,
+      su7Gain: 1.2,
+      su7Preset: 'identity',
+      su7Seed: 11,
+      su7Schedule: [],
+      su7Projector: { id: 'hopfLens', weight: 0.65 },
+      su7ScheduleStrength: 1,
+      su7GateAppends: [],
+    },
+    surface: {
+      surfEnabled: true,
+      surfaceBlend: 0.4,
+      warpAmp: 0.95,
+      nOrient: 5,
+      wallGroup: 'p4m',
+      surfaceRegion: 'both',
+    },
+    display: {
+      displayMode: 'colorBaseBlendedRims',
+      polBins: 24,
+      normPin: true,
+      curvatureStrength: 0.2,
+      curvatureMode: 'poincare',
+      hyperbolicGuideSpacing: DEFAULT_HYPERBOLIC_GUIDE_SPACING,
+    },
+    tracer: cloneTracerConfig(DEFAULT_TRACER_CONFIG),
+    runtime: {
+      renderBackend: 'gpu',
+      rimEnabled: true,
+      showRimDebug: false,
+      showHyperbolicGrid: false,
+      showHyperbolicGuide: false,
+      showSurfaceDebug: false,
+      showPhaseDebug: false,
+      phaseHeatmapEnabled: false,
+      volumeEnabled: false,
+      telemetryEnabled: false,
+      telemetryOverlayEnabled: false,
+      frameLoggingEnabled: false,
+      macroBinding: null,
+      macroKnobValue: 0,
+      earlyVision: {
+        dogEnabled: false,
+        orientationEnabled: false,
+        motionEnabled: false,
+        opacity: 0.65,
+        dogSigma: 1.2,
+        dogRatio: 1.6,
+        dogGain: 2.4,
+        downsample: 1,
+        orientationGain: 0.9,
+        orientationSharpness: 2,
+        orientationCount: 4,
+        motionGain: 6,
+        frameModulo: 1,
+        viewMode: 'blend',
+      },
+    },
+    kuramoto: {
+      kurEnabled: true,
+      kurSync: true,
+      kurRegime: 'custom',
+      K0: 0.72,
+      alphaKur: 0.24,
+      gammaKur: 0.18,
+      omega0: 0.08,
+      epsKur: 0.0018,
+      fluxX: Math.PI / 3,
+      fluxY: Math.PI / 6,
+      qInit: 1,
+      smallWorldEnabled: false,
+      smallWorldWeight: 0.45,
+      p_sw: 0,
+      smallWorldSeed: 2048,
+      smallWorldDegree: 10,
+      polarizationEnabled: true,
+      wavePlateEnabled: true,
+      wavePlatePhaseDeg: 90,
+      wavePlateOrientationDeg: 45,
+      su7PolarizationEnabled: true,
+      su7PolarizationColumn: 2,
+      su7PolarizationGain: 1.1,
+      su7PolarizationBlend: 0.85,
+      polarizerEnabled: true,
+      polarizerOrientationDeg: 20,
+      polarizerExtinction: 0.08,
+    },
+    developer: {
+      selectedSyntheticCase: 'waves',
+    },
+    media: null,
+    coupling: {
+      rimToSurfaceBlend: 0.42,
+      rimToSurfaceAlign: 0.5,
+      surfaceToRimOffset: 0.35,
+      surfaceToRimSigma: 0.55,
+      surfaceToRimHue: 0.48,
+      kurToTransparency: 0.4,
+      kurToOrientation: 0.45,
+      kurToChirality: 0.55,
+      volumePhaseToHue: 0.4,
+      volumeDepthToWarp: 0.33,
+    },
+    composer: createDefaultComposerConfig(),
+    couplingToggles: DEFAULT_COUPLING_TOGGLES,
+    qcd: {
+      beta: 5.25,
+      stepsPerSecond: 3,
+      smearingAlpha: 0.5,
+      smearingIterations: 1,
+      overRelaxationSteps: 1,
+      baseSeed: 2024,
+      depth: 1,
+      temporalExtent: 1,
+      batchLayers: 1,
+      temperatureSchedule: [],
+      snapshot: null,
+    },
+  },
+  {
+    name: 'Early Vision Circles Diagnostic',
+    params: {
+      edgeThreshold: 0.08,
+      blend: 0.39,
+      kernel: createKernelSpec({
+        gain: 3.0,
+        k0: 0.2,
+        Q: 4.6,
+        anisotropy: 0.95,
+        chirality: 1.46,
+        transparency: 0.28,
+      }),
+      dmt: 0.2,
+      arousal: 0.35,
+      thetaMode: 'gradient',
+      thetaGlobal: 0,
+      beta2: 1.9,
+      jitter: 1.16,
+      sigma: 4.0,
+      microsaccade: true,
+      speed: 1.32,
+      contrast: 1.62,
+      phasePin: true,
+      alive: false,
+      rimAlpha: 1.0,
+      su7Enabled: false,
+      su7Gain: 1,
+      su7Preset: 'identity',
+      su7Seed: 0,
+      su7Schedule: [],
+      su7Projector: { id: 'identity' },
+      su7ScheduleStrength: 1,
+      su7GateAppends: [],
+    },
+    surface: {
+      surfEnabled: false,
+      surfaceBlend: 0.35,
+      warpAmp: 1.0,
+      nOrient: 4,
+      wallGroup: 'p4',
+      surfaceRegion: 'both',
+    },
+    display: {
+      displayMode: 'color',
+      polBins: 16,
+      normPin: true,
+      curvatureStrength: 0,
+      curvatureMode: 'poincare',
+      hyperbolicGuideSpacing: DEFAULT_HYPERBOLIC_GUIDE_SPACING,
+    },
+    tracer: cloneTracerConfig(DEFAULT_TRACER_CONFIG),
+    runtime: {
+      renderBackend: 'gpu',
+      rimEnabled: true,
+      showRimDebug: false,
+      showHyperbolicGrid: false,
+      showHyperbolicGuide: false,
+      showSurfaceDebug: false,
+      showPhaseDebug: false,
+      phaseHeatmapEnabled: false,
+      volumeEnabled: false,
+      telemetryEnabled: false,
+      telemetryOverlayEnabled: false,
+      frameLoggingEnabled: true,
+      macroBinding: null,
+      macroKnobValue: 0,
+      earlyVision: {
+        dogEnabled: true,
+        orientationEnabled: true,
+        motionEnabled: true,
+        opacity: 0.7,
+        dogSigma: 1.6,
+        dogRatio: 1.6,
+        dogGain: 3.0,
+        downsample: 2,
+        orientationGain: 1.2,
+        orientationSharpness: 2.5,
+        orientationCount: 6,
+        motionGain: 7.5,
+        frameModulo: 2,
+        viewMode: 'blend',
+      },
+    },
+    kuramoto: {
+      kurEnabled: false,
+      kurSync: false,
+      kurRegime: 'locked',
+      K0: 0.6,
+      alphaKur: 0.2,
+      gammaKur: 0.15,
+      omega0: 0,
+      epsKur: 0.002,
+      fluxX: 0,
+      fluxY: 0,
+      qInit: 1,
+      smallWorldEnabled: false,
+      smallWorldWeight: 0.75,
+      p_sw: 0.05,
+      smallWorldSeed: 1337,
+      smallWorldDegree: 12,
+      polarizationEnabled: false,
+      wavePlateEnabled: true,
+      wavePlatePhaseDeg: 90,
+      wavePlateOrientationDeg: 0,
+      su7PolarizationEnabled: false,
+      su7PolarizationColumn: 0,
+      su7PolarizationGain: 1,
+      su7PolarizationBlend: 1,
+      polarizerEnabled: false,
+      polarizerOrientationDeg: 0,
+      polarizerExtinction: 0,
     },
     developer: {
       selectedSyntheticCase: 'circles',
@@ -1395,6 +1825,8 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
   const fallbackSurface = fallback.surface;
   const fallbackDisplay = fallback.display;
   const fallbackRuntime = fallback.runtime;
+  const earlyVisionSource = (runtimeSource.earlyVision as Record<string, unknown>) ?? {};
+  const fallbackEarlyVision = fallbackRuntime.earlyVision;
   const fallbackKuramoto = fallback.kuramoto;
   const fallbackDeveloper = fallback.developer;
   const fallbackQcd = fallback.qcd;
@@ -1558,6 +1990,46 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
         runtimeSource.macroKnobValue,
         typeof fallbackRuntime.macroKnobValue === 'number' ? fallbackRuntime.macroKnobValue : 0,
       ),
+      earlyVision: {
+        dogEnabled: sanitizeBoolean(earlyVisionSource.dogEnabled, fallbackEarlyVision.dogEnabled),
+        orientationEnabled: sanitizeBoolean(
+          earlyVisionSource.orientationEnabled,
+          fallbackEarlyVision.orientationEnabled,
+        ),
+        motionEnabled: sanitizeBoolean(
+          earlyVisionSource.motionEnabled,
+          fallbackEarlyVision.motionEnabled,
+        ),
+        opacity: sanitizeNumber(earlyVisionSource.opacity, fallbackEarlyVision.opacity),
+        dogSigma: sanitizeNumber(earlyVisionSource.dogSigma, fallbackEarlyVision.dogSigma),
+        dogRatio: sanitizeNumber(earlyVisionSource.dogRatio, fallbackEarlyVision.dogRatio),
+        dogGain: sanitizeNumber(earlyVisionSource.dogGain, fallbackEarlyVision.dogGain),
+        downsample: sanitizeNumber(earlyVisionSource.downsample, fallbackEarlyVision.downsample),
+        orientationGain: sanitizeNumber(
+          earlyVisionSource.orientationGain,
+          fallbackEarlyVision.orientationGain,
+        ),
+        orientationSharpness: sanitizeNumber(
+          earlyVisionSource.orientationSharpness,
+          fallbackEarlyVision.orientationSharpness,
+        ),
+        orientationCount: clampInt(
+          sanitizeNumber(earlyVisionSource.orientationCount, fallbackEarlyVision.orientationCount),
+          1,
+          8,
+        ),
+        motionGain: sanitizeNumber(earlyVisionSource.motionGain, fallbackEarlyVision.motionGain),
+        frameModulo: clampInt(
+          sanitizeNumber(earlyVisionSource.frameModulo, fallbackEarlyVision.frameModulo),
+          1,
+          16,
+        ),
+        viewMode: sanitizeEnum(
+          earlyVisionSource.viewMode,
+          ['blend', 'overlay'],
+          fallbackEarlyVision.viewMode,
+        ),
+      },
     },
     kuramoto: {
       kurEnabled: sanitizeBoolean(kuramotoSource.kurEnabled, fallbackKuramoto.kurEnabled),
@@ -1593,6 +2065,62 @@ const sanitizePresetPayload = (raw: unknown, fallback: Preset): Preset | null =>
         sanitizeNumber(kuramotoSource.smallWorldDegree, fallbackKuramoto.smallWorldDegree),
         0,
         64,
+      ),
+      polarizationEnabled: sanitizeBoolean(
+        kuramotoSource.polarizationEnabled,
+        fallbackKuramoto.polarizationEnabled ?? false,
+      ),
+      wavePlateEnabled: sanitizeBoolean(
+        kuramotoSource.wavePlateEnabled,
+        fallbackKuramoto.wavePlateEnabled ?? true,
+      ),
+      wavePlatePhaseDeg: sanitizeNumber(
+        kuramotoSource.wavePlatePhaseDeg,
+        fallbackKuramoto.wavePlatePhaseDeg ?? 90,
+      ),
+      wavePlateOrientationDeg: sanitizeNumber(
+        kuramotoSource.wavePlateOrientationDeg,
+        fallbackKuramoto.wavePlateOrientationDeg ?? 0,
+      ),
+      su7PolarizationEnabled: sanitizeBoolean(
+        kuramotoSource.su7PolarizationEnabled,
+        fallbackKuramoto.su7PolarizationEnabled ?? false,
+      ),
+      su7PolarizationColumn: clampInt(
+        sanitizeNumber(
+          kuramotoSource.su7PolarizationColumn,
+          fallbackKuramoto.su7PolarizationColumn ?? 0,
+        ),
+        0,
+        6,
+      ),
+      su7PolarizationGain: sanitizeNumber(
+        kuramotoSource.su7PolarizationGain,
+        fallbackKuramoto.su7PolarizationGain ?? 1,
+      ),
+      su7PolarizationBlend: clamp(
+        sanitizeNumber(
+          kuramotoSource.su7PolarizationBlend,
+          fallbackKuramoto.su7PolarizationBlend ?? 1,
+        ),
+        0,
+        1,
+      ),
+      polarizerEnabled: sanitizeBoolean(
+        kuramotoSource.polarizerEnabled,
+        fallbackKuramoto.polarizerEnabled ?? false,
+      ),
+      polarizerOrientationDeg: sanitizeNumber(
+        kuramotoSource.polarizerOrientationDeg,
+        fallbackKuramoto.polarizerOrientationDeg ?? 0,
+      ),
+      polarizerExtinction: clamp(
+        sanitizeNumber(
+          kuramotoSource.polarizerExtinction,
+          fallbackKuramoto.polarizerExtinction ?? 0,
+        ),
+        0,
+        1,
       ),
     },
     developer: {
@@ -1817,6 +2345,20 @@ type FrameMetricsEntry = {
   kernelVersion: number;
 };
 
+type TelemetryExportEntry = {
+  timestamp: number;
+  backend: FrameMetricsEntry['backend'];
+  kernelVersion: number;
+  qualia: QualiaMetrics;
+  motion: RainbowFrameMetrics['motionEnergy'];
+  parallax: RainbowFrameMetrics['parallax'];
+  texture: {
+    wallpapericity: number;
+    beatEnergy: number;
+    sampleCount: number;
+  };
+};
+
 const printRgb = (values: [number, number, number]) =>
   `(${values.map((value) => Math.round(value)).join(', ')})`;
 
@@ -1969,11 +2511,147 @@ export default function App() {
   const basePixelsRef = useRef<ImageData | null>(null);
   const surfaceFieldRef = useRef<SurfaceField | null>(null);
   const rimFieldRef = useRef<RimField | null>(null);
+  const earlyVisionFrameRef = useRef(0);
+  const earlyVisionForceUpdateRef = useRef(false);
   const timelinePlayerRef = useRef<TimelinePlayer | null>(null);
   const timelineEvaluationRef = useRef<TimelineFrameEvaluation | null>(null);
   const timelineHashRef = useRef<string>(FALLBACK_TIMELINE_HASH);
   const timelineActiveRef = useRef(false);
   const timelineLastFrameRef = useRef<number | null>(null);
+  const timelineClockRef = useRef(0);
+  const [timelineCurrentTime, setTimelineCurrentTime] = useState(0);
+  const [timelinePlaying, setTimelinePlaying] = useState(false);
+  const [timelineLoop, setTimelineLoop] = useState(true);
+  const [timelineFps, setTimelineFps] = useState(60);
+  const [timelineDurationSeconds, setTimelineDurationSeconds] = useState(10);
+  const [timelineAutoKeyframe, setTimelineAutoKeyframe] = useState(true);
+  const [timelineLanes, setTimelineLanes] = useState<TimelineEditorLane[]>([]);
+  const [timelineEvaluationState, setTimelineEvaluationState] =
+    useState<TimelineFrameEvaluation | null>(null);
+  const [timelineActive, setTimelineActive] = useState(false);
+  const durationFrames = useMemo(
+    () => Math.max(1, Math.round(timelineDurationSeconds * timelineFps)),
+    [timelineDurationSeconds, timelineFps],
+  );
+
+  const [macroRecording, setMacroRecording] = useState(false);
+  const macroRecordingRef = useRef(false);
+  const macroStartTimeRef = useRef(0);
+  const [macroEvents, setMacroEvents] = useState<MacroEvent[]>([]);
+  const macroEventsRef = useRef<MacroEvent[]>([]);
+  const [macroLibrary, setMacroLibrary] = useState<MacroScript[]>([]);
+  const macroPlaybackRef = useRef<{ timers: number[] } | null>(null);
+  const [macroPlaybackId, setMacroPlaybackId] = useState<string | null>(null);
+  const macroIdCounterRef = useRef(1);
+
+  const recordMacroEvent = useCallback(
+    (entry: Omit<MacroEvent, 'at'>) => {
+      if (!macroRecordingRef.current) {
+        return;
+      }
+      const now =
+        typeof performance !== 'undefined' && typeof performance.now === 'function'
+          ? performance.now()
+          : Date.now();
+      const at = Math.max(0, now - macroStartTimeRef.current);
+      const event: MacroEvent = { ...entry, at };
+      macroEventsRef.current = [...macroEventsRef.current, event];
+      setMacroEvents((prev) => [...prev, event]);
+    },
+    [setMacroEvents],
+  );
+
+  const recordMacroParameterChange = useCallback(
+    (target: string, value: TimelineValue) => {
+      recordMacroEvent({ kind: 'set', target, value });
+    },
+    [recordMacroEvent],
+  );
+
+  const recordMacroPresetAction = useCallback(
+    (presetName: string) => {
+      recordMacroEvent({ kind: 'action', action: 'applyPreset', presetName });
+    },
+    [recordMacroEvent],
+  );
+
+  const cancelMacroPlayback = useCallback(() => {
+    const playback = macroPlaybackRef.current;
+    if (playback) {
+      playback.timers.forEach((timerId) => globalThis.clearTimeout(timerId));
+      macroPlaybackRef.current = null;
+    }
+    setMacroPlaybackId(null);
+  }, []);
+
+  const startMacroRecording = useCallback(() => {
+    if (macroRecordingRef.current) {
+      return;
+    }
+    cancelMacroPlayback();
+    macroRecordingRef.current = true;
+    setMacroRecording(true);
+    macroEventsRef.current = [];
+    setMacroEvents([]);
+    macroStartTimeRef.current =
+      typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now();
+  }, [cancelMacroPlayback]);
+
+  const stopMacroRecording = useCallback(
+    (label?: string) => {
+      if (!macroRecordingRef.current) {
+        return;
+      }
+      macroRecordingRef.current = false;
+      setMacroRecording(false);
+      const recorded = macroEventsRef.current;
+      if (recorded.length > 0) {
+        const macroIndex = macroIdCounterRef.current++;
+        const script: MacroScript = {
+          id: `macro-${macroIndex}`,
+          label: label ?? `Macro ${macroIndex}`,
+          createdAt: new Date().toISOString(),
+          events: recorded.map((event) => ({ ...event })),
+        };
+        setMacroLibrary((prev) => [...prev, script]);
+      }
+      macroEventsRef.current = [];
+      setMacroEvents([]);
+    },
+    [setMacroLibrary],
+  );
+
+  const cancelMacroRecording = useCallback(() => {
+    if (!macroRecordingRef.current) {
+      return;
+    }
+    macroRecordingRef.current = false;
+    setMacroRecording(false);
+    macroEventsRef.current = [];
+    setMacroEvents([]);
+  }, []);
+
+  useEffect(() => {
+    if (macroLibrary.length === 0 && PRESETS.length > 0) {
+      const demoEvents: MacroEvent[] = PRESETS.slice(0, Math.min(3, PRESETS.length)).map(
+        (preset, index) => ({
+          kind: 'action',
+          action: 'applyPreset',
+          presetName: preset.name,
+          at: index * 2000,
+        }),
+      );
+      const demoMacro: MacroScript = {
+        id: 'macro-demo-cycle-presets',
+        label: 'Cycle Presets Demo',
+        createdAt: new Date().toISOString(),
+        events: demoEvents,
+      };
+      setMacroLibrary([demoMacro]);
+    }
+  }, [macroLibrary.length]);
 
   const getTimelineNumber = (id: string, fallback: number): number => {
     const evaluation = timelineEvaluationRef.current;
@@ -2006,18 +2684,44 @@ export default function App() {
     (timeSeconds: number): TimelineFrameEvaluation | null => {
       const player = timelinePlayerRef.current;
       if (!player || !timelineActiveRef.current) {
-        timelineEvaluationRef.current = null;
-        timelineLastFrameRef.current = null;
+        if (timelineEvaluationRef.current || timelineLastFrameRef.current !== null) {
+          timelineEvaluationRef.current = null;
+          timelineLastFrameRef.current = null;
+          setTimelineEvaluationState(null);
+        }
         return null;
       }
       const evaluation = player.evaluateAtTimeSeconds(timeSeconds);
-      if (timelineLastFrameRef.current !== evaluation.frameIndex) {
-        timelineEvaluationRef.current = evaluation;
-        timelineLastFrameRef.current = evaluation.frameIndex;
+      const previous = timelineEvaluationRef.current;
+      let changed = false;
+      if (!previous) {
+        changed = true;
+      } else if (previous.frameIndex !== evaluation.frameIndex) {
+        changed = true;
+      } else {
+        const prevValues = previous.values;
+        const nextValues = evaluation.values;
+        const prevKeys = Object.keys(prevValues);
+        const nextKeys = Object.keys(nextValues);
+        if (prevKeys.length !== nextKeys.length) {
+          changed = true;
+        } else {
+          for (const key of nextKeys) {
+            if (nextValues[key] !== prevValues[key]) {
+              changed = true;
+              break;
+            }
+          }
+        }
+      }
+      timelineEvaluationRef.current = evaluation;
+      timelineLastFrameRef.current = evaluation.frameIndex;
+      if (changed) {
+        setTimelineEvaluationState(evaluation);
       }
       return timelineEvaluationRef.current;
     },
-    [],
+    [setTimelineEvaluationState],
   );
 
   const getTimelineSeed = useCallback((scope: string, timeSeconds: number): number => {
@@ -2032,18 +2736,25 @@ export default function App() {
     return deriveSeedFromHash(timelineHashRef.current, scope, frame);
   }, []);
 
-  const loadTimeline = useCallback((timeline: Timeline) => {
-    const player = new TimelinePlayer(timeline);
-    timelinePlayerRef.current = player;
-    timelineHashRef.current = player.hash;
-    timelineActiveRef.current = true;
-    timelineEvaluationRef.current = player.evaluateAtFrame(0);
-    timelineLastFrameRef.current = null;
-    console.info(
-      `[timeline] loaded hash=${player.hash} fps=${player.fps} frames=${player.durationFrames}`,
-    );
-    return { hash: player.hash, fps: player.fps, durationFrames: player.durationFrames };
-  }, []);
+  const loadTimeline = useCallback(
+    (timeline: Timeline) => {
+      const player = new TimelinePlayer(timeline);
+      timelinePlayerRef.current = player;
+      timelineHashRef.current = player.hash;
+      timelineActiveRef.current = true;
+      const currentFrame = player.getFrameForTime(timelineClockRef.current);
+      const evaluation = player.evaluateAtFrame(currentFrame);
+      timelineEvaluationRef.current = evaluation;
+      timelineLastFrameRef.current = evaluation.frameIndex;
+      setTimelineEvaluationState(evaluation);
+      setTimelineActive(true);
+      console.info(
+        `[timeline] loaded hash=${player.hash} fps=${player.fps} frames=${player.durationFrames}`,
+      );
+      return { hash: player.hash, fps: player.fps, durationFrames: player.durationFrames };
+    },
+    [setTimelineActive, setTimelineEvaluationState],
+  );
 
   const clearTimeline = useCallback(() => {
     timelinePlayerRef.current = null;
@@ -2051,8 +2762,11 @@ export default function App() {
     timelineEvaluationRef.current = null;
     timelineLastFrameRef.current = null;
     timelineHashRef.current = FALLBACK_TIMELINE_HASH;
+    setTimelineActive(false);
+    setTimelineEvaluationState(null);
+    setTimelinePlaying(false);
     console.info('[timeline] cleared');
-  }, []);
+  }, [setTimelineActive, setTimelineEvaluationState, setTimelinePlaying]);
 
   const exportTimeline = useCallback(() => {
     const player = timelinePlayerRef.current;
@@ -2083,6 +2797,64 @@ export default function App() {
   const [hyperbolicGuideSpacing, setHyperbolicGuideSpacing] = useState(
     DEFAULT_HYPERBOLIC_GUIDE_SPACING,
   );
+  const [earlyVisionDogEnabled, setEarlyVisionDogEnabled] = useState(false);
+  const [earlyVisionOrientationEnabled, setEarlyVisionOrientationEnabled] = useState(false);
+  const [earlyVisionMotionEnabled, setEarlyVisionMotionEnabled] = useState(false);
+  const [earlyVisionOpacity, setEarlyVisionOpacity] = useState(0.65);
+  const [earlyVisionDoGSigma, setEarlyVisionDoGSigma] = useState(1.2);
+  const [earlyVisionDoGRatio, setEarlyVisionDoGRatio] = useState(1.6);
+  const [earlyVisionDoGGain, setEarlyVisionDoGGain] = useState(2.4);
+  const [earlyVisionDownsample, setEarlyVisionDownsample] = useState(1);
+  const [earlyVisionOrientationGain, setEarlyVisionOrientationGain] = useState(0.9);
+  const [earlyVisionOrientationSharpness, setEarlyVisionOrientationSharpness] = useState(2);
+  const [earlyVisionOrientationCount, setEarlyVisionOrientationCount] = useState(4);
+  const [earlyVisionMotionGain, setEarlyVisionMotionGain] = useState(6);
+  const [earlyVisionFrameModulo, setEarlyVisionFrameModulo] = useState(1);
+  const [earlyVisionViewMode, setEarlyVisionViewMode] = useState<'blend' | 'overlay'>('blend');
+  const earlyVisionOrientationAngles = useMemo(() => {
+    const count = Math.min(8, Math.max(1, earlyVisionOrientationCount));
+    const result = new Float32Array(count);
+    for (let index = 0; index < count; index += 1) {
+      result[index] = (Math.PI * index) / count;
+    }
+    return result;
+  }, [earlyVisionOrientationCount]);
+  const earlyVisionOrientationCos = useMemo(() => {
+    const result = new Float32Array(earlyVisionOrientationAngles.length);
+    earlyVisionOrientationAngles.forEach((angle, index) => {
+      result[index] = Math.cos(angle);
+    });
+    return result;
+  }, [earlyVisionOrientationAngles]);
+  const earlyVisionOrientationSin = useMemo(() => {
+    const result = new Float32Array(earlyVisionOrientationAngles.length);
+    earlyVisionOrientationAngles.forEach((angle, index) => {
+      result[index] = Math.sin(angle);
+    });
+    return result;
+  }, [earlyVisionOrientationAngles]);
+  useEffect(() => {
+    earlyVisionForceUpdateRef.current = true;
+  }, [
+    earlyVisionDogEnabled,
+    earlyVisionOrientationEnabled,
+    earlyVisionMotionEnabled,
+    earlyVisionOpacity,
+    earlyVisionDoGSigma,
+    earlyVisionDoGRatio,
+    earlyVisionDoGGain,
+    earlyVisionDownsample,
+    earlyVisionOrientationGain,
+    earlyVisionOrientationSharpness,
+    earlyVisionOrientationCount,
+    earlyVisionMotionGain,
+    earlyVisionFrameModulo,
+    earlyVisionViewMode,
+  ]);
+  useEffect(() => {
+    earlyVisionForceUpdateRef.current = true;
+    earlyVisionFrameRef.current = 0;
+  }, [width, height]);
 
   const [beta2, setBeta2] = useState(1.1);
   const [jitter, setJitter] = useState(0.5);
@@ -2217,10 +2989,12 @@ export default function App() {
   useEffect(() => {
     applyMacroGateValue(macroKnobValue, macroBinding);
   }, [applyMacroGateValue, macroBinding, macroKnobValue]);
-  const su7DisplayGateList = useMemo(
-    () => resolveSu7Runtime(su7Params, undefined, { emitGuardrailEvents: false }).gateList,
+  const su7RuntimeEval = useMemo(
+    () => resolveSu7Runtime(su7Params, undefined, { emitGuardrailEvents: false }),
     [su7Params],
   );
+  const su7DisplayGateList = su7RuntimeEval.gateList;
+  const su7Unitary = su7RuntimeEval.unitary;
   const su7SquashedGateCount = su7DisplayGateList?.squashedAppends ?? 0;
   const handleSu7EnabledChange = useCallback(
     (value: boolean) => {
@@ -2945,6 +3719,877 @@ export default function App() {
   const [warpAmp, setWarpAmp] = useState(1.0);
   const [surfaceRegion, setSurfaceRegion] = useState<SurfaceRegion>('surfaces');
 
+  const timelineParameterConfigs = useMemo<TimelineParameterConfig[]>(
+    () => [
+      {
+        id: 'edgeThreshold',
+        label: 'Edge threshold',
+        kind: 'number',
+        min: 0,
+        max: 1,
+        step: 0.01,
+        getValue: () => edgeThreshold,
+      },
+      {
+        id: 'blend',
+        label: 'Kernel blend',
+        kind: 'number',
+        min: 0,
+        max: 1,
+        step: 0.01,
+        getValue: () => blend,
+      },
+      {
+        id: 'beta2',
+        label: 'Dispersion β₂',
+        kind: 'number',
+        min: 0,
+        max: 3,
+        step: 0.01,
+        getValue: () => beta2,
+      },
+      {
+        id: 'sigma',
+        label: 'Rim thickness σ',
+        kind: 'number',
+        min: 0.3,
+        max: 6,
+        step: 0.05,
+        getValue: () => sigma,
+      },
+      {
+        id: 'jitter',
+        label: 'Phase jitter',
+        kind: 'number',
+        min: 0,
+        max: 2,
+        step: 0.02,
+        getValue: () => jitter,
+      },
+      {
+        id: 'contrast',
+        label: 'Contrast',
+        kind: 'number',
+        min: 0.25,
+        max: 3,
+        step: 0.05,
+        getValue: () => contrast,
+      },
+      {
+        id: 'rimAlpha',
+        label: 'Rim alpha',
+        kind: 'number',
+        min: 0,
+        max: 1,
+        step: 0.01,
+        getValue: () => rimAlpha,
+      },
+      {
+        id: 'rimEnabled',
+        label: 'Rim enabled',
+        kind: 'boolean',
+        getValue: () => rimEnabled,
+      },
+      {
+        id: 'microsaccade',
+        label: 'Microsaccade',
+        kind: 'boolean',
+        getValue: () => microsaccade,
+      },
+      {
+        id: 'normPin',
+        label: 'Normalization pin',
+        kind: 'boolean',
+        getValue: () => normPin,
+      },
+      {
+        id: 'phasePin',
+        label: 'Phase pin',
+        kind: 'boolean',
+        getValue: () => phasePin,
+      },
+      {
+        id: 'alive',
+        label: 'Alive',
+        kind: 'boolean',
+        getValue: () => alive,
+      },
+      {
+        id: 'dmt',
+        label: 'DMT gain',
+        kind: 'number',
+        min: 0,
+        max: 1,
+        step: 0.01,
+        getValue: () => dmt,
+      },
+      {
+        id: 'arousal',
+        label: 'Arousal',
+        kind: 'number',
+        min: 0,
+        max: 1,
+        step: 0.01,
+        getValue: () => arousal,
+      },
+      {
+        id: 'surfaceBlend',
+        label: 'Surface blend',
+        kind: 'number',
+        min: 0,
+        max: 1,
+        step: 0.02,
+        getValue: () => surfaceBlend,
+      },
+      {
+        id: 'warpAmp',
+        label: 'Warp amplitude',
+        kind: 'number',
+        min: 0,
+        max: 6,
+        step: 0.1,
+        getValue: () => warpAmp,
+      },
+      {
+        id: 'thetaMode',
+        label: 'Theta mode',
+        kind: 'enum',
+        options: [
+          { value: 'gradient', label: 'Gradient' },
+          { value: 'global', label: 'Global' },
+        ],
+        getValue: () => thetaMode,
+      },
+      {
+        id: 'thetaGlobal',
+        label: 'Theta (global)',
+        kind: 'number',
+        min: -Math.PI,
+        max: Math.PI,
+        step: 0.05,
+        getValue: () => thetaGlobal,
+      },
+    ],
+    [
+      edgeThreshold,
+      blend,
+      beta2,
+      sigma,
+      jitter,
+      contrast,
+      rimAlpha,
+      rimEnabled,
+      microsaccade,
+      normPin,
+      phasePin,
+      alive,
+      dmt,
+      arousal,
+      surfaceBlend,
+      warpAmp,
+      thetaMode,
+      thetaGlobal,
+    ],
+  );
+
+  const availableTimelineParameters = useMemo(
+    () =>
+      timelineParameterConfigs.filter(
+        (config) => !timelineLanes.some((lane) => lane.id === config.id),
+      ),
+    [timelineParameterConfigs, timelineLanes],
+  );
+
+  const timelineMaxSeconds = durationFrames / timelineFps;
+
+  const clampFrameIndex = useCallback(
+    (frame: number) => Math.max(0, Math.min(durationFrames, frame)),
+    [durationFrames],
+  );
+
+  const upsertTimelineKeyframe = useCallback(
+    (
+      parameterId: string,
+      config: TimelineParameterConfig,
+      frame: number,
+      nextValue: TimelineValue,
+      previousValue: TimelineValue,
+    ) => {
+      setTimelineLanes((lanes) => {
+        const laneIndex = lanes.findIndex((lane) => lane.id === parameterId);
+        const clampedFrame = clampFrameIndex(frame);
+        if (laneIndex === -1) {
+          const baselineValue = clampedFrame > 0 ? (previousValue ?? nextValue) : nextValue;
+          const keyframes =
+            clampedFrame > 0
+              ? sortTimelineKeyframes([
+                  { frame: 0, value: baselineValue },
+                  { frame: clampedFrame, value: nextValue },
+                ])
+              : sortTimelineKeyframes([{ frame: 0, value: nextValue }]);
+          const interpolation =
+            config.kind === 'boolean' || config.kind === 'enum' ? 'step' : 'linear';
+          return [
+            ...lanes,
+            {
+              id: parameterId,
+              label: config.label,
+              kind: config.kind,
+              interpolation,
+              keyframes,
+            },
+          ];
+        }
+        const lane = lanes[laneIndex]!;
+        const keyframes = lane.keyframes.slice();
+        const existingIndex = keyframes.findIndex((entry) => entry.frame === clampedFrame);
+        if (existingIndex >= 0) {
+          if (keyframes[existingIndex].value === nextValue) {
+            return lanes;
+          }
+          keyframes[existingIndex] = { frame: clampedFrame, value: nextValue };
+        } else {
+          keyframes.push({ frame: clampedFrame, value: nextValue });
+        }
+        if (clampedFrame !== 0 && keyframes.every((entry) => entry.frame !== 0)) {
+          keyframes.push({ frame: 0, value: previousValue ?? nextValue });
+        }
+        const sorted = sortTimelineKeyframes(keyframes);
+        const unchanged =
+          sorted.length === lane.keyframes.length &&
+          sorted.every(
+            (entry, idx) =>
+              entry.frame === lane.keyframes[idx]?.frame &&
+              entry.value === lane.keyframes[idx]?.value,
+          );
+        if (unchanged) {
+          return lanes;
+        }
+        const nextLane: TimelineEditorLane = {
+          ...lane,
+          keyframes: sorted,
+        };
+        const nextLanes = lanes.slice();
+        nextLanes[laneIndex] = nextLane;
+        return nextLanes;
+      });
+    },
+    [clampFrameIndex, setTimelineLanes],
+  );
+
+  const maybeRecordTimelineKeyframe = useCallback(
+    (parameterId: string, nextValue: TimelineValue, previousValue: TimelineValue) => {
+      if (!timelineAutoKeyframe || timelinePlaying) {
+        return;
+      }
+      const config = timelineParameterConfigs.find((entry) => entry.id === parameterId);
+      if (!config) {
+        return;
+      }
+      const clampedTime = Math.max(0, Math.min(timelineMaxSeconds, timelineClockRef.current));
+      const frame = clampFrameIndex(Math.round(clampedTime * timelineFps));
+      upsertTimelineKeyframe(parameterId, config, frame, nextValue, previousValue);
+    },
+    [
+      timelineAutoKeyframe,
+      timelinePlaying,
+      timelineParameterConfigs,
+      timelineMaxSeconds,
+      clampFrameIndex,
+      timelineFps,
+      upsertTimelineKeyframe,
+    ],
+  );
+
+  const handleAddTimelineLane = useCallback(
+    (parameterId: string) => {
+      const config = timelineParameterConfigs.find((entry) => entry.id === parameterId);
+      if (!config) {
+        return;
+      }
+      setTimelineLanes((lanes) => {
+        if (lanes.some((lane) => lane.id === parameterId)) {
+          return lanes;
+        }
+        const currentTime = Math.max(0, Math.min(timelineMaxSeconds, timelineClockRef.current));
+        const frame = clampFrameIndex(Math.round(currentTime * timelineFps));
+        const baseline = config.getValue();
+        const currentValue = timelineEvaluationRef.current?.values[parameterId] ?? baseline;
+        const keyframes =
+          frame > 0
+            ? sortTimelineKeyframes([
+                { frame: 0, value: baseline },
+                { frame, value: currentValue },
+              ])
+            : sortTimelineKeyframes([{ frame, value: currentValue }]);
+        const interpolation =
+          config.kind === 'boolean' || config.kind === 'enum' ? 'step' : 'linear';
+        return [
+          ...lanes,
+          {
+            id: parameterId,
+            label: config.label,
+            kind: config.kind,
+            interpolation,
+            keyframes,
+          },
+        ];
+      });
+    },
+    [timelineParameterConfigs, timelineMaxSeconds, clampFrameIndex, timelineFps, setTimelineLanes],
+  );
+
+  const handleRemoveTimelineLane = useCallback(
+    (laneId: string) => {
+      setTimelineLanes((lanes) => lanes.filter((lane) => lane.id !== laneId));
+    },
+    [setTimelineLanes],
+  );
+
+  const handleAddTimelineKeyframe = useCallback(
+    (laneId: string) => {
+      const config = timelineParameterConfigs.find((entry) => entry.id === laneId);
+      if (!config) {
+        return;
+      }
+      const lane = timelineLanes.find((entry) => entry.id === laneId);
+      const baseline =
+        lane?.keyframes.find((entry) => entry.frame === 0)?.value ?? config.getValue();
+      const currentTime = Math.max(0, Math.min(timelineMaxSeconds, timelineClockRef.current));
+      const frame = clampFrameIndex(Math.round(currentTime * timelineFps));
+      const currentValue = timelineEvaluationRef.current?.values[laneId] ?? config.getValue();
+      upsertTimelineKeyframe(laneId, config, frame, currentValue, baseline);
+    },
+    [
+      timelineParameterConfigs,
+      timelineLanes,
+      timelineMaxSeconds,
+      clampFrameIndex,
+      timelineFps,
+      upsertTimelineKeyframe,
+    ],
+  );
+
+  const handleTimelineKeyframeTimeChange = useCallback(
+    (laneId: string, index: number, nextTimeSeconds: number) => {
+      setTimelineLanes((lanes) => {
+        const laneIndex = lanes.findIndex((lane) => lane.id === laneId);
+        if (laneIndex === -1) {
+          return lanes;
+        }
+        const lane = lanes[laneIndex]!;
+        if (!lane.keyframes[index]) {
+          return lanes;
+        }
+        const clampedTime = Math.max(0, Math.min(timelineMaxSeconds, nextTimeSeconds));
+        const frame = clampFrameIndex(Math.round(clampedTime * timelineFps));
+        const keyframes = lane.keyframes.slice();
+        const value = keyframes[index]!.value;
+        keyframes.splice(index, 1);
+        const existingIndex = keyframes.findIndex((entry) => entry.frame === frame);
+        if (existingIndex >= 0) {
+          keyframes[existingIndex] = { frame, value };
+        } else {
+          keyframes.push({ frame, value });
+        }
+        const sorted = sortTimelineKeyframes(keyframes);
+        const nextLane: TimelineEditorLane = {
+          ...lane,
+          keyframes: sorted,
+        };
+        const nextLanes = lanes.slice();
+        nextLanes[laneIndex] = nextLane;
+        return nextLanes;
+      });
+    },
+    [clampFrameIndex, timelineFps, timelineMaxSeconds, setTimelineLanes],
+  );
+
+  const handleTimelineKeyframeValueChange = useCallback(
+    (laneId: string, index: number, value: TimelineValue) => {
+      setTimelineLanes((lanes) => {
+        const laneIndex = lanes.findIndex((lane) => lane.id === laneId);
+        if (laneIndex === -1) {
+          return lanes;
+        }
+        const lane = lanes[laneIndex]!;
+        if (!lane.keyframes[index]) {
+          return lanes;
+        }
+        const keyframes = lane.keyframes.slice();
+        if (keyframes[index]!.value === value) {
+          return lanes;
+        }
+        keyframes[index] = { ...keyframes[index]!, value };
+        const nextLane: TimelineEditorLane = {
+          ...lane,
+          keyframes,
+        };
+        const nextLanes = lanes.slice();
+        nextLanes[laneIndex] = nextLane;
+        return nextLanes;
+      });
+    },
+    [setTimelineLanes],
+  );
+
+  const handleTimelineRemoveKeyframe = useCallback(
+    (laneId: string, index: number) => {
+      setTimelineLanes((lanes) => {
+        const laneIndex = lanes.findIndex((lane) => lane.id === laneId);
+        if (laneIndex === -1) {
+          return lanes;
+        }
+        const lane = lanes[laneIndex]!;
+        if (!lane.keyframes[index]) {
+          return lanes;
+        }
+        if (lane.keyframes.length <= 1) {
+          return lanes.filter((entry) => entry.id !== laneId);
+        }
+        const keyframes = lane.keyframes.slice();
+        keyframes.splice(index, 1);
+        const nextLane: TimelineEditorLane = {
+          ...lane,
+          keyframes,
+        };
+        const nextLanes = lanes.slice();
+        nextLanes[laneIndex] = nextLane;
+        return nextLanes;
+      });
+    },
+    [setTimelineLanes],
+  );
+
+  const handleTimelineInterpolationChange = useCallback(
+    (laneId: string, interpolation: TimelineInterpolation) => {
+      setTimelineLanes((lanes) =>
+        lanes.map((lane) => (lane.id === laneId ? { ...lane, interpolation } : lane)),
+      );
+    },
+    [setTimelineLanes],
+  );
+
+  const setTimelineTime = useCallback(
+    (timeSeconds: number) => {
+      const clamped = Math.max(0, Math.min(timelineMaxSeconds, timeSeconds));
+      timelineClockRef.current = clamped;
+      setTimelineCurrentTime(clamped);
+      updateTimelineForTime(clamped);
+    },
+    [timelineMaxSeconds, updateTimelineForTime],
+  );
+
+  const handleTimelineScrub = useCallback(
+    (timeSeconds: number) => {
+      setTimelinePlaying(false);
+      setTimelineTime(timeSeconds);
+    },
+    [setTimelineTime],
+  );
+
+  const handleTimelineTogglePlay = useCallback(() => {
+    setTimelinePlaying((prev) => !prev);
+  }, []);
+
+  const handleTimelineStop = useCallback(() => {
+    setTimelinePlaying(false);
+    setTimelineTime(0);
+  }, [setTimelineTime]);
+
+  const handleTimelineLoopToggle = useCallback((value: boolean) => {
+    setTimelineLoop(value);
+  }, []);
+
+  const handleTimelineFpsChange = useCallback((value: number) => {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    const clamped = Math.max(1, Math.min(240, Math.round(value)));
+    setTimelineFps(clamped);
+  }, []);
+
+  const handleTimelineDurationChange = useCallback((value: number) => {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    const clamped = Math.max(0.1, Math.min(600, value));
+    setTimelineDurationSeconds(clamped);
+  }, []);
+
+  const handleTimelineAutoKeyframeToggle = useCallback((value: boolean) => {
+    setTimelineAutoKeyframe(value);
+  }, []);
+
+  const handleTimelineClear = useCallback(() => {
+    setTimelinePlaying(false);
+    timelineClockRef.current = 0;
+    setTimelineCurrentTime(0);
+    setTimelineLanes([]);
+    clearTimeline();
+    updateTimelineForTime(0);
+  }, [clearTimeline, setTimelineLanes, updateTimelineForTime]);
+
+  const handleTimelineStepPrev = useCallback(() => {
+    if (timelineLanes.length === 0) {
+      setTimelinePlaying(false);
+      setTimelineTime(0);
+      return;
+    }
+    const frames = new Set<number>();
+    timelineLanes.forEach((lane) => lane.keyframes.forEach((kf) => frames.add(kf.frame)));
+    if (frames.size === 0) {
+      setTimelinePlaying(false);
+      setTimelineTime(0);
+      return;
+    }
+    const sorted = Array.from(frames)
+      .map((frame) => clampFrameIndex(frame))
+      .sort((a, b) => a - b);
+    const currentFrame = clampFrameIndex(Math.round(timelineClockRef.current * timelineFps));
+    let targetFrame = sorted[0]!;
+    for (let i = sorted.length - 1; i >= 0; i -= 1) {
+      const frame = sorted[i]!;
+      if (frame < currentFrame) {
+        targetFrame = frame;
+        break;
+      }
+    }
+    setTimelinePlaying(false);
+    setTimelineTime(targetFrame / timelineFps);
+  }, [timelineLanes, clampFrameIndex, timelineFps, setTimelineTime]);
+
+  const handleTimelineStepNext = useCallback(() => {
+    if (timelineLanes.length === 0) {
+      setTimelinePlaying(false);
+      setTimelineTime(0);
+      return;
+    }
+    const frames = new Set<number>();
+    timelineLanes.forEach((lane) => lane.keyframes.forEach((kf) => frames.add(kf.frame)));
+    if (frames.size === 0) {
+      setTimelinePlaying(false);
+      setTimelineTime(0);
+      return;
+    }
+    const sorted = Array.from(frames)
+      .map((frame) => clampFrameIndex(frame))
+      .sort((a, b) => a - b);
+    const currentFrame = clampFrameIndex(Math.round(timelineClockRef.current * timelineFps));
+    let targetFrame = sorted[sorted.length - 1]!;
+    for (let i = 0; i < sorted.length; i += 1) {
+      const frame = sorted[i]!;
+      if (frame > currentFrame) {
+        targetFrame = frame;
+        break;
+      }
+    }
+    setTimelinePlaying(false);
+    setTimelineTime(targetFrame / timelineFps);
+  }, [timelineLanes, clampFrameIndex, timelineFps, setTimelineTime]);
+
+  const timelineRuntime = useMemo((): Timeline | null => {
+    if (timelineLanes.length === 0) {
+      return null;
+    }
+    const lanes = timelineLanes
+      .map((lane) => ({
+        id: lane.id,
+        label: lane.label,
+        interpolation: lane.interpolation,
+        keyframes: sortTimelineKeyframes(
+          lane.keyframes.map((entry) => ({
+            frame: clampFrameIndex(entry.frame),
+            value: entry.value,
+          })),
+        ),
+      }))
+      .filter((lane) => lane.keyframes.length > 0);
+    if (lanes.length === 0) {
+      return null;
+    }
+    return {
+      version: 1,
+      fps: timelineFps,
+      durationFrames,
+      lanes,
+      seeds: [],
+    };
+  }, [timelineLanes, clampFrameIndex, timelineFps, durationFrames]);
+
+  useEffect(() => {
+    if (!timelineRuntime) {
+      if (timelineActiveRef.current) {
+        clearTimeline();
+      }
+      return;
+    }
+    loadTimeline(timelineRuntime);
+    const currentTime = Math.max(0, Math.min(timelineMaxSeconds, timelineClockRef.current));
+    updateTimelineForTime(currentTime);
+  }, [timelineRuntime, loadTimeline, updateTimelineForTime, timelineMaxSeconds, clearTimeline]);
+
+  useEffect(() => {
+    if (!timelinePlaying) {
+      return;
+    }
+    let animationFrame = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const dt = (now - last) / 1000;
+      last = now;
+      let next = timelineClockRef.current + dt;
+      let continuePlayback = true;
+      if (next > timelineMaxSeconds) {
+        if (timelineLoop && timelineMaxSeconds > 0) {
+          next = next % timelineMaxSeconds;
+        } else {
+          next = timelineMaxSeconds;
+          setTimelinePlaying(false);
+          continuePlayback = false;
+        }
+      }
+      timelineClockRef.current = next;
+      setTimelineCurrentTime(next);
+      updateTimelineForTime(next);
+      if (continuePlayback) {
+        animationFrame = requestAnimationFrame(tick);
+      }
+    };
+    animationFrame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animationFrame);
+  }, [
+    timelinePlaying,
+    timelineLoop,
+    timelineMaxSeconds,
+    updateTimelineForTime,
+    setTimelinePlaying,
+    setTimelineCurrentTime,
+  ]);
+
+  useEffect(() => {
+    const clamped = Math.max(0, Math.min(timelineMaxSeconds, timelineClockRef.current));
+    if (!Number.isFinite(clamped)) {
+      return;
+    }
+    if (Math.abs(clamped - timelineClockRef.current) > 1e-6) {
+      timelineClockRef.current = clamped;
+      setTimelineCurrentTime(clamped);
+      updateTimelineForTime(clamped);
+    }
+  }, [timelineMaxSeconds, updateTimelineForTime, setTimelineCurrentTime]);
+
+  const handleEdgeThresholdChange = useCallback(
+    (value: number) => {
+      const previous = edgeThreshold;
+      setEdgeThreshold(value);
+      maybeRecordTimelineKeyframe('edgeThreshold', value, previous);
+      recordMacroParameterChange('edgeThreshold', value);
+    },
+    [edgeThreshold, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleBlendChange = useCallback(
+    (value: number) => {
+      const previous = blend;
+      setBlend(value);
+      maybeRecordTimelineKeyframe('blend', value, previous);
+      recordMacroParameterChange('blend', value);
+    },
+    [blend, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleBeta2Change = useCallback(
+    (value: number) => {
+      const previous = beta2;
+      setBeta2(value);
+      maybeRecordTimelineKeyframe('beta2', value, previous);
+      recordMacroParameterChange('beta2', value);
+    },
+    [beta2, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleSigmaChange = useCallback(
+    (value: number) => {
+      const previous = sigma;
+      setSigma(value);
+      maybeRecordTimelineKeyframe('sigma', value, previous);
+      recordMacroParameterChange('sigma', value);
+    },
+    [sigma, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleJitterChange = useCallback(
+    (value: number) => {
+      const previous = jitter;
+      setJitter(value);
+      maybeRecordTimelineKeyframe('jitter', value, previous);
+      recordMacroParameterChange('jitter', value);
+    },
+    [jitter, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleContrastChange = useCallback(
+    (value: number) => {
+      const previous = contrast;
+      setContrast(value);
+      maybeRecordTimelineKeyframe('contrast', value, previous);
+      recordMacroParameterChange('contrast', value);
+    },
+    [contrast, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleRimAlphaChange = useCallback(
+    (value: number) => {
+      const previous = rimAlpha;
+      setRimAlpha(value);
+      maybeRecordTimelineKeyframe('rimAlpha', value, previous);
+      recordMacroParameterChange('rimAlpha', value);
+    },
+    [rimAlpha, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleRimEnabledChange = useCallback(
+    (value: boolean) => {
+      const previous = rimEnabled;
+      setRimEnabled(value);
+      maybeRecordTimelineKeyframe('rimEnabled', value, previous);
+      recordMacroParameterChange('rimEnabled', value);
+    },
+    [rimEnabled, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleMicrosaccadeChange = useCallback(
+    (value: boolean) => {
+      const previous = microsaccade;
+      setMicrosaccade(value);
+      maybeRecordTimelineKeyframe('microsaccade', value, previous);
+      recordMacroParameterChange('microsaccade', value);
+    },
+    [microsaccade, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleNormPinChange = useCallback(
+    (value: boolean) => {
+      const previous = normPin;
+      setNormPin(value);
+      maybeRecordTimelineKeyframe('normPin', value, previous);
+      recordMacroParameterChange('normPin', value);
+    },
+    [normPin, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handlePhasePinChange = useCallback(
+    (value: boolean) => {
+      const previous = phasePin;
+      setPhasePin(value);
+      maybeRecordTimelineKeyframe('phasePin', value, previous);
+      recordMacroParameterChange('phasePin', value);
+    },
+    [phasePin, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleAliveChange = useCallback(
+    (value: boolean) => {
+      const previous = alive;
+      setAlive(value);
+      maybeRecordTimelineKeyframe('alive', value, previous);
+      recordMacroParameterChange('alive', value);
+    },
+    [alive, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleDmtChange = useCallback(
+    (value: number) => {
+      const previous = dmt;
+      setDmt(value);
+      maybeRecordTimelineKeyframe('dmt', value, previous);
+      recordMacroParameterChange('dmt', value);
+    },
+    [dmt, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleArousalChange = useCallback(
+    (value: number) => {
+      const previous = arousal;
+      setArousal(value);
+      maybeRecordTimelineKeyframe('arousal', value, previous);
+      recordMacroParameterChange('arousal', value);
+    },
+    [arousal, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleSurfaceBlendChange = useCallback(
+    (value: number) => {
+      const previous = surfaceBlend;
+      setSurfaceBlend(value);
+      maybeRecordTimelineKeyframe('surfaceBlend', value, previous);
+      recordMacroParameterChange('surfaceBlend', value);
+    },
+    [surfaceBlend, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const handleWarpAmpChange = useCallback(
+    (value: number) => {
+      const previous = warpAmp;
+      setWarpAmp(value);
+      maybeRecordTimelineKeyframe('warpAmp', value, previous);
+      recordMacroParameterChange('warpAmp', value);
+    },
+    [warpAmp, maybeRecordTimelineKeyframe, recordMacroParameterChange],
+  );
+
+  const macroActionHandlers = useMemo<Record<string, (value: TimelineValue) => void>>(
+    () => ({
+      edgeThreshold: (value) =>
+        handleEdgeThresholdChange(coerceTimelineNumber(value, edgeThreshold)),
+      blend: (value) => handleBlendChange(coerceTimelineNumber(value, blend)),
+      beta2: (value) => handleBeta2Change(coerceTimelineNumber(value, beta2)),
+      sigma: (value) => handleSigmaChange(coerceTimelineNumber(value, sigma)),
+      jitter: (value) => handleJitterChange(coerceTimelineNumber(value, jitter)),
+      contrast: (value) => handleContrastChange(coerceTimelineNumber(value, contrast)),
+      rimAlpha: (value) => handleRimAlphaChange(coerceTimelineNumber(value, rimAlpha)),
+      rimEnabled: (value) => handleRimEnabledChange(Boolean(value)),
+      microsaccade: (value) => handleMicrosaccadeChange(Boolean(value)),
+      normPin: (value) => handleNormPinChange(Boolean(value)),
+      phasePin: (value) => handlePhasePinChange(Boolean(value)),
+      alive: (value) => handleAliveChange(Boolean(value)),
+      dmt: (value) => handleDmtChange(coerceTimelineNumber(value, dmt)),
+      arousal: (value) => handleArousalChange(coerceTimelineNumber(value, arousal)),
+      surfaceBlend: (value) => handleSurfaceBlendChange(coerceTimelineNumber(value, surfaceBlend)),
+      warpAmp: (value) => handleWarpAmpChange(coerceTimelineNumber(value, warpAmp)),
+    }),
+    [
+      edgeThreshold,
+      blend,
+      beta2,
+      sigma,
+      jitter,
+      contrast,
+      rimAlpha,
+      dmt,
+      arousal,
+      surfaceBlend,
+      warpAmp,
+      handleEdgeThresholdChange,
+      handleBlendChange,
+      handleBeta2Change,
+      handleSigmaChange,
+      handleJitterChange,
+      handleContrastChange,
+      handleRimAlphaChange,
+      handleRimEnabledChange,
+      handleMicrosaccadeChange,
+      handleNormPinChange,
+      handlePhasePinChange,
+      handleAliveChange,
+      handleDmtChange,
+      handleArousalChange,
+      handleSurfaceBlendChange,
+      handleWarpAmpChange,
+    ],
+  );
+
   const [coupling, setCoupling] = useState<CouplingConfig>({
     rimToSurfaceBlend: 0.45,
     rimToSurfaceAlign: 0.55,
@@ -3026,6 +4671,86 @@ export default function App() {
   const [epsKur, setEpsKur] = useState(0.002);
   const [fluxX, setFluxX] = useState(0);
   const [fluxY, setFluxY] = useState(0);
+  const [polarizationEnabled, setPolarizationEnabled] = useState(false);
+  const [wavePlateEnabled, setWavePlateEnabled] = useState(true);
+  const [wavePlatePhaseDeg, setWavePlatePhaseDeg] = useState(90);
+  const [wavePlateOrientationDeg, setWavePlateOrientationDeg] = useState(0);
+  const [polarizerEnabled, setPolarizerEnabled] = useState(false);
+  const [polarizerOrientationDeg, setPolarizerOrientationDeg] = useState(0);
+  const [polarizerExtinction, setPolarizerExtinction] = useState(0);
+  const [su7PolarizationEnabled, setSu7PolarizationEnabled] = useState(false);
+  const [su7PolarizationColumn, setSu7PolarizationColumn] = useState(0);
+  const [su7PolarizationGain, setSu7PolarizationGain] = useState(1);
+  const [su7PolarizationBlend, setSu7PolarizationBlend] = useState(1);
+  const su7PolarizationMatrix = useMemo<PolarizationMatrix | null>(() => {
+    if (!su7PolarizationEnabled) {
+      return null;
+    }
+    const column = Math.min(6, Math.max(0, Math.floor(su7PolarizationColumn)));
+    const gain = Number.isFinite(su7PolarizationGain) ? su7PolarizationGain : 1;
+    return su7UnitaryColumnToPolarizationMatrix(su7Unitary, {
+      column,
+      gain,
+    });
+  }, [su7PolarizationEnabled, su7Unitary, su7PolarizationColumn, su7PolarizationGain]);
+  const polarizationSchedule = useMemo<ThinElementSchedule | undefined>(() => {
+    if (!polarizationEnabled) {
+      return undefined;
+    }
+    const steps: any[] = [];
+    const toRad = (deg: number) => (Number.isFinite(deg) ? (deg * Math.PI) / 180 : 0);
+    if (wavePlateEnabled) {
+      const phaseRad = toRad(wavePlatePhaseDeg);
+      const orientationRad = toRad(wavePlateOrientationDeg);
+      steps.push(createWavePlateStep(phaseRad, orientationRad, 'Wave plate'));
+    }
+    if (su7PolarizationEnabled && su7PolarizationMatrix) {
+      const blend = clamp(su7PolarizationBlend, 0, 1);
+      const mixMatrix = (matrix: PolarizationMatrix, weight: number): PolarizationMatrix => {
+        if (weight >= 0.999) {
+          return matrix;
+        }
+        const w = Math.max(0, weight);
+        const inv = 1 - w;
+        const mixEntry = (
+          entry: { re: number; im: number },
+          identityRe: number,
+        ): { re: number; im: number } => ({
+          re: inv * identityRe + w * entry.re,
+          im: w * entry.im,
+        });
+        return {
+          m00: mixEntry(matrix.m00, 1),
+          m01: mixEntry(matrix.m01, 0),
+          m10: mixEntry(matrix.m10, 0),
+          m11: mixEntry(matrix.m11, 1),
+        };
+      };
+      const matrix = mixMatrix(su7PolarizationMatrix, blend);
+      steps.push(createPolarizationMatrixStep(matrix, 'SU7 gate'));
+    }
+    if (polarizerEnabled) {
+      const orientationRad = toRad(polarizerOrientationDeg);
+      const extinction = clamp(polarizerExtinction, 0, 1);
+      steps.push(createPolarizerStep(orientationRad, extinction, 'Polarizer'));
+    }
+    return [
+      ...steps,
+      { kind: 'operator', operator: 'amplitude' as const },
+      { kind: 'operator', operator: 'phase' as const },
+    ] as ThinElementSchedule;
+  }, [
+    polarizationEnabled,
+    wavePlateEnabled,
+    wavePlatePhaseDeg,
+    wavePlateOrientationDeg,
+    su7PolarizationEnabled,
+    su7PolarizationMatrix,
+    su7PolarizationBlend,
+    polarizerEnabled,
+    polarizerOrientationDeg,
+    polarizerExtinction,
+  ]);
   const [fluxSources, setFluxSources] = useState<FluxSource[]>([]);
   const [qcdBeta, setQcdBeta] = useState(5.25);
   const [qcdStepsPerSecond, setQcdStepsPerSecond] = useState(3);
@@ -3091,6 +4816,30 @@ export default function App() {
   const [telemetryEnabled, setTelemetryEnabled] = useState(false);
   const [telemetryOverlayEnabled, setTelemetryOverlayEnabled] = useState(false);
   const [telemetrySnapshot, setTelemetrySnapshot] = useState<TelemetrySnapshot | null>(null);
+  const [telemetrySeriesSelection, setTelemetrySeriesSelection] =
+    useState<TelemetrySeriesSelection>({
+      indraIndex: true,
+      symmetry: true,
+      colorfulness: false,
+      edgeDensity: false,
+    });
+  const [telemetryStreamEnabled, setTelemetryStreamEnabled] = useState(false);
+  const [telemetryStreamUrl, setTelemetryStreamUrl] = useState('ws://localhost:8090/telemetry');
+  const [telemetryStreamStatus, setTelemetryStreamStatus] = useState<
+    'idle' | 'connecting' | 'connected' | 'error'
+  >('idle');
+  const [telemetryStreamError, setTelemetryStreamError] = useState<string | null>(null);
+  const telemetryStreamSocketRef = useRef<WebSocket | null>(null);
+  const telemetryStreamQueueRef = useRef<string[]>([]);
+  const telemetryStreamFrameIdRef = useRef(0);
+  const telemetryStreamErrorRef = useRef<string | null>(null);
+  const telemetryRecordingRef = useRef<{
+    active: boolean;
+    startedAt: number | null;
+    samples: TelemetryExportEntry[];
+  }>({ active: false, startedAt: null, samples: [] });
+  const [telemetryRecordingActive, setTelemetryRecordingActive] = useState(false);
+  const [telemetryRecordingCount, setTelemetryRecordingCount] = useState(0);
   const [frameLoggingEnabled, setFrameLoggingEnabled] = useState(true);
   const [lastParityResult, setLastParityResult] = useState<ParitySummary | null>(null);
   const [lastPerfResult, setLastPerfResult] = useState<PerformanceSnapshot | null>(null);
@@ -3110,6 +4859,240 @@ export default function App() {
     checked: boolean;
     supported: CaptureFormatConfig[];
   }>({ checked: false, supported: [] });
+  const toggleTelemetrySeries = useCallback((key: QualiaSeriesKey) => {
+    setTelemetrySeriesSelection((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  }, []);
+
+  const flushTelemetryStreamQueue = (socket: WebSocket) => {
+    const queue = telemetryStreamQueueRef.current;
+    while (queue.length > 0 && socket.readyState === WebSocket.OPEN) {
+      const message = queue.shift();
+      if (message) {
+        socket.send(message);
+      }
+    }
+  };
+
+  const closeTelemetryStream = useCallback(() => {
+    const socket = telemetryStreamSocketRef.current;
+    if (socket) {
+      try {
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+          socket.close();
+        }
+      } catch (error) {
+        console.warn('[telemetry-stream] failed to close socket', error);
+      }
+    }
+    telemetryStreamSocketRef.current = null;
+    telemetryStreamQueueRef.current = [];
+    telemetryStreamErrorRef.current = null;
+    setTelemetryStreamStatus('idle');
+  }, []);
+
+  const openTelemetryStream = useCallback(() => {
+    if (typeof window === 'undefined' || !telemetryStreamEnabled) {
+      return;
+    }
+    const existing = telemetryStreamSocketRef.current;
+    if (existing) {
+      if (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING) {
+        return;
+      }
+    }
+    try {
+      const socket = new WebSocket(telemetryStreamUrl);
+      telemetryStreamSocketRef.current = socket;
+      setTelemetryStreamStatus('connecting');
+      setTelemetryStreamError(null);
+      socket.addEventListener('open', () => {
+        setTelemetryStreamStatus('connected');
+        flushTelemetryStreamQueue(socket);
+      });
+      socket.addEventListener('error', (event) => {
+        console.warn('[telemetry-stream] socket error', event);
+        telemetryStreamErrorRef.current = 'Unable to connect';
+        setTelemetryStreamStatus('error');
+        setTelemetryStreamError('Unable to connect');
+      });
+      socket.addEventListener('close', () => {
+        telemetryStreamSocketRef.current = null;
+        if (telemetryStreamEnabled) {
+          setTelemetryStreamStatus('error');
+          setTelemetryStreamError(telemetryStreamErrorRef.current ?? 'Stream closed');
+        } else {
+          setTelemetryStreamStatus('idle');
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      telemetryStreamErrorRef.current = message;
+      setTelemetryStreamStatus('error');
+      setTelemetryStreamError(message);
+    }
+  }, [telemetryStreamEnabled, telemetryStreamUrl]);
+
+  const streamFrame = useCallback(
+    (payload: unknown) => {
+      if (!telemetryStreamEnabled) {
+        return;
+      }
+      const data = JSON.stringify(payload);
+      const socket = telemetryStreamSocketRef.current;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(data);
+        return;
+      }
+      if (!socket) {
+        openTelemetryStream();
+      }
+      const queue = telemetryStreamQueueRef.current;
+      if (queue.length >= TELEMETRY_STREAM_QUEUE_LIMIT) {
+        queue.shift();
+      }
+      queue.push(data);
+    },
+    [openTelemetryStream, telemetryStreamEnabled],
+  );
+
+  const startTelemetryRecording = useCallback(() => {
+    telemetryRecordingRef.current = {
+      active: true,
+      startedAt: Date.now(),
+      samples: [],
+    };
+    setTelemetryRecordingActive(true);
+    setTelemetryRecordingCount(0);
+  }, []);
+
+  const stopTelemetryRecording = useCallback(() => {
+    const record = telemetryRecordingRef.current;
+    if (!record.active) {
+      return;
+    }
+    record.active = false;
+    setTelemetryRecordingActive(false);
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      record.samples = [];
+      setTelemetryRecordingCount(0);
+      return;
+    }
+    if (record.samples.length === 0) {
+      setTelemetryRecordingCount(0);
+      return;
+    }
+    const samples = record.samples.slice();
+    const lines = samples.map((sample) => JSON.stringify(sample));
+    const blob = new Blob([lines.join('\n')], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    const timestamp = record.startedAt ? new Date(record.startedAt) : new Date();
+    const safeName = timestamp.toISOString().replace(/[:]/g, '-');
+    anchor.href = url;
+    anchor.download = `indra-telemetry-${safeName}.jsonl`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+    record.samples = [];
+    record.startedAt = null;
+    setTelemetryRecordingCount(0);
+  }, []);
+
+  const downloadTelemetrySnapshot = useCallback(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    const latest = metricsRef.current[metricsRef.current.length - 1];
+    if (!latest) {
+      return;
+    }
+    const blob = new Blob([JSON.stringify(latest, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `indra-telemetry-snapshot-${new Date().toISOString().replace(/[:]/g, '-')}.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const captureFrameMetrics = useCallback(
+    (
+      backend: FrameMetricsEntry['backend'],
+      metrics: RainbowFrameMetrics,
+      kernelVersion: number,
+    ) => {
+      const entry: FrameMetricsEntry = {
+        backend,
+        ts: performance.now(),
+        metrics,
+        kernelVersion,
+      };
+      metricsRef.current.push(entry);
+      if (metricsRef.current.length > 240) {
+        metricsRef.current.shift();
+      }
+      if (telemetryStreamEnabled) {
+        const payload = {
+          type: 'qualia-frame',
+          frame: telemetryStreamFrameIdRef.current++,
+          timestamp: Date.now(),
+          backend: entry.backend,
+          kernelVersion: entry.kernelVersion,
+          qualia: entry.metrics.qualia,
+          motion: entry.metrics.motionEnergy,
+          parallax: entry.metrics.parallax,
+          texture: {
+            wallpapericity: entry.metrics.texture.wallpapericity,
+            beatEnergy: entry.metrics.texture.beatEnergy,
+            sampleCount: entry.metrics.texture.sampleCount,
+          },
+          composer: entry.metrics.composer.fields,
+        };
+        streamFrame(payload);
+      }
+      if (telemetryRecordingRef.current.active) {
+        const record = telemetryRecordingRef.current;
+        const exportEntry: TelemetryExportEntry = {
+          timestamp: Date.now(),
+          backend: entry.backend,
+          kernelVersion: entry.kernelVersion,
+          qualia: entry.metrics.qualia,
+          motion: entry.metrics.motionEnergy,
+          parallax: entry.metrics.parallax,
+          texture: {
+            wallpapericity: entry.metrics.texture.wallpapericity,
+            beatEnergy: entry.metrics.texture.beatEnergy,
+            sampleCount: entry.metrics.texture.sampleCount,
+          },
+        };
+        if (record.samples.length >= TELEMETRY_RECORDING_LIMIT) {
+          record.samples.shift();
+        }
+        record.samples.push(exportEntry);
+        setTelemetryRecordingCount(record.samples.length);
+      }
+    },
+    [streamFrame, telemetryStreamEnabled],
+  );
+
+  const toggleTelemetryRecording = useCallback(() => {
+    if (telemetryRecordingRef.current.active) {
+      stopTelemetryRecording();
+    } else {
+      startTelemetryRecording();
+    }
+  }, [startTelemetryRecording, stopTelemetryRecording]);
+
+  const handleTelemetryReconnect = useCallback(() => {
+    closeTelemetryStream();
+    openTelemetryStream();
+  }, [closeTelemetryStream, openTelemetryStream]);
   const [recordingFormatId, setRecordingFormatId] = useState<CaptureFormatId | null>(null);
   const [fieldStatuses, setFieldStatuses] = useState<FieldStatusMap>(() => createInitialStatuses());
   const [rimDebugSnapshot, setRimDebugSnapshot] = useState<RimDebugSnapshot | null>(null);
@@ -3832,6 +5815,39 @@ export default function App() {
   }, [frameLoggingEnabled]);
 
   useEffect(() => {
+    if (!telemetryStreamEnabled) {
+      setTelemetryStreamError(null);
+      telemetryStreamQueueRef.current = [];
+      return;
+    }
+    openTelemetryStream();
+    return () => {
+      closeTelemetryStream();
+    };
+  }, [telemetryStreamEnabled, openTelemetryStream, closeTelemetryStream]);
+
+  useEffect(() => {
+    if (!telemetryStreamEnabled) {
+      return;
+    }
+    closeTelemetryStream();
+    openTelemetryStream();
+  }, [telemetryStreamUrl, telemetryStreamEnabled, closeTelemetryStream, openTelemetryStream]);
+
+  useEffect(() => {
+    return () => {
+      closeTelemetryStream();
+    };
+  }, [closeTelemetryStream]);
+
+  useEffect(() => {
+    return () => {
+      telemetryRecordingRef.current.active = false;
+      telemetryRecordingRef.current.samples = [];
+    };
+  }, []);
+
+  useEffect(() => {
     if (!telemetryEnabled) {
       setTelemetrySnapshot(null);
       return;
@@ -3857,6 +5873,7 @@ export default function App() {
         normDeltaMax: 0,
         normDeltaMean: 0,
         projectorEnergy: 0,
+        geodesicFallbacks: 0,
       };
       const su7UnitaryValues: number[] = [];
       const su7NormMeanValues: number[] = [];
@@ -3876,6 +5893,7 @@ export default function App() {
         su7Totals.normDeltaMax += su7.normDeltaMax;
         su7Totals.normDeltaMean += su7.normDeltaMean;
         su7Totals.projectorEnergy += su7.projectorEnergy;
+        su7Totals.geodesicFallbacks += su7.geodesicFallbacks;
         if (Number.isFinite(su7.unitaryError)) {
           su7UnitaryValues.push(su7.unitaryError);
         }
@@ -3906,6 +5924,25 @@ export default function App() {
       const su7GpuStats = su7GpuStatsRef.current;
       const su7GpuWarning = su7GpuWarningRef.current;
       const su7GpuProfile = su7GpuLastProfileRef.current;
+      const qualiaSeriesLength = Math.min(history.length, 90);
+      const qualiaHistory = history.slice(-qualiaSeriesLength);
+      const qualiaLatestMetrics =
+        qualiaHistory.length > 0
+          ? qualiaHistory[qualiaHistory.length - 1]!.metrics.qualia
+          : history[history.length - 1]!.metrics.qualia;
+      const projectQualiaSeries = (selector: (metrics: QualiaMetrics) => number) =>
+        qualiaHistory.map((entry) => {
+          const value = selector(entry.metrics.qualia);
+          return Number.isFinite(value) ? clamp01(value) : 0;
+        });
+      let fps = 0;
+      if (history.length > 1) {
+        const span = history[history.length - 1]!.ts - history[0]!.ts;
+        if (span > 1) {
+          fps = ((history.length - 1) * 1000) / span;
+        }
+      }
+      const frameMs = fps > 0 ? 1000 / fps : 0;
       const snapshot: TelemetrySnapshot = {
         fields: {} as Record<ComposerFieldId, TelemetryFieldSnapshot>,
         coupling: {
@@ -3919,6 +5956,7 @@ export default function App() {
           normDeltaMax: su7Totals.normDeltaMax / count,
           normDeltaMean: su7Totals.normDeltaMean / count,
           projectorEnergy: su7Totals.projectorEnergy / count,
+          geodesicFallbacks: su7Totals.geodesicFallbacks / count,
         },
         hopf:
           history.length > 0
@@ -3930,6 +5968,15 @@ export default function App() {
                 })),
               }
             : { lenses: [] },
+        qualia: {
+          latest: qualiaLatestMetrics,
+          series: {
+            indraIndex: projectQualiaSeries((q) => q.indraIndex),
+            symmetry: projectQualiaSeries((q) => q.symmetry),
+            colorfulness: projectQualiaSeries((q) => q.colorfulness),
+            edgeDensity: projectQualiaSeries((q) => q.edgeDensity),
+          },
+        },
         su7Histograms: {
           normDeltaMean: computeTelemetryHistogram(su7NormMeanValues, 16),
           normDeltaMax: computeTelemetryHistogram(su7NormMaxValues, 16),
@@ -3939,6 +5986,10 @@ export default function App() {
           latest: unitaryLatest,
           mean: unitaryMean,
           max: unitaryMax === Number.NEGATIVE_INFINITY ? 0 : unitaryMax,
+        },
+        performance: {
+          fps,
+          frameMs,
         },
         frameSamples: history.length,
         updatedAt: Date.now(),
@@ -3965,7 +6016,7 @@ export default function App() {
         };
       });
       setTelemetrySnapshot(snapshot);
-    }, 500);
+    }, 200);
     return () => window.clearInterval(interval);
   }, [telemetryEnabled]);
 
@@ -4042,12 +6093,16 @@ export default function App() {
   );
 
   const ensureKurCpuState = useCallback(() => {
+    const desiredComponents = polarizationEnabled ? 2 : 1;
     if (
       !kurStateRef.current ||
       kurStateRef.current.width !== width ||
-      kurStateRef.current.height !== height
+      kurStateRef.current.height !== height ||
+      kurStateRef.current.componentCount !== desiredComponents
     ) {
-      kurStateRef.current = createKuramotoState(width, height);
+      kurStateRef.current = createKuramotoState(width, height, undefined, {
+        componentCount: desiredComponents,
+      });
       if (kurStateRef.current) {
         kurTelemetryRef.current = kurStateRef.current.telemetry;
         kurIrradianceRef.current = kurStateRef.current.irradiance;
@@ -4083,7 +6138,7 @@ export default function App() {
     cohRef.current = cpuDerivedRef.current.coh;
     ampRef.current = cpuDerivedRef.current.amp;
     return false;
-  }, [width, height]);
+  }, [width, height, polarizationEnabled]);
 
   const ensureVolumeState = useCallback(() => {
     if (width <= 0 || height <= 0) {
@@ -4468,7 +6523,8 @@ export default function App() {
       const kernelSnapshot = kernelEventRef.current;
       kurAppliedKernelVersionRef.current = kernelSnapshot.version;
       const timestamp = typeof performance !== 'undefined' ? performance.now() : Date.now();
-      const seed = getTimelineSeed('kuramotoNoise', tSeconds);
+      const timelineTime = timelineClockRef.current;
+      const seed = getTimelineSeed('kuramotoNoise', timelineTime);
       const frameRand = createNormalGenerator(seed);
       const result = stepKuramotoState(
         kurStateRef.current,
@@ -4480,13 +6536,22 @@ export default function App() {
           kernel: kernelSnapshot.spec,
           controls: { dmt },
           telemetry: { kernelVersion: kernelSnapshot.version },
+          schedule: polarizationSchedule,
         },
       );
       kurTelemetryRef.current = result.telemetry;
       kurIrradianceRef.current = result.irradiance;
       logKurTelemetry(result.telemetry);
     },
-    [kurEnabled, ensureKurCpuState, getKurParams, getTimelineSeed, dmt, logKurTelemetry],
+    [
+      kurEnabled,
+      ensureKurCpuState,
+      getKurParams,
+      getTimelineSeed,
+      dmt,
+      logKurTelemetry,
+      polarizationSchedule,
+    ],
   );
 
   const deriveKurFieldsCpu = useCallback(() => {
@@ -4498,9 +6563,10 @@ export default function App() {
     deriveKuramotoFieldsCore(kurStateRef.current, cpuDerivedRef.current, {
       kernel: kernelSnapshot.spec,
       controls: { dmt: activeDmt },
+      schedule: polarizationSchedule,
     });
     markFieldFresh('phase', cpuDerivedRef.current.resolution, 'cpu');
-  }, [kurEnabled, ensureKurCpuState, dmt, markFieldFresh, getTimelineNumber]);
+  }, [kurEnabled, ensureKurCpuState, dmt, markFieldFresh, getTimelineNumber, polarizationSchedule]);
 
   const resetKuramotoField = useCallback(() => {
     initKuramotoCpu(qInit);
@@ -4716,6 +6782,7 @@ export default function App() {
         qInit,
         buffers,
         seed: getTimelineSeed('kuramotoNoise', seedTime),
+        componentCount: polarizationEnabled ? 2 : 1,
       },
       buffers,
     );
@@ -4729,6 +6796,7 @@ export default function App() {
     stopKurWorker,
     width,
     getTimelineSeed,
+    polarizationEnabled,
   ]);
 
   useEffect(() => {
@@ -4876,7 +6944,7 @@ export default function App() {
         }
       }
 
-      updateTimelineForTime(tSeconds);
+      updateTimelineForTime(timelineClockRef.current);
       const activeDmt = getTimelineNumber('dmt', dmt);
       const activeArousal = getTimelineNumber('arousal', arousal);
       const activeBlend = getTimelineNumber('blend', blend);
@@ -4992,15 +7060,7 @@ export default function App() {
         lastObsRef.current = result.obsAverage;
       }
       if (commitObs && result.metrics) {
-        metricsRef.current.push({
-          backend: 'cpu',
-          ts: performance.now(),
-          metrics: result.metrics,
-          kernelVersion: kernelSnapshot.version,
-        });
-        if (metricsRef.current.length > 240) {
-          metricsRef.current.shift();
-        }
+        captureFrameMetrics('cpu', result.metrics, kernelSnapshot.version);
       }
       updateDebugSnapshots(commitObs, rimDebugRequest, surfaceDebugRequest, result.debug);
       updatePhaseDebug(commitObs, phaseField);
@@ -5125,7 +7185,7 @@ export default function App() {
         return;
       }
 
-      updateTimelineForTime(tSeconds);
+      updateTimelineForTime(timelineClockRef.current);
       const activeDmt = getTimelineNumber('dmt', dmt);
       const activeArousal = getTimelineNumber('arousal', arousal);
       const activeBlend = getTimelineNumber('blend', blend);
@@ -5318,15 +7378,7 @@ export default function App() {
         metricDebug = metricsResult.debug;
         guardrailMetrics = metricsResult;
         if (telemetryActive) {
-          metricsRef.current.push({
-            backend: 'gpu',
-            ts: performance.now(),
-            metrics: metricsResult.metrics,
-            kernelVersion: kernelSnapshot.version,
-          });
-          if (metricsRef.current.length > 240) {
-            metricsRef.current.shift();
-          }
+          captureFrameMetrics('gpu', metricsResult.metrics, kernelSnapshot.version);
           if (metricsResult.obsAverage != null) {
             lastObsRef.current = metricsResult.obsAverage;
           }
@@ -5562,6 +7614,9 @@ export default function App() {
         lastGpuTracerTime != null ? Math.max(1 / 480, Math.min(tracerDelta, 0.25)) : 1 / 60;
       const tracerEnabled = tracerRuntime.enabled;
       const tracerReset = gpuTracerRef.current.needsReset || !tracerEnabled;
+      const earlyVisionFrame = earlyVisionFrameRef.current;
+      earlyVisionFrameRef.current = (earlyVisionFrame + 1) >>> 0;
+      const earlyVisionForceUpdate = earlyVisionForceUpdateRef.current;
 
       renderer.render({
         time: tSeconds,
@@ -5612,11 +7667,34 @@ export default function App() {
           reset: tracerReset,
         },
         su7: su7Uniforms,
+        earlyVision: {
+          dogEnabled: earlyVisionDogEnabled,
+          orientationEnabled: earlyVisionOrientationEnabled,
+          motionEnabled: earlyVisionMotionEnabled,
+          opacity: earlyVisionOpacity,
+          dogSigma: earlyVisionDoGSigma,
+          dogRatio: earlyVisionDoGRatio,
+          dogGain: earlyVisionDoGGain,
+          downsample: Math.max(1, earlyVisionDownsample),
+          orientationGain: earlyVisionOrientationGain,
+          orientationSharpness: earlyVisionOrientationSharpness,
+          orientationCount: earlyVisionOrientationAngles.length,
+          orientationCos: earlyVisionOrientationCos,
+          orientationSin: earlyVisionOrientationSin,
+          motionGain: earlyVisionMotionGain,
+          frameModulo: Math.max(1, earlyVisionFrameModulo),
+          frameIndex: earlyVisionFrame,
+          forceUpdate: earlyVisionForceUpdate,
+          viewMode: earlyVisionViewMode,
+        },
         orientations: orientationCache,
         ops: gpuOps,
         center: [cx, cy],
       });
 
+      if (earlyVisionForceUpdate) {
+        earlyVisionForceUpdateRef.current = false;
+      }
       gpuTracerRef.current.lastTime = tSeconds;
       gpuTracerRef.current.needsReset = !tracerEnabled;
 
@@ -5671,6 +7749,23 @@ export default function App() {
       updatePhaseDebug,
       showPhaseDebug,
       logFrameMetrics,
+      earlyVisionDogEnabled,
+      earlyVisionOrientationEnabled,
+      earlyVisionMotionEnabled,
+      earlyVisionOpacity,
+      earlyVisionDoGSigma,
+      earlyVisionDoGRatio,
+      earlyVisionDoGGain,
+      earlyVisionDownsample,
+      earlyVisionOrientationGain,
+      earlyVisionOrientationSharpness,
+      earlyVisionOrientationCount,
+      earlyVisionMotionGain,
+      earlyVisionFrameModulo,
+      earlyVisionViewMode,
+      earlyVisionOrientationCos,
+      earlyVisionOrientationSin,
+      earlyVisionOrientationAngles,
       tracerRuntime,
       deriveSu7ScheduleContext,
       getTimelineNumber,
@@ -5699,7 +7794,8 @@ export default function App() {
     (dt: number, tSeconds: number) => {
       if (!kurEnabled) return;
       const teleStart = telemetryRef.current.enabled ? performance.now() : 0;
-      updateTimelineForTime(tSeconds);
+      const timelineTime = timelineClockRef.current;
+      updateTimelineForTime(timelineTime);
       if (kurSyncRef.current) {
         stepKuramotoCpu(dt, tSeconds);
         deriveKurFieldsCpu();
@@ -5709,13 +7805,15 @@ export default function App() {
           const inflight = workerInflightRef.current;
           if (inflight < 2) {
             const frameId = workerNextFrameIdRef.current++;
-            const seed = getTimelineSeed('kuramotoNoise', tSeconds);
+            const seed = getTimelineSeed('kuramotoNoise', timelineTime);
             worker.postMessage({
               kind: 'tick',
               dt,
               timestamp: tSeconds,
               frameId,
               seed,
+              schedule: polarizationSchedule ?? null,
+              componentCount: polarizationEnabled ? 2 : 1,
             });
             workerInflightRef.current = inflight + 1;
           }
@@ -5734,6 +7832,8 @@ export default function App() {
       recordTelemetry,
       updateTimelineForTime,
       getTimelineSeed,
+      polarizationSchedule,
+      polarizationEnabled,
     ],
   );
 
@@ -5812,7 +7912,9 @@ export default function App() {
       const kernelSnapshot = kernelEventRef.current;
       const operatorKernel = kernelSnapshot.spec;
 
-      const cpuState = createKuramotoState(width, height);
+      const cpuState = createKuramotoState(width, height, undefined, {
+        componentCount: polarizationEnabled ? 2 : 1,
+      });
       const cpuBuffer = new ArrayBuffer(derivedBufferSize(width, height));
       const cpuDerived = createDerivedViews(cpuBuffer, width, height);
       const cpuRand = createNormalGenerator(seed);
@@ -5823,10 +7925,12 @@ export default function App() {
         stepKuramotoState(cpuState, params, dt, cpuRand, dt * (i + 1), {
           kernel: operatorKernel,
           controls: { dmt },
+          schedule: polarizationSchedule,
         });
         deriveKuramotoFieldsCore(cpuState, cpuDerived, {
           kernel: operatorKernel,
           controls: { dmt },
+          schedule: polarizationSchedule,
         });
         const buffer = new Uint8ClampedArray(total);
         const tSeconds = i * (1 / 60);
@@ -5862,6 +7966,8 @@ export default function App() {
             height,
             qInit,
             seed,
+            schedule: polarizationSchedule ?? null,
+            componentCount: polarizationEnabled ? 2 : 1,
           });
         });
       } catch (error) {
@@ -5907,6 +8013,8 @@ export default function App() {
       speed,
       qInit,
       dmt,
+      polarizationSchedule,
+      polarizationEnabled,
     ],
   );
 
@@ -6191,6 +8299,22 @@ export default function App() {
     () => (recordingBitrate / 1_000_000).toFixed(1),
     [recordingBitrate],
   );
+  const telemetryStreamStatusLabel =
+    telemetryStreamStatus === 'connected'
+      ? 'Connected'
+      : telemetryStreamStatus === 'connecting'
+        ? 'Connecting…'
+        : telemetryStreamStatus === 'error'
+          ? 'Error'
+          : 'Idle';
+  const telemetryStreamStatusColor =
+    telemetryStreamStatus === 'connected'
+      ? '#34d399'
+      : telemetryStreamStatus === 'error'
+        ? '#f87171'
+        : telemetryStreamStatus === 'connecting'
+          ? '#fbbf24'
+          : '#94a3b8';
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -6860,6 +8984,8 @@ export default function App() {
     (preset: Preset) => {
       pendingStaticUploadRef.current = true;
 
+      recordMacroPresetAction(preset.name);
+
       const { params, surface, display, runtime, kuramoto, developer } = preset;
 
       handleRendererToggle(runtime.renderBackend === 'gpu');
@@ -6881,6 +9007,68 @@ export default function App() {
           : 0,
       );
       setMacroLearnMode(false);
+      const runtimeEarlyVision = runtime.earlyVision ?? {
+        dogEnabled: false,
+        orientationEnabled: false,
+        motionEnabled: false,
+        opacity: 0.65,
+        dogSigma: 1.2,
+        dogRatio: 1.6,
+        dogGain: 2.4,
+        downsample: 1,
+        orientationGain: 0.9,
+        orientationSharpness: 2,
+        orientationCount: 4,
+        motionGain: 6,
+        frameModulo: 1,
+        viewMode: 'blend' as const,
+      };
+      setEarlyVisionDogEnabled(Boolean(runtimeEarlyVision.dogEnabled));
+      setEarlyVisionOrientationEnabled(Boolean(runtimeEarlyVision.orientationEnabled));
+      setEarlyVisionMotionEnabled(Boolean(runtimeEarlyVision.motionEnabled));
+      setEarlyVisionOpacity(
+        Number.isFinite(runtimeEarlyVision.opacity) ? runtimeEarlyVision.opacity : 0.65,
+      );
+      setEarlyVisionDoGSigma(
+        Number.isFinite(runtimeEarlyVision.dogSigma) ? runtimeEarlyVision.dogSigma : 1.2,
+      );
+      setEarlyVisionDoGRatio(
+        Number.isFinite(runtimeEarlyVision.dogRatio) ? runtimeEarlyVision.dogRatio : 1.6,
+      );
+      setEarlyVisionDoGGain(
+        Number.isFinite(runtimeEarlyVision.dogGain) ? runtimeEarlyVision.dogGain : 2.4,
+      );
+      setEarlyVisionDownsample(
+        Number.isFinite(runtimeEarlyVision.downsample)
+          ? Math.max(1, Math.round(runtimeEarlyVision.downsample))
+          : 1,
+      );
+      setEarlyVisionOrientationGain(
+        Number.isFinite(runtimeEarlyVision.orientationGain)
+          ? runtimeEarlyVision.orientationGain
+          : 0.9,
+      );
+      setEarlyVisionOrientationSharpness(
+        Number.isFinite(runtimeEarlyVision.orientationSharpness)
+          ? runtimeEarlyVision.orientationSharpness
+          : 2,
+      );
+      setEarlyVisionOrientationCount(
+        Number.isFinite(runtimeEarlyVision.orientationCount)
+          ? Math.max(1, Math.min(8, Math.round(runtimeEarlyVision.orientationCount)))
+          : 4,
+      );
+      setEarlyVisionMotionGain(
+        Number.isFinite(runtimeEarlyVision.motionGain) ? runtimeEarlyVision.motionGain : 6,
+      );
+      setEarlyVisionFrameModulo(
+        Number.isFinite(runtimeEarlyVision.frameModulo)
+          ? Math.max(1, Math.round(runtimeEarlyVision.frameModulo))
+          : 1,
+      );
+      setEarlyVisionViewMode(runtimeEarlyVision.viewMode === 'overlay' ? 'overlay' : 'blend');
+      earlyVisionForceUpdateRef.current = true;
+      earlyVisionFrameRef.current = 0;
 
       setEdgeThreshold(params.edgeThreshold);
       setBlend(params.blend);
@@ -6963,6 +9151,17 @@ export default function App() {
       setPSw(kuramoto.p_sw);
       setSmallWorldSeed(kuramoto.smallWorldSeed);
       setSmallWorldDegree(kuramoto.smallWorldDegree);
+      setPolarizationEnabled(kuramoto.polarizationEnabled ?? false);
+      setWavePlateEnabled(kuramoto.wavePlateEnabled ?? true);
+      setWavePlatePhaseDeg(kuramoto.wavePlatePhaseDeg ?? 90);
+      setWavePlateOrientationDeg(kuramoto.wavePlateOrientationDeg ?? 0);
+      setSu7PolarizationEnabled(kuramoto.su7PolarizationEnabled ?? false);
+      setSu7PolarizationColumn(kuramoto.su7PolarizationColumn ?? 0);
+      setSu7PolarizationGain(kuramoto.su7PolarizationGain ?? 1);
+      setSu7PolarizationBlend(kuramoto.su7PolarizationBlend ?? 1);
+      setPolarizerEnabled(kuramoto.polarizerEnabled ?? false);
+      setPolarizerOrientationDeg(kuramoto.polarizerOrientationDeg ?? 0);
+      setPolarizerExtinction(kuramoto.polarizerExtinction ?? 0);
 
       stopQcdAnneal();
       setQcdBeta(preset.qcd.beta);
@@ -7042,6 +9241,7 @@ export default function App() {
       setSu7Params,
       stopQcdAnneal,
       ensureQcdRuntime,
+      recordMacroPresetAction,
     ],
   );
 
@@ -7050,6 +9250,77 @@ export default function App() {
   useEffect(() => {
     applyPresetRef.current = applyPreset;
   }, [applyPreset]);
+
+  const applyMacroEvent = useCallback(
+    (event: MacroEvent) => {
+      if (event.kind === 'set') {
+        const handler = macroActionHandlers[event.target];
+        if (handler) {
+          handler(event.value);
+        }
+        return;
+      }
+      switch (event.action) {
+        case 'applyPreset': {
+          const preset = PRESETS.find((entry) => entry.name === event.presetName);
+          if (preset) {
+            applyPresetRef.current?.(preset);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    },
+    [macroActionHandlers],
+  );
+
+  const playMacro = useCallback(
+    (macroId: string) => {
+      cancelMacroPlayback();
+      const script = macroLibrary.find((entry) => entry.id === macroId);
+      if (!script || script.events.length === 0) {
+        return;
+      }
+      setMacroPlaybackId(macroId);
+      let executed = 0;
+      const timers: number[] = [];
+      script.events.forEach((event) => {
+        const timerId = globalThis.setTimeout(
+          () => {
+            applyMacroEvent(event);
+            executed += 1;
+            if (executed >= script.events.length) {
+              macroPlaybackRef.current = null;
+              setMacroPlaybackId(null);
+            }
+          },
+          Math.max(0, event.at),
+        );
+        timers.push(timerId);
+      });
+      macroPlaybackRef.current = { timers };
+    },
+    [applyMacroEvent, cancelMacroPlayback, macroLibrary],
+  );
+
+  const deleteMacro = useCallback(
+    (macroId: string) => {
+      setMacroLibrary((prev) => prev.filter((entry) => entry.id !== macroId));
+      if (macroPlaybackId === macroId) {
+        cancelMacroPlayback();
+      }
+    },
+    [cancelMacroPlayback, macroPlaybackId],
+  );
+
+  const renameMacro = useCallback((macroId: string, label: string) => {
+    setMacroLibrary((prev) =>
+      prev.map((entry) =>
+        entry.id === macroId ? { ...entry, label: label.trim() || entry.label } : entry,
+      ),
+    );
+  }, []);
 
   const buildCurrentPreset = useCallback((): Preset => {
     const su7Snapshot = cloneSu7RuntimeParams(su7Params);
@@ -7120,6 +9391,22 @@ export default function App() {
         frameLoggingEnabled,
         macroBinding: cloneMacroBinding(macroBinding),
         macroKnobValue: Number.isFinite(macroKnobValue) ? macroKnobValue : 0,
+        earlyVision: {
+          dogEnabled: earlyVisionDogEnabled,
+          orientationEnabled: earlyVisionOrientationEnabled,
+          motionEnabled: earlyVisionMotionEnabled,
+          opacity: earlyVisionOpacity,
+          dogSigma: earlyVisionDoGSigma,
+          dogRatio: earlyVisionDoGRatio,
+          dogGain: earlyVisionDoGGain,
+          downsample: Math.max(1, earlyVisionDownsample),
+          orientationGain: earlyVisionOrientationGain,
+          orientationSharpness: earlyVisionOrientationSharpness,
+          orientationCount: earlyVisionOrientationCount,
+          motionGain: earlyVisionMotionGain,
+          frameModulo: Math.max(1, earlyVisionFrameModulo),
+          viewMode: earlyVisionViewMode,
+        },
       },
       kuramoto: {
         kurEnabled,
@@ -7138,6 +9425,17 @@ export default function App() {
         p_sw: pSw,
         smallWorldSeed,
         smallWorldDegree,
+        polarizationEnabled,
+        wavePlateEnabled,
+        wavePlatePhaseDeg,
+        wavePlateOrientationDeg,
+        su7PolarizationEnabled,
+        su7PolarizationColumn,
+        su7PolarizationGain,
+        su7PolarizationBlend,
+        polarizerEnabled,
+        polarizerOrientationDeg,
+        polarizerExtinction,
       },
       developer: {
         selectedSyntheticCase,
@@ -7224,6 +9522,17 @@ export default function App() {
     pSw,
     smallWorldSeed,
     smallWorldDegree,
+    polarizationEnabled,
+    wavePlateEnabled,
+    wavePlatePhaseDeg,
+    wavePlateOrientationDeg,
+    su7PolarizationEnabled,
+    su7PolarizationColumn,
+    su7PolarizationGain,
+    su7PolarizationBlend,
+    polarizerEnabled,
+    polarizerOrientationDeg,
+    polarizerExtinction,
     selectedSyntheticCase,
     includeImageInPreset,
     imageAsset,
@@ -7241,6 +9550,20 @@ export default function App() {
     coupling,
     composer,
     couplingToggles,
+    earlyVisionDogEnabled,
+    earlyVisionOrientationEnabled,
+    earlyVisionMotionEnabled,
+    earlyVisionOpacity,
+    earlyVisionDoGSigma,
+    earlyVisionDoGRatio,
+    earlyVisionDoGGain,
+    earlyVisionDownsample,
+    earlyVisionOrientationGain,
+    earlyVisionOrientationSharpness,
+    earlyVisionOrientationCount,
+    earlyVisionMotionGain,
+    earlyVisionFrameModulo,
+    earlyVisionViewMode,
   ]);
 
   const handlePresetExport = useCallback(() => {
@@ -7256,6 +9579,126 @@ export default function App() {
     URL.revokeObjectURL(url);
   }, [buildCurrentPreset]);
 
+  const handleExportEarlyVisionOverlay = useCallback(() => {
+    if (!earlyVisionDogEnabled && !earlyVisionOrientationEnabled && !earlyVisionMotionEnabled) {
+      console.warn('[early-vision] enable at least one analyzer before exporting an overlay.');
+      return;
+    }
+    const gpuState = gpuStateRef.current;
+    if (!gpuState) {
+      console.warn('[early-vision] GPU renderer unavailable.');
+      return;
+    }
+    const total = width * height * 4;
+    const buffer = new Uint8Array(total);
+    const ok = gpuState.renderer.readEarlyVisionOverlay(buffer);
+    if (!ok) {
+      console.warn('[early-vision] overlay texture not available yet.');
+      return;
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) {
+      console.warn('[early-vision] failed to allocate canvas context.');
+      return;
+    }
+    const imageData = new ImageData(new Uint8ClampedArray(buffer), width, height);
+    ctx.putImageData(imageData, 0, 0);
+    const finalizeDownload = (blob: Blob | null) => {
+      if (!blob) {
+        console.warn('[early-vision] failed to encode overlay image.');
+        return;
+      }
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `early-vision-overlay-${stamp}.png`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    };
+    if (canvas.toBlob) {
+      canvas.toBlob(finalizeDownload, 'image/png');
+    } else {
+      const url = canvas.toDataURL('image/png');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `early-vision-overlay-${stamp}.png`;
+      anchor.click();
+    }
+  }, [
+    earlyVisionDogEnabled,
+    earlyVisionMotionEnabled,
+    earlyVisionOrientationEnabled,
+    width,
+    height,
+  ]);
+
+  const handleExportEarlyVisionMetrics = useCallback(() => {
+    const latest = metricsRef.current[metricsRef.current.length - 1];
+    if (!latest) {
+      console.warn('[early-vision] metrics history is empty.');
+      return;
+    }
+    const evMetrics = latest.metrics.texture.earlyVision;
+    const payload = {
+      timestamp: new Date().toISOString(),
+      backend: latest.backend,
+      frameStamp: latest.ts,
+      analyzer: {
+        dogMean: evMetrics.dogMean,
+        dogStd: evMetrics.dogStd,
+        orientationMean: evMetrics.orientationMean,
+        orientationStd: evMetrics.orientationStd,
+        divisiveMean: evMetrics.divisiveMean,
+        divisiveStd: evMetrics.divisiveStd,
+        sampleCount: evMetrics.sampleCount,
+      },
+      motionEnergy: latest.metrics.motionEnergy,
+      configuration: {
+        dogEnabled: earlyVisionDogEnabled,
+        orientationEnabled: earlyVisionOrientationEnabled,
+        motionEnabled: earlyVisionMotionEnabled,
+        opacity: earlyVisionOpacity,
+        dogSigma: earlyVisionDoGSigma,
+        dogRatio: earlyVisionDoGRatio,
+        dogGain: earlyVisionDoGGain,
+        downsample: Math.max(1, earlyVisionDownsample),
+        orientationGain: earlyVisionOrientationGain,
+        orientationSharpness: earlyVisionOrientationSharpness,
+        orientationCount: earlyVisionOrientationCount,
+        motionGain: earlyVisionMotionGain,
+        frameModulo: Math.max(1, earlyVisionFrameModulo),
+        viewMode: earlyVisionViewMode,
+      },
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `early-vision-metrics-${stamp}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, [
+    earlyVisionDogEnabled,
+    earlyVisionDoGGain,
+    earlyVisionDoGRatio,
+    earlyVisionDoGSigma,
+    earlyVisionDownsample,
+    earlyVisionFrameModulo,
+    earlyVisionMotionEnabled,
+    earlyVisionMotionGain,
+    earlyVisionOpacity,
+    earlyVisionOrientationCount,
+    earlyVisionOrientationEnabled,
+    earlyVisionOrientationGain,
+    earlyVisionOrientationSharpness,
+    earlyVisionViewMode,
+  ]);
   const handleCreateShareLink = useCallback(async () => {
     if (typeof window === 'undefined') return;
     try {
@@ -7363,13 +9806,16 @@ export default function App() {
       let localDerived: ReturnType<typeof createDerivedViews> | null = null;
       const params = getKurParams();
       if (kurEnabled) {
-        localKurState = createKuramotoState(width, height);
+        localKurState = createKuramotoState(width, height, undefined, {
+          componentCount: polarizationEnabled ? 2 : 1,
+        });
         const derivedBuffer = new ArrayBuffer(derivedBufferSize(width, height));
         localDerived = createDerivedViews(derivedBuffer, width, height);
         initKuramotoState(localKurState, qInit, localDerived);
         deriveKuramotoFieldsCore(localKurState, localDerived, {
           kernel: kernelSpec,
           controls: { dmt: initialDmt },
+          schedule: polarizationSchedule,
         });
       }
 
@@ -7395,10 +9841,12 @@ export default function App() {
           stepKuramotoState(localKurState, params, dt, localRand, (i + 1) * dt, {
             kernel: kernelSpec,
             controls: { dmt: frameDmt },
+            schedule: polarizationSchedule,
           });
           deriveKuramotoFieldsCore(localKurState, localDerived, {
             kernel: kernelSpec,
             controls: { dmt: frameDmt },
+            schedule: polarizationSchedule,
           });
         }
 
@@ -7533,6 +9981,8 @@ export default function App() {
     updateTimelineForTime,
     getTimelineNumber,
     getTimelineSeed,
+    polarizationEnabled,
+    polarizationSchedule,
   ]);
 
   const cancelFrameExport = useCallback(() => {
@@ -7832,7 +10282,7 @@ export default function App() {
             <ToggleControl
               label="Enable rim generator"
               value={rimEnabled}
-              onChange={setRimEnabled}
+              onChange={handleRimEnabledChange}
             />
             <ToggleControl
               label="Rim debug overlays"
@@ -7860,6 +10310,155 @@ export default function App() {
               value={phaseHeatmapEnabled}
               onChange={setPhaseHeatmapEnabled}
             />
+            <div style={{ marginTop: '0.75rem' }}>
+              <strong style={{ color: '#cbd5f5', fontSize: '0.9rem' }}>
+                Early vision analyzer
+              </strong>
+            </div>
+            <ToggleControl
+              label="Retina edge map"
+              value={earlyVisionDogEnabled}
+              onChange={setEarlyVisionDogEnabled}
+            />
+            <ToggleControl
+              label="Orientation map"
+              value={earlyVisionOrientationEnabled}
+              onChange={setEarlyVisionOrientationEnabled}
+            />
+            <ToggleControl
+              label="Motion highlight"
+              value={earlyVisionMotionEnabled}
+              onChange={setEarlyVisionMotionEnabled}
+            />
+            <SliderControl
+              label="Overlay opacity"
+              min={0}
+              max={1}
+              step={0.05}
+              value={earlyVisionOpacity}
+              onChange={setEarlyVisionOpacity}
+              format={(value) => value.toFixed(2)}
+            />
+            <SliderControl
+              label="DoG sigma"
+              min={0.3}
+              max={4}
+              step={0.1}
+              value={earlyVisionDoGSigma}
+              onChange={setEarlyVisionDoGSigma}
+              format={(value) => value.toFixed(2)}
+            />
+            <SliderControl
+              label="DoG ratio"
+              min={1.1}
+              max={3}
+              step={0.05}
+              value={earlyVisionDoGRatio}
+              onChange={setEarlyVisionDoGRatio}
+              format={(value) => value.toFixed(2)}
+            />
+            <SliderControl
+              label="DoG gain"
+              min={0.5}
+              max={4}
+              step={0.1}
+              value={earlyVisionDoGGain}
+              onChange={setEarlyVisionDoGGain}
+              format={(value) => value.toFixed(2)}
+            />
+            <SliderControl
+              label="DoG downsample"
+              min={1}
+              max={4}
+              step={1}
+              value={earlyVisionDownsample}
+              onChange={(value) => setEarlyVisionDownsample(Math.max(1, Math.round(value)))}
+              format={(value) => value.toFixed(0)}
+            />
+            <SliderControl
+              label="Orientation count"
+              min={1}
+              max={8}
+              step={1}
+              value={earlyVisionOrientationCount}
+              onChange={(value) => setEarlyVisionOrientationCount(Math.max(1, Math.round(value)))}
+              format={(value) => value.toFixed(0)}
+            />
+            <SliderControl
+              label="Orientation gain"
+              min={0}
+              max={3}
+              step={0.05}
+              value={earlyVisionOrientationGain}
+              onChange={setEarlyVisionOrientationGain}
+              format={(value) => value.toFixed(2)}
+            />
+            <SliderControl
+              label="Orientation sharpness"
+              min={0.5}
+              max={4}
+              step={0.05}
+              value={earlyVisionOrientationSharpness}
+              onChange={setEarlyVisionOrientationSharpness}
+              format={(value) => value.toFixed(2)}
+            />
+            <SliderControl
+              label="Motion gain"
+              min={0}
+              max={12}
+              step={0.25}
+              value={earlyVisionMotionGain}
+              onChange={setEarlyVisionMotionGain}
+              format={(value) => value.toFixed(2)}
+            />
+            <SliderControl
+              label="Analysis frame skip"
+              min={1}
+              max={8}
+              step={1}
+              value={earlyVisionFrameModulo}
+              onChange={(value) => setEarlyVisionFrameModulo(Math.max(1, Math.round(value)))}
+              format={(value) => `x${value.toFixed(0)}`}
+            />
+            <SelectControl
+              label="Overlay view"
+              value={earlyVisionViewMode}
+              onChange={(value) => setEarlyVisionViewMode(value as 'blend' | 'overlay')}
+              options={[
+                { value: 'blend', label: 'Blend with base' },
+                { value: 'overlay', label: 'Overlay only' },
+              ]}
+            />
+            <div className="control">
+              <button
+                onClick={handleExportEarlyVisionOverlay}
+                style={{
+                  padding: '0.5rem 0.75rem',
+                  borderRadius: '0.6rem',
+                  border: '1px solid rgba(185, 248, 255, 0.35)',
+                  background: 'rgba(14, 165, 233, 0.2)',
+                  color: '#e0f2fe',
+                  cursor: 'pointer',
+                }}
+              >
+                Download overlay PNG
+              </button>
+            </div>
+            <div className="control">
+              <button
+                onClick={handleExportEarlyVisionMetrics}
+                style={{
+                  padding: '0.5rem 0.75rem',
+                  borderRadius: '0.6rem',
+                  border: '1px solid rgba(190, 242, 100, 0.35)',
+                  background: 'rgba(132, 204, 22, 0.18)',
+                  color: '#ecfccb',
+                  cursor: 'pointer',
+                }}
+              >
+                Export analyzer metrics
+              </button>
+            </div>
             <div className="control">
               <button
                 onClick={() => handleParityCheck()}
@@ -8744,7 +11343,7 @@ export default function App() {
               min={0}
               max={1}
               step={0.01}
-              onChange={setEdgeThreshold}
+              onChange={handleEdgeThresholdChange}
             />
             <SliderControl
               label="Kernel Blend"
@@ -8752,7 +11351,7 @@ export default function App() {
               min={0}
               max={1}
               step={0.01}
-              onChange={setBlend}
+              onChange={handleBlendChange}
             />
             <SliderControl
               label="Dispersion β₂"
@@ -8760,7 +11359,7 @@ export default function App() {
               min={0}
               max={3}
               step={0.01}
-              onChange={setBeta2}
+              onChange={handleBeta2Change}
             />
             <SliderControl
               label="Rim Thickness σ"
@@ -8768,7 +11367,7 @@ export default function App() {
               min={0.3}
               max={6}
               step={0.05}
-              onChange={setSigma}
+              onChange={handleSigmaChange}
             />
             <SliderControl
               label="Phase Jitter"
@@ -8776,7 +11375,7 @@ export default function App() {
               min={0}
               max={2}
               step={0.02}
-              onChange={setJitter}
+              onChange={handleJitterChange}
             />
             <SliderControl
               label="Contrast"
@@ -8784,7 +11383,7 @@ export default function App() {
               min={0.25}
               max={3}
               step={0.05}
-              onChange={setContrast}
+              onChange={handleContrastChange}
             />
             <SliderControl
               label="Animation Speed"
@@ -8797,17 +11396,17 @@ export default function App() {
             <ToggleControl
               label="Microsaccade jitter"
               value={microsaccade}
-              onChange={setMicrosaccade}
+              onChange={handleMicrosaccadeChange}
             />
-            <ToggleControl label="Zero-mean pin" value={phasePin} onChange={setPhasePin} />
-            <ToggleControl label="Alive microbreath" value={alive} onChange={setAlive} />
+            <ToggleControl label="Zero-mean pin" value={phasePin} onChange={handlePhasePinChange} />
+            <ToggleControl label="Alive microbreath" value={alive} onChange={handleAliveChange} />
             <SliderControl
               label="Rim Alpha"
               value={rimAlpha}
               min={0}
               max={1}
               step={0.05}
-              onChange={setRimAlpha}
+              onChange={handleRimAlphaChange}
             />
           </section>
 
@@ -8873,7 +11472,7 @@ export default function App() {
               min={0}
               max={1}
               step={0.01}
-              onChange={setDmt}
+              onChange={handleDmtChange}
             />
             <SliderControl
               label="Arousal"
@@ -8881,8 +11480,122 @@ export default function App() {
               min={0}
               max={1}
               step={0.01}
-              onChange={setArousal}
+              onChange={handleArousalChange}
             />
+          </section>
+
+          <section className="panel">
+            <h2>Timeline</h2>
+            <TimelineEditorPanel
+              active={timelineActive}
+              playing={timelinePlaying}
+              loop={timelineLoop}
+              fps={timelineFps}
+              durationSeconds={timelineDurationSeconds}
+              durationFrames={durationFrames}
+              currentTime={timelineCurrentTime}
+              lanes={timelineLanes}
+              parameterConfigs={timelineParameterConfigs}
+              availableParameters={availableTimelineParameters}
+              evaluation={timelineEvaluationState}
+              autoKeyframe={timelineAutoKeyframe}
+              onTogglePlay={handleTimelineTogglePlay}
+              onStop={handleTimelineStop}
+              onToggleLoop={handleTimelineLoopToggle}
+              onTimeChange={handleTimelineScrub}
+              onFpsChange={handleTimelineFpsChange}
+              onDurationChange={handleTimelineDurationChange}
+              onAddLane={handleAddTimelineLane}
+              onRemoveLane={handleRemoveTimelineLane}
+              onClear={handleTimelineClear}
+              onAddKeyframe={handleAddTimelineKeyframe}
+              onKeyframeTimeChange={handleTimelineKeyframeTimeChange}
+              onKeyframeValueChange={handleTimelineKeyframeValueChange}
+              onKeyframeRemove={handleTimelineRemoveKeyframe}
+              onInterpolationChange={handleTimelineInterpolationChange}
+              onPrevKeyframe={handleTimelineStepPrev}
+              onNextKeyframe={handleTimelineStepNext}
+              onAutoKeyframeToggle={handleTimelineAutoKeyframeToggle}
+            />
+          </section>
+
+          <section className="panel">
+            <h2>Macro Recorder</h2>
+            <div className="macro-recorder">
+              <div className="macro-recorder__controls">
+                <button
+                  type="button"
+                  className="macro-button"
+                  onClick={
+                    macroRecording ? () => stopMacroRecording() : () => startMacroRecording()
+                  }
+                >
+                  {macroRecording ? 'Stop & save macro' : 'Record macro'}
+                </button>
+                {macroRecording ? (
+                  <button type="button" className="macro-button" onClick={cancelMacroRecording}>
+                    Cancel
+                  </button>
+                ) : macroPlaybackId ? (
+                  <button type="button" className="macro-button" onClick={cancelMacroPlayback}>
+                    Stop playback
+                  </button>
+                ) : null}
+                <span className="macro-recorder__status">
+                  {macroRecording
+                    ? `Recording… ${macroEvents.length} event${macroEvents.length === 1 ? '' : 's'}`
+                    : macroLibrary.length === 0
+                      ? 'No macros recorded yet'
+                      : `${macroLibrary.length} saved ${macroLibrary.length === 1 ? 'macro' : 'macros'}`}
+                </span>
+              </div>
+              {macroLibrary.length === 0 ? (
+                <p className="macro-recorder__empty">
+                  Start recording to capture parameter changes, preset loads, and other actions.
+                </p>
+              ) : (
+                <ul className="macro-recorder__list">
+                  {macroLibrary.map((macro) => {
+                    const createdLabel = new Date(macro.createdAt).toLocaleString();
+                    const isActive = macroPlaybackId === macro.id;
+                    return (
+                      <li
+                        key={macro.id}
+                        className={isActive ? 'macro-item macro-item--active' : 'macro-item'}
+                      >
+                        <div className="macro-item__header">
+                          <input
+                            value={macro.label}
+                            onChange={(event) => renameMacro(macro.id, event.target.value)}
+                            className="macro-item__title"
+                          />
+                          <span className="macro-item__meta">
+                            {macro.events.length} event{macro.events.length === 1 ? '' : 's'} •{' '}
+                            {createdLabel}
+                          </span>
+                        </div>
+                        <div className="macro-item__actions">
+                          <button
+                            type="button"
+                            className="macro-button"
+                            onClick={() => (isActive ? cancelMacroPlayback() : playMacro(macro.id))}
+                          >
+                            {isActive ? 'Stop' : 'Play'}
+                          </button>
+                          <button
+                            type="button"
+                            className="macro-button macro-button--danger"
+                            onClick={() => deleteMacro(macro.id)}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
           </section>
 
           <section className="panel">
@@ -8898,7 +11611,7 @@ export default function App() {
               min={0}
               max={1}
               step={0.02}
-              onChange={setSurfaceBlend}
+              onChange={handleSurfaceBlendChange}
             />
             <SliderControl
               label="Warp amplitude"
@@ -8906,7 +11619,7 @@ export default function App() {
               min={0}
               max={6}
               step={0.1}
-              onChange={setWarpAmp}
+              onChange={handleWarpAmpChange}
             />
             <SliderControl
               label="Orientations"
@@ -9351,6 +12064,134 @@ export default function App() {
               }}
               format={(v) => `${(v / Math.PI).toFixed(2)}π`}
             />
+            <h3 style={{ marginTop: '0.75rem' }}>Polarization</h3>
+            <ToggleControl
+              label="Enable polarization"
+              value={polarizationEnabled}
+              onChange={(value) => {
+                markKurCustom();
+                setPolarizationEnabled(value);
+              }}
+            />
+            {polarizationEnabled ? (
+              <>
+                <ToggleControl
+                  label="Wave plate"
+                  value={wavePlateEnabled}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setWavePlateEnabled(value);
+                  }}
+                />
+                <SliderControl
+                  label="Phase delay"
+                  value={wavePlatePhaseDeg}
+                  min={-360}
+                  max={360}
+                  step={1}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setWavePlatePhaseDeg(value);
+                  }}
+                  format={(v) => `${v.toFixed(0)}°`}
+                  disabled={!wavePlateEnabled}
+                />
+                <SliderControl
+                  label="Wave plate orientation"
+                  value={wavePlateOrientationDeg}
+                  min={-90}
+                  max={90}
+                  step={1}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setWavePlateOrientationDeg(value);
+                  }}
+                  format={(v) => `${v.toFixed(0)}°`}
+                  disabled={!wavePlateEnabled}
+                />
+                <ToggleControl
+                  label="SU(7) gate coupling"
+                  value={su7PolarizationEnabled}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setSu7PolarizationEnabled(value);
+                  }}
+                />
+                <SliderControl
+                  label="SU(7) blend"
+                  value={su7PolarizationBlend}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setSu7PolarizationBlend(value);
+                  }}
+                  format={(v) => `${(v * 100).toFixed(0)}%`}
+                  disabled={!su7PolarizationEnabled}
+                />
+                <SliderControl
+                  label="SU(7) column"
+                  value={su7PolarizationColumn}
+                  min={0}
+                  max={6}
+                  step={1}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setSu7PolarizationColumn(Math.round(value));
+                  }}
+                  format={(v) => v.toFixed(0)}
+                  disabled={!su7PolarizationEnabled}
+                />
+                <SliderControl
+                  label="SU(7) gain"
+                  value={su7PolarizationGain}
+                  min={0}
+                  max={2.5}
+                  step={0.05}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setSu7PolarizationGain(value);
+                  }}
+                  format={(v) => v.toFixed(2)}
+                  disabled={!su7PolarizationEnabled}
+                />
+                <ToggleControl
+                  label="Polarizer"
+                  value={polarizerEnabled}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setPolarizerEnabled(value);
+                  }}
+                />
+                <SliderControl
+                  label="Polarizer orientation"
+                  value={polarizerOrientationDeg}
+                  min={-90}
+                  max={90}
+                  step={1}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setPolarizerOrientationDeg(value);
+                  }}
+                  format={(v) => `${v.toFixed(0)}°`}
+                  disabled={!polarizerEnabled}
+                />
+                <SliderControl
+                  label="Extinction ratio"
+                  value={polarizerExtinction}
+                  min={0}
+                  max={1}
+                  step={0.02}
+                  onChange={(value) => {
+                    markKurCustom();
+                    setPolarizerExtinction(value);
+                  }}
+                  format={(v) => v.toFixed(2)}
+                  disabled={!polarizerEnabled}
+                />
+              </>
+            ) : null}
             <SliderControl
               label="Init twist q"
               value={qInit}
@@ -9791,7 +12632,11 @@ export default function App() {
               onChange={setPolBins}
               format={(v) => v.toFixed(0)}
             />
-            <ToggleControl label="Normalization pin" value={normPin} onChange={setNormPin} />
+            <ToggleControl
+              label="Normalization pin"
+              value={normPin}
+              onChange={handleNormPinChange}
+            />
             <SliderControl
               label="Curvature strength"
               value={curvatureStrength}
@@ -10074,7 +12919,11 @@ export default function App() {
                   backdropFilter: 'blur(6px)',
                 }}
               >
-                <TelemetryOverlayContents snapshot={telemetrySnapshot} />
+                <TelemetryOverlayContents
+                  snapshot={telemetrySnapshot}
+                  seriesSelection={telemetrySeriesSelection}
+                  onToggleSeries={toggleTelemetrySeries}
+                />
               </div>
             ) : null}
           </div>
@@ -10123,6 +12972,228 @@ export default function App() {
                       </div>
                     );
                   })}
+                </div>
+                <div
+                  style={{
+                    background: 'rgba(15,23,42,0.45)',
+                    borderRadius: '0.75rem',
+                    padding: '0.75rem',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.65rem',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'baseline',
+                    }}
+                  >
+                    <span style={{ color: '#5eead4', fontWeight: 600 }}>Qualia dashboard</span>
+                    <span style={{ color: '#94a3b8', fontSize: '0.78rem' }}>
+                      {telemetrySnapshot.performance.fps > 0
+                        ? `${telemetrySnapshot.performance.fps.toFixed(1)} fps · ${telemetrySnapshot.performance.frameMs.toFixed(2)} ms`
+                        : 'fps —'}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(auto-fit, minmax(14rem, 1fr))',
+                      gap: '0.75rem',
+                    }}
+                  >
+                    {QUALIA_SERIES_META.map((entry) => {
+                      const values = telemetrySnapshot.qualia.series[entry.key];
+                      const latest = telemetrySnapshot.qualia.latest[entry.key];
+                      const seriesValues = values.length > 0 ? values : [latest];
+                      return (
+                        <div
+                          key={`panel-qualia-${entry.key}`}
+                          style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '0.35rem',
+                            padding: '0.5rem 0.6rem',
+                            borderRadius: '0.65rem',
+                            background: 'rgba(14,36,52,0.55)',
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              fontSize: '0.8rem',
+                              color: '#e2e8f0',
+                              fontWeight: 600,
+                            }}
+                          >
+                            <span>{entry.label}</span>
+                            <span style={{ color: entry.color }}>{entry.format(latest)}</span>
+                          </div>
+                          <div style={{ height: '48px' }}>
+                            <Sparkline values={seriesValues} color={entry.color} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div
+                  style={{
+                    background: 'rgba(15,23,42,0.45)',
+                    borderRadius: '0.75rem',
+                    padding: '0.75rem',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.5rem',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'baseline',
+                    }}
+                  >
+                    <span style={{ color: '#38bdf8', fontWeight: 600 }}>Live telemetry stream</span>
+                    <span style={{ color: telemetryStreamStatusColor, fontSize: '0.78rem' }}>
+                      {telemetryStreamStatusLabel}
+                    </span>
+                  </div>
+                  <label
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '0.3rem',
+                      fontSize: '0.75rem',
+                      color: '#cbd5f5',
+                    }}
+                  >
+                    <span>WebSocket endpoint</span>
+                    <input
+                      type="text"
+                      value={telemetryStreamUrl}
+                      onChange={(event) => setTelemetryStreamUrl(event.target.value)}
+                      style={{
+                        padding: '0.5rem 0.6rem',
+                        borderRadius: '0.55rem',
+                        border: '1px solid rgba(148,163,184,0.35)',
+                        background: 'rgba(15,23,42,0.6)',
+                        color: '#e2e8f0',
+                      }}
+                    />
+                  </label>
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={() => setTelemetryStreamEnabled((prev) => !prev)}
+                      style={{
+                        padding: '0.45rem 0.8rem',
+                        borderRadius: '0.6rem',
+                        border: '1px solid rgba(56,189,248,0.35)',
+                        background: telemetryStreamEnabled
+                          ? 'rgba(22,78,99,0.6)'
+                          : 'rgba(30,64,175,0.4)',
+                        color: '#e2e8f0',
+                        fontSize: '0.75rem',
+                      }}
+                    >
+                      {telemetryStreamEnabled ? 'Stop streaming' : 'Start streaming'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleTelemetryReconnect}
+                      disabled={!telemetryStreamEnabled}
+                      style={{
+                        padding: '0.45rem 0.8rem',
+                        borderRadius: '0.6rem',
+                        border: '1px solid rgba(148,163,184,0.35)',
+                        background: telemetryStreamEnabled
+                          ? 'rgba(15,23,42,0.6)'
+                          : 'rgba(15,23,42,0.3)',
+                        color: telemetryStreamEnabled ? '#e2e8f0' : '#94a3b8',
+                        fontSize: '0.75rem',
+                      }}
+                    >
+                      Reconnect
+                    </button>
+                  </div>
+                  {telemetryStreamError ? (
+                    <div style={{ fontSize: '0.72rem', color: '#f87171' }}>
+                      {telemetryStreamError}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: '0.72rem', color: '#94a3b8' }}>
+                      Frames send as JSON lines when the socket is connected.
+                    </div>
+                  )}
+                </div>
+                <div
+                  style={{
+                    background: 'rgba(15,23,42,0.45)',
+                    borderRadius: '0.75rem',
+                    padding: '0.75rem',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.5rem',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'baseline',
+                    }}
+                  >
+                    <span style={{ color: '#fcd34d', fontWeight: 600 }}>Metrics recording</span>
+                    <span style={{ color: '#94a3b8', fontSize: '0.78rem' }}>
+                      {telemetryRecordingActive ? `${telemetryRecordingCount} frames` : 'Idle'}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={toggleTelemetryRecording}
+                      style={{
+                        padding: '0.45rem 0.8rem',
+                        borderRadius: '0.6rem',
+                        border: '1px solid rgba(251,191,36,0.45)',
+                        background: telemetryRecordingActive
+                          ? 'rgba(146,64,14,0.6)'
+                          : 'rgba(124,45,18,0.45)',
+                        color: '#fef9c3',
+                        fontSize: '0.75rem',
+                      }}
+                    >
+                      {telemetryRecordingActive ? 'Stop & download' : 'Start recording'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={downloadTelemetrySnapshot}
+                      style={{
+                        padding: '0.45rem 0.8rem',
+                        borderRadius: '0.6rem',
+                        border: '1px solid rgba(148,163,184,0.35)',
+                        background: 'rgba(15,23,42,0.5)',
+                        color: '#e2e8f0',
+                        fontSize: '0.75rem',
+                      }}
+                    >
+                      Export snapshot
+                    </button>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: '0.72rem',
+                      color: telemetryRecordingActive ? '#facc15' : '#94a3b8',
+                    }}
+                  >
+                    {telemetryRecordingActive
+                      ? 'Recording to memory; stop to download a JSONL log.'
+                      : 'Recording outputs newline-delimited JSON with qualia metrics.'}
+                  </div>
                 </div>
                 <div
                   style={{
@@ -10319,6 +13390,10 @@ type TelemetryHistogramSnapshot = {
   max: number;
 };
 
+type QualiaSeriesKey = 'indraIndex' | 'symmetry' | 'colorfulness' | 'edgeDensity';
+
+type TelemetrySeriesSelection = Record<QualiaSeriesKey, boolean>;
+
 type TelemetrySnapshot = {
   fields: Record<ComposerFieldId, TelemetryFieldSnapshot>;
   coupling: {
@@ -10328,6 +13403,10 @@ type TelemetrySnapshot = {
   };
   su7: Su7Telemetry;
   hopf: RainbowFrameMetrics['hopf'];
+  qualia: {
+    latest: QualiaMetrics;
+    series: Record<QualiaSeriesKey, number[]>;
+  };
   su7Histograms: {
     normDeltaMean: TelemetryHistogramSnapshot;
     normDeltaMax: TelemetryHistogramSnapshot;
@@ -10337,6 +13416,10 @@ type TelemetrySnapshot = {
     latest: number;
     mean: number;
     max: number;
+  };
+  performance: {
+    fps: number;
+    frameMs: number;
   };
   frameSamples: number;
   updatedAt: number;
@@ -10352,6 +13435,20 @@ type TelemetrySnapshot = {
     warningEvent: Su7GpuKernelWarningEvent | null;
   } | null;
 };
+
+const formatPercentValue = (value: number) => `${(clamp01(value) * 100).toFixed(1)}%`;
+
+const QUALIA_SERIES_META: readonly {
+  key: QualiaSeriesKey;
+  label: string;
+  color: string;
+  format: (value: number) => string;
+}[] = [
+  { key: 'indraIndex', label: 'Indra Index', color: '#facc15', format: formatPercentValue },
+  { key: 'symmetry', label: 'Symmetry', color: '#34d399', format: formatPercentValue },
+  { key: 'colorfulness', label: 'Colorfulness', color: '#60a5fa', format: formatPercentValue },
+  { key: 'edgeDensity', label: 'Edge Density', color: '#f97316', format: formatPercentValue },
+];
 
 const HistogramPanel = ({
   title,
@@ -10499,10 +13596,203 @@ function TinyHistogram({ bins, color = '#38bdf8', height = 36 }: TinyHistogramPr
   );
 }
 
-function TelemetryOverlayContents({ snapshot }: { snapshot: TelemetrySnapshot }) {
-  const { su7, su7Histograms, su7Unitary, frameSamples, su7Gpu } = snapshot;
+type SparklineProps = {
+  values: readonly number[];
+  color: string;
+  width?: number;
+  height?: number;
+  strokeWidth?: number;
+};
+
+function Sparkline({ values, color, width = 160, height = 56, strokeWidth = 2 }: SparklineProps) {
+  if (!values.length) {
+    return (
+      <div
+        style={{
+          height,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          fontSize: '0.65rem',
+          color: '#94a3b8',
+          background: 'rgba(15,23,42,0.35)',
+          borderRadius: '0.5rem',
+        }}
+      >
+        No data
+      </div>
+    );
+  }
+  const min = values.reduce((acc, value) => (value < acc ? value : acc), values[0] ?? 0);
+  const max = values.reduce((acc, value) => (value > acc ? value : acc), values[0] ?? 0);
+  const range = Math.max(1e-6, max - min);
+  const step = values.length > 1 ? width / (values.length - 1) : width;
+  let path = '';
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i]!;
+    const norm = clamp01(range <= 1e-6 ? 0.5 : (value - min) / range);
+    const x = i === values.length - 1 ? width : i * step;
+    const y = height - norm * height;
+    path += i === 0 ? `M${x},${y}` : ` L${x},${y}`;
+  }
+  return (
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      style={{
+        width: '100%',
+        height: '100%',
+        display: 'block',
+        background: 'rgba(15,23,42,0.35)',
+        borderRadius: '0.5rem',
+      }}
+    >
+      <path
+        d={path}
+        fill="none"
+        stroke={color}
+        strokeWidth={strokeWidth}
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function TelemetryOverlayContents({
+  snapshot,
+  seriesSelection,
+  onToggleSeries,
+}: {
+  snapshot: TelemetrySnapshot;
+  seriesSelection: TelemetrySeriesSelection;
+  onToggleSeries: (key: QualiaSeriesKey) => void;
+}) {
+  const { su7, su7Histograms, su7Unitary, frameSamples, su7Gpu, qualia, performance } = snapshot;
+  const selectedQualiaSeries = QUALIA_SERIES_META.filter((entry) => seriesSelection[entry.key]);
+  const performanceLabel =
+    performance.fps > 0
+      ? `${performance.fps.toFixed(1)} fps · ${performance.frameMs.toFixed(2)} ms`
+      : 'fps —';
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '0.45rem',
+          padding: '0.5rem',
+          borderRadius: '0.75rem',
+          background: 'rgba(13,36,52,0.65)',
+          border: '1px solid rgba(45,212,191,0.18)',
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'baseline',
+          }}
+        >
+          <span
+            style={{
+              fontWeight: 700,
+              fontSize: '0.72rem',
+              letterSpacing: '0.02em',
+              color: '#5eead4',
+            }}
+          >
+            Qualia metrics
+          </span>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'baseline',
+              gap: '0.5rem',
+              fontSize: '0.64rem',
+              color: '#bae6fd',
+            }}
+          >
+            <span style={{ color: '#94a3b8' }}>{performanceLabel}</span>
+            <span>Indra {formatPercentValue(qualia.latest.indraIndex)}</span>
+          </div>
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: '0.4rem',
+          }}
+        >
+          {QUALIA_SERIES_META.map((entry) => {
+            const active = seriesSelection[entry.key];
+            return (
+              <label
+                key={`qualia-toggle-${entry.key}`}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.3rem',
+                  padding: '0.25rem 0.55rem',
+                  borderRadius: '9999px',
+                  fontSize: '0.64rem',
+                  cursor: 'pointer',
+                  background: active ? 'rgba(45,212,191,0.2)' : 'rgba(15,23,42,0.45)',
+                  color: active ? entry.color : '#94a3b8',
+                  border: '1px solid rgba(94,234,212,0.25)',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={active}
+                  onChange={() => onToggleSeries(entry.key)}
+                />
+                <span>{entry.label}</span>
+              </label>
+            );
+          })}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
+          {selectedQualiaSeries.length === 0 ? (
+            <div style={{ fontSize: '0.65rem', color: '#94a3b8' }}>
+              Enable a metric above to visualize its trend over the last frames.
+            </div>
+          ) : (
+            selectedQualiaSeries.map((entry) => {
+              const values = qualia.series[entry.key];
+              const seriesValues =
+                values && values.length > 0 ? values : [qualia.latest[entry.key]];
+              return (
+                <div
+                  key={`qualia-series-${entry.key}`}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.3rem',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      fontSize: '0.66rem',
+                      color: '#e2e8f0',
+                    }}
+                  >
+                    <span>{entry.label}</span>
+                    <span>{entry.format(qualia.latest[entry.key])}</span>
+                  </div>
+                  <div style={{ height: '56px' }}>
+                    <Sparkline values={seriesValues} color={entry.color} />
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
       <div
         style={{
           display: 'flex',
@@ -11152,6 +14442,429 @@ function SelectControl({ label, value, onChange, options }: SelectProps) {
           </option>
         ))}
       </select>
+    </div>
+  );
+}
+
+type TimelineEditorPanelProps = {
+  active: boolean;
+  playing: boolean;
+  loop: boolean;
+  fps: number;
+  durationSeconds: number;
+  durationFrames: number;
+  currentTime: number;
+  lanes: TimelineEditorLane[];
+  parameterConfigs: TimelineParameterConfig[];
+  availableParameters: TimelineParameterConfig[];
+  evaluation: TimelineFrameEvaluation | null;
+  autoKeyframe: boolean;
+  onTogglePlay: () => void;
+  onStop: () => void;
+  onToggleLoop: (value: boolean) => void;
+  onTimeChange: (timeSeconds: number) => void;
+  onFpsChange: (value: number) => void;
+  onDurationChange: (value: number) => void;
+  onAddLane: (parameterId: string) => void;
+  onRemoveLane: (laneId: string) => void;
+  onClear: () => void;
+  onAddKeyframe: (laneId: string) => void;
+  onKeyframeTimeChange: (laneId: string, index: number, timeSeconds: number) => void;
+  onKeyframeValueChange: (laneId: string, index: number, value: TimelineValue) => void;
+  onKeyframeRemove: (laneId: string, index: number) => void;
+  onInterpolationChange: (laneId: string, interpolation: TimelineInterpolation) => void;
+  onPrevKeyframe: () => void;
+  onNextKeyframe: () => void;
+  onAutoKeyframeToggle: (value: boolean) => void;
+};
+
+function TimelineEditorPanel({
+  active,
+  playing,
+  loop,
+  fps,
+  durationSeconds,
+  durationFrames,
+  currentTime,
+  lanes,
+  parameterConfigs,
+  availableParameters,
+  evaluation,
+  autoKeyframe,
+  onTogglePlay,
+  onStop,
+  onToggleLoop,
+  onTimeChange,
+  onFpsChange,
+  onDurationChange,
+  onAddLane,
+  onRemoveLane,
+  onClear,
+  onAddKeyframe,
+  onKeyframeTimeChange,
+  onKeyframeValueChange,
+  onKeyframeRemove,
+  onInterpolationChange,
+  onPrevKeyframe,
+  onNextKeyframe,
+  onAutoKeyframeToggle,
+}: TimelineEditorPanelProps) {
+  const [selectedParameter, setSelectedParameter] = React.useState<string>(
+    availableParameters[0]?.id ?? '',
+  );
+
+  React.useEffect(() => {
+    if (availableParameters.length === 0) {
+      setSelectedParameter('');
+      return;
+    }
+    if (!availableParameters.some((entry) => entry.id === selectedParameter)) {
+      setSelectedParameter(availableParameters[0]!.id);
+    }
+  }, [availableParameters, selectedParameter]);
+
+  const configMap = React.useMemo(() => {
+    const map = new Map<string, TimelineParameterConfig>();
+    parameterConfigs.forEach((config) => {
+      map.set(config.id, config);
+    });
+    return map;
+  }, [parameterConfigs]);
+
+  const timeStep = fps > 0 ? 1 / fps : 0.0166667;
+  const safeDuration = durationSeconds > 0 ? durationSeconds : timeStep;
+  const sliderMax = Math.max(safeDuration, timeStep);
+  const playheadFraction = safeDuration > 0 ? Math.min(currentTime / safeDuration, 1) : 0;
+  const hasKeyframes = lanes.some((lane) => lane.keyframes.length > 0);
+
+  const handleAddLaneClick = () => {
+    if (selectedParameter) {
+      onAddLane(selectedParameter);
+    }
+  };
+
+  const handleTimeInput = (value: number) => {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    onTimeChange(Math.max(0, value));
+  };
+
+  return (
+    <div className="timeline-editor">
+      <div className="timeline-editor__status">
+        <span>
+          {playing ? 'Playing' : 'Paused'} • {currentTime.toFixed(2)} s / {safeDuration.toFixed(2)}
+           s • {Math.round(fps)} fps
+        </span>
+        {!active ? <span className="timeline-editor__badge">Timeline inactive</span> : null}
+      </div>
+      <div className="timeline-editor__controls">
+        <button type="button" onClick={onTogglePlay} className="timeline-editor__button">
+          {playing ? 'Pause' : 'Play'}
+        </button>
+        <button
+          type="button"
+          onClick={onStop}
+          className="timeline-editor__button"
+          disabled={currentTime <= 0 && !playing}
+        >
+          Stop
+        </button>
+        <button
+          type="button"
+          onClick={onPrevKeyframe}
+          className="timeline-editor__button"
+          disabled={!hasKeyframes}
+        >
+          Prev KF
+        </button>
+        <button
+          type="button"
+          onClick={onNextKeyframe}
+          className="timeline-editor__button"
+          disabled={!hasKeyframes}
+        >
+          Next KF
+        </button>
+        <label className="timeline-editor__toggle">
+          <input
+            type="checkbox"
+            checked={loop}
+            onChange={(event) => onToggleLoop(event.target.checked)}
+          />{' '}
+          Loop
+        </label>
+        <label className="timeline-editor__toggle">
+          <input
+            type="checkbox"
+            checked={autoKeyframe}
+            onChange={(event) => onAutoKeyframeToggle(event.target.checked)}
+          />{' '}
+          Auto keyframe on tweak
+        </label>
+        <button
+          type="button"
+          onClick={onClear}
+          className="timeline-editor__button timeline-editor__button--danger"
+          disabled={lanes.length === 0}
+        >
+          Clear timeline
+        </button>
+      </div>
+      <div className="timeline-editor__timeline">
+        <label className="timeline-editor__slider">
+          <span>Time</span>
+          <input
+            type="range"
+            min={0}
+            max={sliderMax}
+            step={timeStep}
+            value={Math.max(0, Math.min(currentTime, sliderMax))}
+            onChange={(event) => handleTimeInput(Number(event.target.value))}
+          />
+          <span>{currentTime.toFixed(3)} s</span>
+        </label>
+        <div className="timeline-editor__settings">
+          <label>
+            Duration (s)
+            <input
+              type="number"
+              min={0.1}
+              max={600}
+              step={0.1}
+              value={Number(durationSeconds.toFixed(2))}
+              onChange={(event) => onDurationChange(Number(event.target.value))}
+            />
+          </label>
+          <label>
+            FPS
+            <input
+              type="number"
+              min={1}
+              max={240}
+              step={1}
+              value={Math.round(fps)}
+              onChange={(event) => onFpsChange(Number(event.target.value))}
+            />
+          </label>
+          <label>
+            Current time (s)
+            <input
+              type="number"
+              min={0}
+              max={sliderMax}
+              step={timeStep}
+              value={Number(currentTime.toFixed(3))}
+              onChange={(event) => handleTimeInput(Number(event.target.value))}
+            />
+          </label>
+        </div>
+        <div className="timeline-editor__track">
+          <div className="timeline-track">
+            <div
+              className="timeline-track__playhead"
+              style={{ left: `${Math.max(0, Math.min(playheadFraction, 1)) * 100}%` }}
+            />
+          </div>
+        </div>
+      </div>
+      <div className="timeline-editor__add">
+        <label htmlFor="timeline-parameter-select">Add parameter</label>
+        <div className="timeline-editor__add-controls">
+          <select
+            id="timeline-parameter-select"
+            value={selectedParameter}
+            onChange={(event) => setSelectedParameter(event.target.value)}
+          >
+            {availableParameters.length === 0 ? (
+              <option value="" disabled>
+                All parameters added
+              </option>
+            ) : (
+              availableParameters.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))
+            )}
+          </select>
+          <button
+            type="button"
+            className="timeline-editor__button"
+            onClick={handleAddLaneClick}
+            disabled={!selectedParameter}
+          >
+            Add lane
+          </button>
+        </div>
+      </div>
+      {lanes.length === 0 ? (
+        <p className="timeline-editor__empty">
+          No lanes yet. Add a parameter or enable auto keyframe and tweak a control.
+        </p>
+      ) : (
+        lanes.map((lane) => {
+          const config = configMap.get(lane.id);
+          const interpolationOptions: TimelineInterpolation[] =
+            config?.kind === 'number' ? ['linear', 'step'] : ['step'];
+          const activeValue = evaluation?.values[lane.id];
+          return (
+            <div key={lane.id} className="timeline-lane">
+              <header className="timeline-lane__header">
+                <div>
+                  <div className="timeline-lane__title">{config?.label ?? lane.id}</div>
+                  <div className="timeline-lane__meta">
+                    Active value: {formatTimelineValue(activeValue)}
+                  </div>
+                </div>
+                <div className="timeline-lane__actions">
+                  <label>
+                    Interpolation
+                    <select
+                      value={lane.interpolation}
+                      onChange={(event) =>
+                        onInterpolationChange(lane.id, event.target.value as TimelineInterpolation)
+                      }
+                    >
+                      {interpolationOptions.map((option) => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    className="timeline-editor__button"
+                    onClick={() => onAddKeyframe(lane.id)}
+                  >
+                    Keyframe @ {currentTime.toFixed(2)} s
+                  </button>
+                  <button
+                    type="button"
+                    className="timeline-editor__button timeline-editor__button--danger"
+                    onClick={() => onRemoveLane(lane.id)}
+                  >
+                    Remove lane
+                  </button>
+                </div>
+              </header>
+              <div className="timeline-track timeline-track--lane">
+                <div
+                  className="timeline-track__playhead"
+                  style={{ left: `${Math.max(0, Math.min(playheadFraction, 1)) * 100}%` }}
+                />
+                {lane.keyframes.map((keyframe, index) => {
+                  const timeSeconds = keyframe.frame / fps;
+                  const fraction = safeDuration > 0 ? Math.min(timeSeconds / safeDuration, 1) : 0;
+                  return (
+                    <button
+                      type="button"
+                      key={`${lane.id}-kf-${index}`}
+                      className="timeline-keyframe"
+                      style={{ left: `${fraction * 100}%` }}
+                      onClick={() => onTimeChange(timeSeconds)}
+                      title={`${timeSeconds.toFixed(3)}s`}
+                    />
+                  );
+                })}
+              </div>
+              <div className="timeline-keyframes">
+                {lane.keyframes.map((keyframe, index) => {
+                  const timeSeconds = keyframe.frame / fps;
+                  const configForLane = config ?? null;
+                  const renderValueInput = () => {
+                    if (configForLane?.kind === 'boolean') {
+                      const current = Boolean(keyframe.value);
+                      return (
+                        <select
+                          value={current ? 'true' : 'false'}
+                          onChange={(event) =>
+                            onKeyframeValueChange(lane.id, index, event.target.value === 'true')
+                          }
+                        >
+                          <option value="true">True</option>
+                          <option value="false">False</option>
+                        </select>
+                      );
+                    }
+                    if (configForLane?.kind === 'enum') {
+                      return (
+                        <select
+                          value={String(keyframe.value)}
+                          onChange={(event) =>
+                            onKeyframeValueChange(lane.id, index, event.target.value)
+                          }
+                        >
+                          {(configForLane.options ?? []).map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label ?? option.value}
+                            </option>
+                          ))}
+                        </select>
+                      );
+                    }
+                    const min = configForLane?.min;
+                    const max = configForLane?.max;
+                    const step = configForLane?.step ?? 0.01;
+                    const numericValue =
+                      typeof keyframe.value === 'number' && Number.isFinite(keyframe.value)
+                        ? keyframe.value
+                        : 0;
+                    return (
+                      <input
+                        type="number"
+                        value={numericValue}
+                        step={step}
+                        min={min}
+                        max={max}
+                        onChange={(event) => {
+                          const next = Number(event.target.value);
+                          if (Number.isFinite(next)) {
+                            onKeyframeValueChange(lane.id, index, next);
+                          }
+                        }}
+                      />
+                    );
+                  };
+                  return (
+                    <div key={`${lane.id}-row-${index}`} className="timeline-keyframe-row">
+                      <div className="timeline-keyframe-field">
+                        <label>Time (s)</label>
+                        <input
+                          type="number"
+                          min={0}
+                          max={sliderMax}
+                          step={timeStep}
+                          value={Number(timeSeconds.toFixed(3))}
+                          onChange={(event) => {
+                            const nextTime = Number(event.target.value);
+                            if (Number.isFinite(nextTime)) {
+                              onKeyframeTimeChange(lane.id, index, nextTime);
+                            }
+                          }}
+                        />
+                      </div>
+                      <div className="timeline-keyframe-field">
+                        <label>Value</label>
+                        {renderValueInput()}
+                      </div>
+                      <button
+                        type="button"
+                        className="timeline-editor__button timeline-editor__button--danger"
+                        onClick={() => onKeyframeRemove(lane.id, index)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })
+      )}
     </div>
   );
 }

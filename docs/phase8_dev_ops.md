@@ -39,6 +39,31 @@ This guide captures the Phase 8 deliverables: a precise data-flow walkthrough,
 
 ---
 
+## Early Vision Analyzer
+
+- **Diagnostics toggles** – three new controls live under _Early vision analyzer_ in the Diagnostics panel:
+  - _Retina edge map_ (Difference-of-Gaussians) highlights center–surround edge contrast.
+  - _Orientation map_ bins dominant gradients into colour-coded orientation channels.
+  - _Motion highlight_ compares the current frame against the tracer buffer to flag per-pixel motion energy.
+- **Playback controls**
+  - `Overlay opacity` blends analysis colours with the base render.
+  - `DoG sigma / ratio / gain / downsample` tune the retinal receptive-field approximation; bump `downsample` or `Analysis frame skip` when profiling on low-power devices.
+  - `Orientation count / gain / sharpness` set the V1 bank granularity and filter response curve.
+  - `Motion gain` controls the fade-out threshold for the frame differencer.
+  - `Overlay view` toggles between blended and analysis-only display modes (use the latter for documentation screenshots).
+- **Exports**
+  - _Download overlay PNG_ captures the analyser texture (`state.textures.analysis`) at the current canvas resolution.
+  - _Export analyser metrics_ writes a JSON blob containing `texture.earlyVision` statistics (DoG mean/std, orientation dispersion, divisive normalization) plus the active analyser configuration.
+  - For automation, wire the JSON into your existing Phase 6 regression dashboards; the payload format mirrors `RainbowFrameMetrics.texture.earlyVision`.
+- **Example workflow**
+  1. Load the synthetic preset **Concentric Circles** from the Synthetic deck.
+  2. Enable _Retina edge map_ and _Orientation map_; set `Orientation count = 6` to capture the alternating spokes around the centre.
+  3. Increase `Motion gain` to `8` and apply a slow timeline sweep—the motion overlay traces the radial expansion.
+  4. Export both the PNG and metrics JSON; attach them to experiment notes or share via Slack along with `earlyVision` config values.
+- **Note** – the overlay texture persists between updates; reduce the sampling cost by raising `Analysis frame skip` while keeping the last computed overlay on screen.
+
+---
+
 ## DMT & Arousal Tuning Playbook
 
 1. **Establish a baseline**

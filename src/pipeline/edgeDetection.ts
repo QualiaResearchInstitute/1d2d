@@ -1,4 +1,4 @@
-import { makeResolution, type RimField } from '../fields/contracts';
+import { makeResolution, type RimField } from '../fields/contracts.js';
 
 export type ImageBuffer = {
   data: Uint8ClampedArray;

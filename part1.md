@@ -484,7 +484,7 @@ const ca = Math.cos(alphaKur), sa = Math.sin(alphaKur);
 const H1r = ca*Hr + sa*Hi, H1i = -sa*Hr + ca*Hi;
 // e^{iα} (Z^2 H*)
 const Hc_r = Hr, Hc_i = -Hi; // conjugate
-const T_r = Z2r*Hc*r - Z2i*Hc_i, T_i = Z2r*Hc_i + Z2i*Hc_r; // Z^2 H*
+const T_r = Z2r*Hc*r - Z2i*Hc*i, T_i = Z2r*Hc_i + Z2i*Hc_r; // Z^2 H*
 const H2r = ca*T_r - sa*T_i, H2i = sa*T_r + ca*T_i;
 const dZr = -gammaKur*Zre + ( -omega0*Zim ) + 0.5*K0*( H1r - H2r );
 const dZi = -gammaKur*Zim + ( omega0*Zre ) + 0.5*K0*( H1i - H2i );
@@ -507,7 +507,7 @@ for (let x=0;x<w;x++){
 const i = idx2(x,y), iL = idx2(wrapX(x-1),y), iR = idx2(wrapX(x+1),y), iU = idx2(x,wrapY(y-1)), iD = idx2(x,wrapY(y+1));
 const tC = theta(i), tL = theta(iL), tR = theta(iR), tU = theta(iU), tD = theta(iD);
 gx[i] = 0.5 * ( wrapAngle(tR - tL) );
-gy[i] = 0.5 _ ( wrapAngle(tD - tU) );
+gy[i] = 0.5 * ( wrapAngle(tD - tU) );
 const mag = Math.hypot(Zr[i], Zi[i]); coh[i] = Math.max(0, Math.min(1, mag));
 }
 }
@@ -544,7 +544,7 @@ const ca = Math.cos(alphaKur), sa = Math.sin(alphaKur);
 // e^{-iα}H
 const H1r = ca*Hr + sa*Hi, H1i = -sa*Hr + ca*Hi;
 // e^{iα} (Z^2 H*)
-const Hc_r = Hr, Hc_i = -Hi; // conjugate
+const Hc*r = Hr, Hc_i = -Hi; // conjugate
 const T_r = Z2r*Hc_r - Z2i*Hc_i, T_i = Z2r*Hc_i + Z2i*Hc_r; // Z^2 H*
 const H2r = ca*T_r - sa*T_i, H2i = sa*T_r + ca*T_i;
 const dZr = -gammaKur*Zre + ( -omega0*Zim ) + 0.5*K0*( H1r - H2r );
@@ -589,7 +589,7 @@ return { x, y };
 }
 function wallpaperAt(xp: number, yp: number, cosA: Float32Array, sinA: Float32Array, ke: KernelSpec, tSeconds: number) {
 // uniform (unweighted) plane-wave sum → gradient only (gx, gy)
-const N = cosA.length; const twoPI = Math.PI _ 2;
+const N = cosA.length; const twoPI = Math.PI * 2;
 let gx = 0, gy = 0;
 for (let j=0;j<N;j++) {
 const phi = ke.chirality _ (j _ Math.PI / N) + (alive ? 0.2 _ Math.sin(twoPI _ 0.3 _ tSeconds + j) : 0);

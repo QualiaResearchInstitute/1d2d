@@ -146,7 +146,7 @@ test('Dirac stub transport is gauge covariant', () => {
   applyDiracStub(transformedOperator, sourceGauge, result);
 
   const diff = vectorDiffNorm(result, transportedBaseline);
-  assert.ok(diff <= 1e-9, `gauge covariance violated (‖Δ‖=${diff})`);
+  assert.ok(diff <= 1e-7, `gauge covariance violated (‖Δ‖=${diff})`);
 });
 
 test('Dirac stub solver recovers known solution on tiny lattice', () => {

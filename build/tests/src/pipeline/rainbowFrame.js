@@ -397,6 +397,190 @@ const finalizeBranchAttentionSummary = (branches, kind) => {
         entries,
     };
 };
+const computeQualiaMetrics = (input) => {
+    const { pixels, width, height, rimMagnitude, edgeThreshold, motion, orderParameter, wallpapericity, } = input;
+    if (width <= 0 || height <= 0 || pixels.length < width * height * 4) {
+        const orderCoherence = clamp01(orderParameter);
+        return {
+            symmetry: 0,
+            symmetryHorizontal: 1,
+            symmetryVertical: 1,
+            symmetryRadial: 1,
+            edgeDensity: 0,
+            colorfulness: 0,
+            spectralEntropy: 0,
+            motionCoherence: 0,
+            orderCoherence,
+            indraIndex: orderCoherence,
+        };
+    }
+    const strideX = Math.max(1, Math.floor(width / 180));
+    const strideY = Math.max(1, Math.floor(height / 180));
+    const halfWidth = Math.floor(width / 2);
+    const halfHeight = Math.floor(height / 2);
+    const colorDiff = (aIdx, bIdx) => {
+        const dr = Math.abs(pixels[aIdx] - pixels[bIdx]) / 255;
+        const dg = Math.abs(pixels[aIdx + 1] - pixels[bIdx + 1]) / 255;
+        const db = Math.abs(pixels[aIdx + 2] - pixels[bIdx + 2]) / 255;
+        return (dr + dg + db) / 3;
+    };
+    let horizDiff = 0;
+    let horizSamples = 0;
+    if (halfWidth > 0) {
+        for (let y = 0; y < height; y += strideY) {
+            const rowOffset = y * width;
+            for (let x = 0; x < halfWidth; x += strideX) {
+                const idxA = (rowOffset + x) * 4;
+                const idxB = (rowOffset + (width - 1 - x)) * 4;
+                horizDiff += colorDiff(idxA, idxB);
+                horizSamples++;
+            }
+        }
+    }
+    let vertDiff = 0;
+    let vertSamples = 0;
+    if (halfHeight > 0) {
+        for (let y = 0; y < halfHeight; y += strideY) {
+            const rowOffsetA = y * width;
+            const rowOffsetB = (height - 1 - y) * width;
+            for (let x = 0; x < width; x += strideX) {
+                const idxA = (rowOffsetA + x) * 4;
+                const idxB = (rowOffsetB + x) * 4;
+                vertDiff += colorDiff(idxA, idxB);
+                vertSamples++;
+            }
+        }
+    }
+    let radialDiff = 0;
+    let radialSamples = 0;
+    if (halfWidth > 0 && halfHeight > 0) {
+        for (let y = 0; y < halfHeight; y += strideY) {
+            const rowOffsetA = y * width;
+            const rowOffsetB = (height - 1 - y) * width;
+            for (let x = 0; x < halfWidth; x += strideX) {
+                const idxA = (rowOffsetA + x) * 4;
+                const idxB = (rowOffsetB + (width - 1 - x)) * 4;
+                radialDiff += colorDiff(idxA, idxB);
+                radialSamples++;
+            }
+        }
+    }
+    const symmetryHorizontal = horizSamples > 0 ? clamp01(1 - horizDiff / horizSamples) : 1;
+    const symmetryVertical = vertSamples > 0 ? clamp01(1 - vertDiff / vertSamples) : 1;
+    const symmetryRadial = radialSamples > 0 ? clamp01(1 - radialDiff / radialSamples) : 1;
+    let symmetryTotal = 0;
+    let symmetryWeight = 0;
+    if (horizSamples > 0 || halfWidth <= 0) {
+        symmetryTotal += symmetryHorizontal;
+        symmetryWeight += 1;
+    }
+    if (vertSamples > 0 || halfHeight <= 0) {
+        symmetryTotal += symmetryVertical;
+        symmetryWeight += 1;
+    }
+    if (radialSamples > 0 || halfHeight <= 0 || halfWidth <= 0) {
+        symmetryTotal += symmetryRadial;
+        symmetryWeight += 1;
+    }
+    const symmetry = symmetryWeight > 0 ? clamp01(symmetryTotal / symmetryWeight) : 1;
+    const strideXColor = Math.max(1, Math.floor(width / 160));
+    const strideYColor = Math.max(1, Math.floor(height / 160));
+    const histBins = 24;
+    const luminanceHist = new Float32Array(histBins);
+    let colorSamples = 0;
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    let sumR2 = 0;
+    let sumG2 = 0;
+    let sumB2 = 0;
+    for (let y = 0; y < height; y += strideYColor) {
+        const rowOffset = y * width;
+        for (let x = 0; x < width; x += strideXColor) {
+            const idx = (rowOffset + x) * 4;
+            const r = pixels[idx] / 255;
+            const g = pixels[idx + 1] / 255;
+            const b = pixels[idx + 2] / 255;
+            sumR += r;
+            sumG += g;
+            sumB += b;
+            sumR2 += r * r;
+            sumG2 += g * g;
+            sumB2 += b * b;
+            const luminance = clamp01(0.299 * r + 0.587 * g + 0.114 * b);
+            const bin = Math.min(histBins - 1, Math.floor(luminance * histBins));
+            luminanceHist[bin] += 1;
+            colorSamples++;
+        }
+    }
+    let colorfulness = 0;
+    let spectralEntropy = 0;
+    if (colorSamples > 0) {
+        const inv = 1 / colorSamples;
+        const meanR = sumR * inv;
+        const meanG = sumG * inv;
+        const meanB = sumB * inv;
+        const varR = Math.max(0, sumR2 * inv - meanR * meanR);
+        const varG = Math.max(0, sumG2 * inv - meanG * meanG);
+        const varB = Math.max(0, sumB2 * inv - meanB * meanB);
+        const varianceMean = (varR + varG + varB) / 3;
+        colorfulness = clamp01(Math.sqrt(varianceMean) * Math.SQRT2);
+        let entropy = 0;
+        for (let i = 0; i < histBins; i++) {
+            const count = luminanceHist[i];
+            if (count <= 0)
+                continue;
+            const p = count / colorSamples;
+            entropy -= p * Math.log2(p);
+        }
+        const maxEntropy = Math.log2(histBins);
+        spectralEntropy = maxEntropy > 0 ? clamp01(entropy / maxEntropy) : 0;
+    }
+    let edgeDensity = 0;
+    if (rimMagnitude && rimMagnitude.length >= width * height) {
+        const stride = Math.max(1, Math.floor(Math.sqrt(rimMagnitude.length) / 512));
+        let edgeSamples = 0;
+        let edgeHits = 0;
+        const threshold = clamp01(edgeThreshold);
+        for (let i = 0; i < rimMagnitude.length; i += stride) {
+            const value = rimMagnitude[i];
+            if (!Number.isFinite(value))
+                continue;
+            edgeSamples++;
+            if (value >= threshold) {
+                edgeHits++;
+            }
+        }
+        edgeDensity = edgeSamples > 0 ? clamp01(edgeHits / edgeSamples) : 0;
+    }
+    const motionCoherence = motion.branchCount > 0
+        ? clamp01(1 - Math.min(1, motion.phaseShiftStd / Math.PI))
+        : 0;
+    const motionTone = motion.branchCount > 0
+        ? clamp01(0.6 * motionCoherence + 0.4 * clamp01(motion.parallaxAbsMean))
+        : 0;
+    const orderCoherence = clamp01(orderParameter);
+    const wallpapericityNorm = clamp01(wallpapericity);
+    const indraIndex = clamp01(symmetry * 0.28 +
+        orderCoherence * 0.22 +
+        colorfulness * 0.18 +
+        spectralEntropy * 0.12 +
+        edgeDensity * 0.1 +
+        wallpapericityNorm * 0.05 +
+        motionTone * 0.05);
+    return {
+        symmetry,
+        symmetryHorizontal,
+        symmetryVertical,
+        symmetryRadial,
+        edgeDensity,
+        colorfulness,
+        spectralEntropy,
+        motionCoherence,
+        orderCoherence,
+        indraIndex,
+    };
+};
 export const computeHyperbolicFlowScale = (hyperRadius, curvatureStrength) => {
     const strength = clamp01(curvatureStrength);
     if (strength <= 1e-6)
@@ -777,6 +961,18 @@ export const renderRainbowFrame = (input) => {
             parallaxStd: 0,
             parallaxAbsMean: 0,
             source: 'none',
+        },
+        qualia: {
+            symmetry: 0,
+            symmetryHorizontal: 0,
+            symmetryVertical: 0,
+            symmetryRadial: 0,
+            edgeDensity: 0,
+            colorfulness: 0,
+            spectralEntropy: 0,
+            motionCoherence: 0,
+            orderCoherence: 0,
+            indraIndex: 0,
         },
         hopf: {
             lenses: [],
@@ -2176,6 +2372,16 @@ export const renderRainbowFrame = (input) => {
         metrics.su7.normDeltaMax = 0;
         metrics.su7.projectorEnergy = 0;
     }
+    metrics.qualia = computeQualiaMetrics({
+        pixels: out,
+        width,
+        height,
+        rimMagnitude: rimField?.mag ?? null,
+        edgeThreshold,
+        motion: metrics.motionEnergy,
+        orderParameter: metrics.kuramoto.orderParameter.magnitude,
+        wallpapericity: metrics.texture.wallpapericity,
+    });
     if (guardrailOpts.emitGuardrailEvents !== false && autoGainSamples > 0) {
         guardrailEventAccumulator.push({
             kind: 'autoGain',

@@ -2,6 +2,13 @@
 
 This repo now ships a dual-path renderer that keeps the original CPU reference implementation as a debugging baseline while elevating the default path to a WebGL2 pipeline. The notes below capture the architecture, shader math, worker handshakes, and the manual regression steps that gate release sign‑off.
 
+## Phase 2 – Media Input Pipeline Highlights
+
+- **Drag-and-drop ingest**: Images and video dropped into the preset panel are decoded, thumbnailed, and registered as media-source nodes with deterministic scene positions.
+- **GPU-friendly edge/phase derivation**: The new `runMediaPipeline` service computes Sobel edges, derives a phase field, and (optionally) runs a seeded Kuramoto lattice to stay in lockstep with Phase 4 optics work. CPU fallback keeps processing viable when Metal/WebGPU acceleration is unavailable.
+- **Live telemetry**: Each ingest emits timing/metric snapshots (edge counts, coherence averages, determinism checks) that feed the telemetry log and surface in the status bar.
+- **Viewport overlays**: Selecting a media asset reveals source, edge-map, and phase overlays directly atop the viewport, making the cross-domain bridge visible without waiting for later optical stages.
+
 ## Architecture Overview
 
 | Layer                      | CPU reference                                                                       | GPU pipeline                                                                                                                                            |
@@ -104,6 +111,14 @@ Document decisions & deltas in QA sign-off:
 - `src/gpuRenderer.ts` – shaders + texture management (WebGL2).
 - `src/kuramotoWorker.ts` – OA evolution + derived fields in a dedicated thread.
 - `overview.md` – in-depth description of the rim/wallpaper pipeline and controls.
+
+# Phase� 10 Interfaces
+
+- **CLI** – Build with `npm run cli:build` and inspect commands via `npx indra-cli --help`. Supports `manifest`, `apply`, `simulate`, `capture`, and `telemetry` workflows.
+- **REST API** – `node dist-cli/server/index.js` exposes `/render`, `/simulate`, `/capture`, and `/manifest/validate` endpoints for automation.
+- **SDKs** – TypeScript and Python clients live in `sdk/typescript` and `sdk/python` respectively; see `docs/reference/sdk-*.md` for usage.
+- **Documentation** – Comprehensive guides under `docs/manual/` and endpoint references under `docs/reference/`.
+- **Examples** – Starter scripts in `examples/` demonstrate SDK integration and parameter sweeps.
 
 Happy rendering! For further tweaks, the shader uniforms are intentionally kept 1:1 with the CPU code so parity stays tractable. Pull the diagnostic toggles when experimenting—they exist so regression data is always one click away.
 

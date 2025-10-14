@@ -100,7 +100,9 @@ const cloneVector = (vector: ProbeColorVector): ProbeColorVector =>
   ] as ProbeColorVector;
 
 const clampSpan = (span: number | undefined): number => {
-  if (!Number.isFinite(span)) return 1;
+  if (!(typeof span === 'number' && Number.isFinite(span))) {
+    return 1;
+  }
   const magnitude = Math.abs(Math.floor(span));
   return magnitude > 0 ? magnitude : 1;
 };

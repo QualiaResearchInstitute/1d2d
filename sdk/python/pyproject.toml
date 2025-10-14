@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "indra-sdk"
+version = "1.0.0"
+description = "Python client for the Indra Studio local API"
+authors = [{ name = "Indra Lab" }]
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []

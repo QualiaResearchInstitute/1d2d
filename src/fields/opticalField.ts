@@ -1,6 +1,6 @@
 import { makeResolution, type FieldResolution } from './contracts.js';
 
-export const OPTICAL_FIELD_SCHEMA_VERSION = 2 as const;
+export const OPTICAL_FIELD_SCHEMA_VERSION = 3 as const;
 
 export type OpticalSpace = 'screen' | 'pupil' | 'volumeSlice';
 
@@ -13,6 +13,7 @@ export type OpticalFieldMetadata = {
   solver: OpticalSolverId;
   solverInstanceId: string;
   frameId: number;
+  componentCount: number;
   timestamp: number;
   dt: number;
   wavelengthNm: number;
@@ -28,6 +29,12 @@ export type OpticalFieldMetadata = {
   userTags?: Record<string, unknown>;
 };
 
+export type OpticalFieldComponentView = {
+  readonly index: number;
+  readonly real: Float32Array;
+  readonly imag: Float32Array;
+};
+
 export type OpticalFieldAcquireOptions = {
   dt?: number;
   timestamp?: number;
@@ -38,6 +45,7 @@ export type OpticalFieldAcquireOptions = {
   frameId?: number;
   notes?: string;
   userTags?: Record<string, unknown>;
+  componentCount?: number;
 };
 
 export type PhaseAlignmentRequest = {
@@ -64,6 +72,15 @@ const wrapAngle = (theta: number) => {
 
 let nextBufferId = 0;
 
+const ensureFiniteComponentIndex = (index: number, componentCount: number) => {
+  if (!Number.isInteger(index) || index < 0 || index >= componentCount) {
+    throw new Error(
+      `[opticalField] component index ${index} out of range 0..${componentCount - 1}`,
+    );
+  }
+  return index;
+};
+
 export class OpticalFieldFrame {
   readonly id: number;
   readonly resolution: FieldResolution;
@@ -71,23 +88,44 @@ export class OpticalFieldFrame {
   readonly view: Float32Array;
   readonly real: Float32Array;
   readonly imag: Float32Array;
+  readonly componentCount: number;
+  readonly components: readonly OpticalFieldComponentView[];
   private metadata: OpticalFieldMetadata;
   private inUse = false;
 
-  constructor(resolution: FieldResolution, buffer?: ArrayBuffer) {
+  constructor(
+    resolution: FieldResolution,
+    options?: { buffer?: ArrayBuffer; componentCount?: number },
+  ) {
     this.id = nextBufferId++;
     this.resolution = makeResolution(resolution.width, resolution.height);
     const texels = resolution.texels;
-    const bytes = texels * 2 * Float32Array.BYTES_PER_ELEMENT;
-    this.buffer = buffer ?? new ArrayBuffer(bytes);
+    this.componentCount = Math.max(1, options?.componentCount ?? 1);
+    const expectedLength = texels * this.componentCount * 2;
+    const bytes = expectedLength * Float32Array.BYTES_PER_ELEMENT;
+    this.buffer = options?.buffer ?? new ArrayBuffer(bytes);
     this.view = new Float32Array(this.buffer);
-    this.real = this.view.subarray(0, texels);
-    this.imag = this.view.subarray(texels, texels * 2);
+    if (this.view.length !== expectedLength) {
+      throw new Error(
+        `[opticalField] buffer length ${this.view.length} does not match expected ${expectedLength} for ${this.componentCount} components`,
+      );
+    }
+    const componentViews: OpticalFieldComponentView[] = [];
+    for (let componentIndex = 0; componentIndex < this.componentCount; componentIndex++) {
+      const base = componentIndex * texels * 2;
+      const real = this.view.subarray(base, base + texels);
+      const imag = this.view.subarray(base + texels, base + texels * 2);
+      componentViews.push({ index: componentIndex, real, imag });
+    }
+    this.components = componentViews;
+    this.real = componentViews[0]!.real;
+    this.imag = componentViews[0]!.imag;
     this.metadata = {
       schemaVersion: OPTICAL_FIELD_SCHEMA_VERSION,
       solver: 'dispatcher',
       solverInstanceId: 'unassigned',
       frameId: -1,
+      componentCount: this.componentCount,
       timestamp: 0,
       dt: 0,
       wavelengthNm: 550,
@@ -113,6 +151,7 @@ export class OpticalFieldFrame {
   updateMeta(update: Partial<OpticalFieldMetadata>) {
     this.metadata = {
       ...this.metadata,
+      componentCount: update.componentCount ?? this.metadata.componentCount,
       ...update,
       phaseOrigin: update.phaseOrigin ?? this.metadata.phaseOrigin,
       userTags: update.userTags ?? this.metadata.userTags,
@@ -123,21 +162,44 @@ export class OpticalFieldFrame {
     return this.inUse;
   }
 
-  getPhase(index: number): number {
-    return Math.atan2(this.imag[index], this.real[index]);
+  getPhase(index: number, component = 0): number {
+    const target =
+      component === 0
+        ? this
+        : this.getComponentView(ensureFiniteComponentIndex(component, this.componentCount));
+    return Math.atan2(target.imag[index], target.real[index]);
   }
 
-  applyPhaseRotation(delta: number) {
-    const cos = Math.cos(delta);
-    const sin = Math.sin(delta);
-    for (let i = 0; i < this.real.length; i++) {
-      const r = this.real[i];
-      const im = this.imag[i];
-      this.real[i] = r * cos - im * sin;
-      this.imag[i] = r * sin + im * cos;
+  applyPhaseRotation(delta: number, component?: number) {
+    if (delta === 0) return;
+    if (component != null) {
+      const target = this.getComponentView(
+        ensureFiniteComponentIndex(component, this.componentCount),
+      );
+      rotateComponent(target.real, target.imag, delta);
+      return;
+    }
+    for (const { real, imag } of this.components) {
+      rotateComponent(real, imag, delta);
     }
   }
+
+  getComponentView(index: number): OpticalFieldComponentView {
+    const safeIndex = ensureFiniteComponentIndex(index, this.componentCount);
+    return this.components[safeIndex]!;
+  }
 }
+
+const rotateComponent = (real: Float32Array, imag: Float32Array, delta: number) => {
+  const cos = Math.cos(delta);
+  const sin = Math.sin(delta);
+  for (let i = 0; i < real.length; i++) {
+    const r = real[i];
+    const im = imag[i];
+    real[i] = r * cos - im * sin;
+    imag[i] = r * sin + im * cos;
+  }
+};
 
 const defaultTimestamp = () => {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -156,6 +218,7 @@ export type OpticalFieldManagerOptions = {
   defaultWavelengthNm?: number;
   defaultPixelPitchMeters?: number;
   defaultSpace?: OpticalSpace;
+  componentCount?: number;
 };
 
 export class OpticalFieldManager {
@@ -167,6 +230,7 @@ export class OpticalFieldManager {
   private readonly live = new Set<OpticalFieldFrame>();
   private nextFrameId: number;
   private readonly hooks = new Set<PhaseAlignmentHook>();
+  private readonly componentCount: number;
   private readonly defaults: {
     dt: number;
     wavelengthNm: number;
@@ -180,6 +244,7 @@ export class OpticalFieldManager {
     this.resolution = makeResolution(options.resolution.width, options.resolution.height);
     this.capacity = Math.max(1, options.capacity ?? 4);
     this.nextFrameId = options.initialFrameId ?? 0;
+    this.componentCount = Math.max(1, options.componentCount ?? 1);
     this.defaults = {
       dt: options.defaultDt ?? 0,
       wavelengthNm: options.defaultWavelengthNm ?? 550,
@@ -189,9 +254,19 @@ export class OpticalFieldManager {
   }
 
   acquireFrame(options?: OpticalFieldAcquireOptions): OpticalFieldFrame {
+    const requestedComponents = options?.componentCount ?? this.componentCount;
+    if (requestedComponents !== this.componentCount) {
+      throw new Error(
+        `[opticalField] manager configured for ${this.componentCount} components; requested ${requestedComponents}`,
+      );
+    }
     let frame: OpticalFieldFrame | undefined = this.pool.pop();
     if (!frame) {
-      frame = new OpticalFieldFrame(this.resolution);
+      frame = new OpticalFieldFrame(this.resolution, { componentCount: this.componentCount });
+    } else if (frame.componentCount !== this.componentCount) {
+      throw new Error(
+        `[opticalField] pooled frame component count ${frame.componentCount} does not match manager component count ${this.componentCount}`,
+      );
     }
     const meta = this.makeMetadata(options);
     frame.markAcquired(meta);
@@ -256,6 +331,7 @@ export class OpticalFieldManager {
     const meta = {
       ...this.makeMetadata(options, prev),
       frameId,
+      componentCount: frame.componentCount,
       timestamp: options?.timestamp ?? defaultTimestamp(),
       dt: options?.dt ?? prev.dt ?? this.defaults.dt,
       wavelengthNm: options?.wavelengthNm ?? prev.wavelengthNm ?? this.defaults.wavelengthNm,
@@ -286,6 +362,10 @@ export class OpticalFieldManager {
     return this.resolution;
   }
 
+  getComponentCount(): number {
+    return this.componentCount;
+  }
+
   getLatestFrameId(): number {
     return this.nextFrameId - 1;
   }
@@ -312,6 +392,7 @@ export class OpticalFieldManager {
       solver: this.solver,
       solverInstanceId: this.solverInstanceId,
       frameId: options?.frameId ?? prev?.frameId ?? -1,
+      componentCount: options?.componentCount ?? prev?.componentCount ?? this.componentCount,
       timestamp: options?.timestamp ?? prev?.timestamp ?? 0,
       dt: options?.dt ?? prev?.dt ?? this.defaults.dt,
       wavelengthNm: options?.wavelengthNm ?? prev?.wavelengthNm ?? this.defaults.wavelengthNm,

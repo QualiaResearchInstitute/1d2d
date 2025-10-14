@@ -47,6 +47,7 @@ test('Kuramoto and angular-spectrum phases agree after alignment', () => {
         wavelengthNm: 550,
         pixelPitchMeters: 1e-6,
         dzMeters: 0.004,
+        componentCount: kurState.field.componentCount,
     });
     const angularFrame = solver.propagate(kurState.field, { dzMeters: 0.004, timestamp: 0.25 });
     solver.alignPhase(angularFrame, 0, kurState.field.getPhase(0));
@@ -57,6 +58,8 @@ test('Kuramoto and angular-spectrum phases agree after alignment', () => {
         height,
         manager: solver.getManager(),
         field: angularFrame,
+        componentCount: angularFrame.componentCount,
+        components: angularFrame.components,
         Zr: angularFrame.real,
         Zi: angularFrame.imag,
         telemetry: angularTelemetry,

@@ -1264,6 +1264,204 @@ void main() {
 }
 `;
 
+const ANALYSIS_FRAGMENT_SRC = `#version 300 es
+precision highp float;
+
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform sampler2D uCompositeTex;
+uniform sampler2D uTracerPrevTex;
+uniform vec2 uResolution;
+
+uniform int uEarlyVisionDoGEnabled;
+uniform int uEarlyVisionOrientationEnabled;
+uniform int uEarlyVisionMotionEnabled;
+uniform float uEarlyVisionDoGSigma;
+uniform float uEarlyVisionDoGRatio;
+uniform float uEarlyVisionDoGGain;
+uniform float uEarlyVisionDownsample;
+uniform float uEarlyVisionOrientationGain;
+uniform float uEarlyVisionOrientationSharpness;
+uniform float uEarlyVisionMotionGain;
+uniform int uEarlyVisionOrientationCount;
+uniform float uEarlyVisionOrientationCos[8];
+uniform float uEarlyVisionOrientationSin[8];
+
+const vec3 LUMA_WEIGHTS = vec3(0.2126, 0.7152, 0.0722);
+const int EARLY_VISION_RADIUS = 3;
+
+float clamp01(float v) {
+  return clamp(v, 0.0, 1.0);
+}
+
+vec3 orientationToColor(float angle) {
+  float cosA = cos(angle);
+  float cosB = cos(angle - 2.094395102f);
+  float cosC = cos(angle + 2.094395102f);
+  return vec3(
+    clamp01(0.5 + 0.5 * cosA),
+    clamp01(0.5 + 0.5 * cosB),
+    clamp01(0.5 + 0.5 * cosC)
+  );
+}
+
+float computeLuma(vec3 rgb) {
+  return dot(rgb, LUMA_WEIGHTS);
+}
+
+vec2 clampUv(vec2 uv) {
+  return clamp(uv, vec2(0.0), vec2(0.999999));
+}
+
+void main() {
+  vec3 baseRgb = texture(uCompositeTex, clampUv(vUv)).rgb;
+  vec3 prevRgb = texture(uTracerPrevTex, clampUv(vUv)).rgb;
+  int enabledFlags = uEarlyVisionDoGEnabled + uEarlyVisionOrientationEnabled + uEarlyVisionMotionEnabled;
+  if (enabledFlags == 0) {
+    fragColor = vec4(0.0, 0.0, 0.0, 0.0);
+    return;
+  }
+
+  vec3 overlayAccum = vec3(0.0);
+  float overlayWeight = 0.0;
+
+  vec2 resolutionSafe = max(uResolution, vec2(1.0));
+  vec2 texel = vec2(1.0) / resolutionSafe;
+  float sigmaPx = max(uEarlyVisionDoGSigma, 0.15);
+  float ratio = max(uEarlyVisionDoGRatio, 1.05);
+  float downsample = max(uEarlyVisionDownsample, 1.0);
+
+  if (uEarlyVisionDoGEnabled == 1) {
+    float sumA = 0.0;
+    float sumB = 0.0;
+    float weightA = 0.0;
+    float weightB = 0.0;
+    for (int oy = -EARLY_VISION_RADIUS; oy <= EARLY_VISION_RADIUS; ++oy) {
+      for (int ox = -EARLY_VISION_RADIUS; ox <= EARLY_VISION_RADIUS; ++ox) {
+        vec2 offsetPx = vec2(float(ox), float(oy)) * downsample;
+        vec2 sampleUv = clampUv(vUv + offsetPx * texel);
+        float intensity = computeLuma(texture(uCompositeTex, sampleUv).rgb);
+        float dist2 = dot(offsetPx, offsetPx);
+        float wA = exp(-dist2 / (2.0 * sigmaPx * sigmaPx + 1e-6));
+        float sigmaB = sigmaPx * ratio;
+        float wB = exp(-dist2 / (2.0 * sigmaB * sigmaB + 1e-6));
+        sumA += intensity * wA;
+        weightA += wA;
+        sumB += intensity * wB;
+        weightB += wB;
+      }
+    }
+    if (weightA > 1e-5 && weightB > 1e-5) {
+      float blurA = sumA / weightA;
+      float blurB = sumB / weightB;
+      float dog = blurA - blurB;
+      float dogStrength = clamp(abs(dog) * uEarlyVisionDoGGain, 0.0, 1.0);
+      if (dogStrength > 1e-4) {
+        vec3 posColor = vec3(0.95, 0.82, 0.28);
+        vec3 negColor = vec3(0.28, 0.48, 0.95);
+        vec3 dogColor = dog >= 0.0 ? posColor : negColor;
+        overlayAccum += dogColor * dogStrength;
+        overlayWeight += dogStrength;
+      }
+    }
+  }
+
+  vec2 grad = vec2(0.0);
+  if (uEarlyVisionOrientationEnabled == 1) {
+    float right = computeLuma(texture(uCompositeTex, clampUv(vUv + vec2(texel.x, 0.0))).rgb);
+    float left = computeLuma(texture(uCompositeTex, clampUv(vUv - vec2(texel.x, 0.0))).rgb);
+    float up = computeLuma(texture(uCompositeTex, clampUv(vUv - vec2(0.0, texel.y))).rgb);
+    float down = computeLuma(texture(uCompositeTex, clampUv(vUv + vec2(0.0, texel.y))).rgb);
+    grad = vec2((right - left) * 0.5, (down - up) * 0.5);
+  }
+
+  if (uEarlyVisionOrientationEnabled == 1) {
+    float gradMag = length(grad);
+    if (gradMag > 1e-5) {
+      vec2 gradDir = grad / gradMag;
+      int orientCount = clamp(uEarlyVisionOrientationCount, 1, 8);
+      float sharpness = max(uEarlyVisionOrientationSharpness, 0.1);
+      vec3 orientAccum = vec3(0.0);
+      float orientWeight = 0.0;
+      for (int idx = 0; idx < 8; ++idx) {
+        if (idx >= orientCount) {
+          break;
+        }
+        vec2 orient = vec2(uEarlyVisionOrientationCos[idx], uEarlyVisionOrientationSin[idx]);
+        float response = abs(dot(gradDir, orient));
+        float weight = pow(response, sharpness);
+        if (weight <= 1e-4) {
+          continue;
+        }
+        float angle = atan(orient.y, orient.x);
+        vec3 orientColor = orientationToColor(angle);
+        orientAccum += orientColor * weight;
+        orientWeight += weight;
+      }
+      if (orientWeight > 1e-5) {
+        vec3 orientColor = orientAccum / orientWeight;
+        float orientStrength = clamp(gradMag * uEarlyVisionOrientationGain, 0.0, 1.0);
+        orientStrength *= clamp(orientWeight, 0.0, 1.0);
+        if (orientStrength > 1e-4) {
+          overlayAccum += orientColor * orientStrength;
+          overlayWeight += orientStrength;
+        }
+      }
+    }
+  }
+
+  if (uEarlyVisionMotionEnabled == 1) {
+    float motionVal = length(baseRgb - prevRgb);
+    float motionStrength = clamp(motionVal * uEarlyVisionMotionGain, 0.0, 1.0);
+    if (motionStrength > 1e-4) {
+      vec3 motionColor = vec3(0.95, 0.45, 0.12) + vec3(0.05, 0.3, 0.6) * clamp(motionVal * 3.0, 0.0, 1.0);
+      motionColor = clamp(motionColor, vec3(0.0), vec3(1.0));
+      overlayAccum += motionColor * motionStrength;
+      overlayWeight += motionStrength;
+    }
+  }
+
+  if (overlayWeight <= 1e-5) {
+    fragColor = vec4(0.0, 0.0, 0.0, 0.0);
+  } else {
+    float alpha = clamp(overlayWeight, 0.0, 1.0);
+    vec3 overlayColor = clamp(overlayAccum / overlayWeight, vec3(0.0), vec3(1.0));
+    fragColor = vec4(overlayColor, alpha);
+  }
+}
+`;
+
+const DISPLAY_FRAGMENT_SRC = `#version 300 es
+precision highp float;
+
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform sampler2D uCompositeTex;
+uniform sampler2D uOverlayTex;
+uniform float uOverlayOpacity;
+uniform int uOverlayEnabled;
+uniform int uOverlayMode;
+
+void main() {
+  vec3 baseRgb = texture(uCompositeTex, clamp(vUv, vec2(0.0), vec2(0.999999))).rgb;
+  if (uOverlayEnabled == 0) {
+    fragColor = vec4(baseRgb, 1.0);
+    return;
+  }
+  vec4 overlay = texture(uOverlayTex, clamp(vUv, vec2(0.0), vec2(0.999999)));
+  vec3 overlayColor = clamp(overlay.rgb, vec3(0.0), vec3(1.0));
+  float alpha = clamp(overlay.a * uOverlayOpacity, 0.0, 1.0);
+  if (uOverlayMode == 1) {
+    fragColor = vec4(overlayColor, 1.0);
+    return;
+  }
+  vec3 result = mix(baseRgb, overlayColor, alpha);
+  fragColor = vec4(result, 1.0);
+}
+`;
+
 export type OrientationUniforms = {
   cos: Float32Array;
   sin: Float32Array;
@@ -1335,6 +1533,27 @@ export type Su7TexturePayload = {
   pretransformed?: boolean;
 };
 
+export type EarlyVisionUniforms = {
+  dogEnabled: boolean;
+  orientationEnabled: boolean;
+  motionEnabled: boolean;
+  opacity: number;
+  dogSigma: number;
+  dogRatio: number;
+  dogGain: number;
+  downsample: number;
+  orientationGain: number;
+  orientationSharpness: number;
+  orientationCount: number;
+  orientationCos: Float32Array;
+  orientationSin: Float32Array;
+  motionGain: number;
+  frameModulo: number;
+  frameIndex: number;
+  forceUpdate: boolean;
+  viewMode: 'blend' | 'overlay';
+};
+
 export type RenderUniforms = {
   time: number;
   edgeThreshold: number;
@@ -1375,6 +1594,7 @@ export type RenderUniforms = {
   composerBlendGain: [number, number];
   tracer: TracerUniforms;
   su7: Su7Uniforms;
+  earlyVision: EarlyVisionUniforms;
 };
 
 export type RenderInputs = {
@@ -1556,6 +1776,7 @@ export type GpuRenderer = {
   getHyperbolicAtlas(): HyperbolicAtlasGpuPackage | null;
   render(options: RenderOptions): void;
   readPixels(target: Uint8Array): void;
+  readEarlyVisionOverlay(target: Uint8Array): boolean;
   dispose(): void;
   runQcdHeatbathSweep?(options: QcdGpuSweepOptions): Promise<boolean>;
 };
@@ -1573,6 +1794,8 @@ const quadBufferData = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 
 
 export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
   const program = createProgram(gl, VERTEX_SRC, FRAGMENT_SRC);
+  const analysisProgram = createProgram(gl, VERTEX_SRC, ANALYSIS_FRAGMENT_SRC);
+  const displayProgram = createProgram(gl, VERTEX_SRC, DISPLAY_FRAGMENT_SRC);
   const attribLoc = gl.getAttribLocation(program, 'aPosition');
 
   const vao = gl.createVertexArray();
@@ -1589,6 +1812,8 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
   gl.bindVertexArray(null);
 
   const uniforms = locateUniforms(gl, program);
+  const analysisUniforms = locateAnalysisUniforms(gl, analysisProgram);
+  const displayUniforms = locateDisplayUniforms(gl, displayProgram);
   const zeroSu7ProjectorMatrix = new Float32Array(21);
   const hopfAxesScratch = new Int32Array(6);
   const hopfMixScratch = new Float32Array(6);
@@ -1669,8 +1894,14 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     internalFormat: gl.RGBA32F,
     type: gl.FLOAT,
   });
+  const analysisTex = createTexture(gl, {
+    format: gl.RGBA,
+    internalFormat: gl.RGBA8,
+    type: gl.UNSIGNED_BYTE,
+  });
   const tracerFramebuffer = gl.createFramebuffer();
-  if (!tracerFramebuffer) {
+  const analysisFramebuffer = gl.createFramebuffer();
+  if (!tracerFramebuffer || !analysisFramebuffer) {
     throw new Error('Failed to allocate tracer framebuffer');
   }
 
@@ -1678,6 +1909,8 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     width: 1,
     height: 1,
     program,
+    analysisProgram,
+    displayProgram,
     vao,
     textures: {
       base: baseTex,
@@ -1687,6 +1920,7 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       volume: volumeTex,
       tracer: [tracerTexA, tracerTexB] as [TextureInfo, TextureInfo],
       composite: tracerColorTex,
+      analysis: analysisTex,
       atlasSample: atlasSampleTex,
       atlasJacobian: atlasJacobianTex,
       su7: [su7Tex0, su7Tex1, su7Tex2, su7Tex3] as [
@@ -1699,17 +1933,27 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     },
     framebuffers: {
       tracer: tracerFramebuffer,
+      analysis: analysisFramebuffer,
     },
     tracerState: {
       readIndex: 0,
       needsClear: true,
     },
+    analysisState: {
+      needsClear: true,
+      valid: false,
+    },
     gl,
+    uniforms,
+    analysisUniforms,
+    displayUniforms,
   };
 
   const opsUniform = new Float32Array(32);
   const orientCosBuffer = new Float32Array(8);
   const orientSinBuffer = new Float32Array(8);
+  const earlyVisionOrientCosBuffer = new Float32Array(8);
+  const earlyVisionOrientSinBuffer = new Float32Array(8);
   let edgeBuffer: Float32Array | null = null;
   let phaseBuffer: Float32Array | null = null;
   let ampBuffer: Float32Array | null = null;
@@ -1751,7 +1995,7 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     }
     qcdContextPromise = (async () => {
       try {
-        const gpuNavigator = navigator as { gpu: any };
+        const gpuNavigator = navigator as unknown as { gpu: any };
         const adapter = await gpuNavigator.gpu.requestAdapter?.();
         if (!adapter) {
           return null;
@@ -1822,7 +2066,7 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     height: number,
     seed: number,
     scopeHash: number,
-  ): { keyLo: number; keyHi: number } | null => {
+  ): { lo: number; hi: number } | null => {
     const signature = `${width}x${height}:${toUint32(seed)}:${scopeHash >>> 0}`;
     if (ctx.seedTexture && ctx.seedSignature === signature && ctx.seedKey) {
       return ctx.seedKey;
@@ -1881,17 +2125,22 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       ensureTextureStorage(gl, state.textures.tracer[0], width, height);
       ensureTextureStorage(gl, state.textures.tracer[1], width, height);
       ensureTextureStorage(gl, state.textures.composite, width, height);
+      ensureTextureStorage(gl, state.textures.analysis, width, height);
       ensureTextureStorage(gl, state.textures.su7[0], width, height);
       ensureTextureStorage(gl, state.textures.su7[1], width, height);
       ensureTextureStorage(gl, state.textures.su7[2], width, height);
       ensureTextureStorage(gl, state.textures.su7[3], width, height);
       state.tracerState.readIndex = 0;
       state.tracerState.needsClear = true;
+      state.analysisState.needsClear = true;
+      state.analysisState.valid = false;
       atlasDirty = atlasState !== null;
       su7State = null;
     },
     uploadBase(image) {
       uploadImageData(gl, state.textures.base.texture, image);
+      state.analysisState.needsClear = true;
+      state.analysisState.valid = false;
     },
     uploadRim(field) {
       const total = state.width * state.height;
@@ -2112,10 +2361,13 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       ensureTextureStorage(gl, state.textures.tracer[0], state.width, state.height);
       ensureTextureStorage(gl, state.textures.tracer[1], state.width, state.height);
       ensureTextureStorage(gl, state.textures.composite, state.width, state.height);
+      ensureTextureStorage(gl, state.textures.analysis, state.width, state.height);
       if (state.tracerState.needsClear || options.tracer.reset) {
         clearTexture(gl, state.framebuffers.tracer, state.textures.tracer[0]);
         clearTexture(gl, state.framebuffers.tracer, state.textures.tracer[1]);
         clearTexture(gl, state.framebuffers.tracer, state.textures.composite);
+        state.analysisState.needsClear = true;
+        state.analysisState.valid = false;
         state.tracerState.readIndex = 0;
         state.tracerState.needsClear = false;
       }
@@ -2397,22 +2649,97 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.drawArrays(gl.TRIANGLES, 0, 6);
       gl.bindVertexArray(null);
 
-      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, state.framebuffers.tracer);
-      gl.readBuffer(gl.COLOR_ATTACHMENT0);
-      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
-      gl.blitFramebuffer(
-        0,
-        0,
-        state.width,
-        state.height,
-        0,
-        0,
-        state.width,
-        state.height,
-        gl.COLOR_BUFFER_BIT,
-        gl.LINEAR,
-      );
-      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+      const earlyVision = options.earlyVision;
+      const earlyVisionActive =
+        earlyVision.dogEnabled || earlyVision.orientationEnabled || earlyVision.motionEnabled;
+      if (!earlyVisionActive) {
+        state.analysisState.valid = false;
+        state.analysisState.needsClear = true;
+      }
+
+      let overlayEnabled = false;
+      if (earlyVisionActive) {
+        if (state.analysisState.needsClear) {
+          clearTexture(gl, state.framebuffers.analysis, state.textures.analysis);
+          state.analysisState.needsClear = false;
+          state.analysisState.valid = false;
+        }
+        const frameModulo = Math.max(1, Math.trunc(earlyVision.frameModulo));
+        const frameIndex = Math.max(0, Math.trunc(earlyVision.frameIndex));
+        const forceUpdate = earlyVision.forceUpdate || !state.analysisState.valid;
+        const shouldUpdate = forceUpdate || frameModulo <= 1 || frameIndex % frameModulo === 0;
+        if (shouldUpdate) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, state.framebuffers.analysis);
+          gl.framebufferTexture2D(
+            gl.FRAMEBUFFER,
+            gl.COLOR_ATTACHMENT0,
+            gl.TEXTURE_2D,
+            state.textures.analysis.texture,
+            0,
+          );
+          gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+          const analysisStatus = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+          if (analysisStatus !== gl.FRAMEBUFFER_COMPLETE) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            throw new Error(
+              `[gpuRenderer] analysis framebuffer incomplete: 0x${analysisStatus.toString(16)}`,
+            );
+          }
+          gl.viewport(0, 0, state.width, state.height);
+          gl.useProgram(analysisProgram);
+          bindTexture(gl, state.textures.composite.texture, 0, analysisUniforms.compositeTex);
+          bindTexture(gl, tracerRead.texture, 1, analysisUniforms.tracerPrevTex);
+          gl.uniform2f(analysisUniforms.resolution, state.width, state.height);
+          gl.uniform1i(analysisUniforms.dogEnabled, earlyVision.dogEnabled ? 1 : 0);
+          gl.uniform1i(analysisUniforms.orientationEnabled, earlyVision.orientationEnabled ? 1 : 0);
+          gl.uniform1i(analysisUniforms.motionEnabled, earlyVision.motionEnabled ? 1 : 0);
+          gl.uniform1f(analysisUniforms.dogSigma, earlyVision.dogSigma);
+          gl.uniform1f(analysisUniforms.dogRatio, earlyVision.dogRatio);
+          gl.uniform1f(analysisUniforms.dogGain, earlyVision.dogGain);
+          gl.uniform1f(analysisUniforms.downsample, earlyVision.downsample);
+          gl.uniform1f(analysisUniforms.orientationGain, earlyVision.orientationGain);
+          gl.uniform1f(analysisUniforms.orientationSharpness, earlyVision.orientationSharpness);
+          gl.uniform1f(analysisUniforms.motionGain, earlyVision.motionGain);
+          const orientCount = Math.min(8, Math.max(0, earlyVision.orientationCount));
+          earlyVisionOrientCosBuffer.fill(0);
+          earlyVisionOrientSinBuffer.fill(0);
+          earlyVisionOrientCosBuffer.set(
+            earlyVision.orientationCos.subarray(
+              0,
+              Math.min(orientCount, earlyVision.orientationCos.length),
+            ),
+          );
+          earlyVisionOrientSinBuffer.set(
+            earlyVision.orientationSin.subarray(
+              0,
+              Math.min(orientCount, earlyVision.orientationSin.length),
+            ),
+          );
+          gl.uniform1i(analysisUniforms.orientationCount, orientCount);
+          gl.uniform1fv(analysisUniforms.orientationCos, earlyVisionOrientCosBuffer);
+          gl.uniform1fv(analysisUniforms.orientationSin, earlyVisionOrientSinBuffer);
+          gl.bindVertexArray(vao);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+          gl.bindVertexArray(null);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, state.framebuffers.analysis);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          state.analysisState.valid = true;
+        }
+        overlayEnabled = state.analysisState.valid;
+      }
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, state.width, state.height);
+      gl.useProgram(displayProgram);
+      bindTexture(gl, state.textures.composite.texture, 0, displayUniforms.compositeTex);
+      bindTexture(gl, state.textures.analysis.texture, 1, displayUniforms.overlayTex);
+      gl.uniform1f(displayUniforms.overlayOpacity, earlyVision.opacity);
+      gl.uniform1i(displayUniforms.overlayEnabled, overlayEnabled ? 1 : 0);
+      gl.uniform1i(displayUniforms.overlayMode, earlyVision.viewMode === 'overlay' ? 1 : 0);
+      gl.bindVertexArray(vao);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      gl.bindVertexArray(null);
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, state.framebuffers.tracer);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
@@ -2427,6 +2754,35 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
         throw new Error('readPixels target buffer too small');
       }
       gl.readPixels(0, 0, state.width, state.height, gl.RGBA, gl.UNSIGNED_BYTE, target);
+    },
+    readEarlyVisionOverlay(target) {
+      if (target.length < state.width * state.height * 4) {
+        throw new Error('readEarlyVisionOverlay target buffer too small');
+      }
+      if (
+        state.textures.analysis.width !== state.width ||
+        state.textures.analysis.height !== state.height
+      ) {
+        return false;
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, state.framebuffers.analysis);
+      gl.framebufferTexture2D(
+        gl.FRAMEBUFFER,
+        gl.COLOR_ATTACHMENT0,
+        gl.TEXTURE_2D,
+        state.textures.analysis.texture,
+        0,
+      );
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return false;
+      }
+      gl.readPixels(0, 0, state.width, state.height, gl.RGBA, gl.UNSIGNED_BYTE, target);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, null, 0);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return true;
     },
     async runQcdHeatbathSweep(options) {
       try {
@@ -2557,13 +2913,12 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
         await ctx.device.queue.onSubmittedWorkDone();
 
         if (supportsReadBuffer && queueAny.readBuffer) {
-          await queueAny.readBuffer(
-            ctx.latticeBuffer,
-            0,
+          const latticeView = new Uint8Array(
             lattice.buffer,
             lattice.byteOffset,
             lattice.byteLength,
           );
+          await queueAny.readBuffer(ctx.latticeBuffer, 0, latticeView);
         } else if (readbackBuffer) {
           await readbackBuffer.mapAsync(GPU_MAP_MODE.READ);
           const mapped = readbackBuffer.getMappedRange();
@@ -2580,6 +2935,8 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
     },
     dispose() {
       gl.deleteProgram(program);
+      gl.deleteProgram(analysisProgram);
+      gl.deleteProgram(displayProgram);
       gl.deleteVertexArray(vao);
       gl.deleteBuffer(vbo);
       gl.deleteTexture(state.textures.base.texture);
@@ -2590,6 +2947,7 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.deleteTexture(state.textures.tracer[0].texture);
       gl.deleteTexture(state.textures.tracer[1].texture);
       gl.deleteTexture(state.textures.composite.texture);
+      gl.deleteTexture(state.textures.analysis.texture);
       gl.deleteTexture(state.textures.atlasSample.texture);
       gl.deleteTexture(state.textures.atlasJacobian.texture);
       gl.deleteTexture(state.textures.su7[0].texture);
@@ -2598,6 +2956,7 @@ export function createGpuRenderer(gl: WebGL2RenderingContext): GpuRenderer {
       gl.deleteTexture(state.textures.su7[3].texture);
       gl.deleteTexture(state.textures.su7Unitary.texture);
       gl.deleteFramebuffer(state.framebuffers.tracer);
+      gl.deleteFramebuffer(state.framebuffers.analysis);
       hyperbolicAtlasPackage = null;
       atlasState = null;
       atlasDirty = false;
@@ -2868,6 +3227,37 @@ function locateUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
     su7HopfLensCount: getOptionalUniform(gl, program, 'uSu7HopfLensCount'),
     su7HopfLensAxes: getOptionalUniform(gl, program, 'uSu7HopfLensAxes'),
     su7HopfLensMix: getOptionalUniform(gl, program, 'uSu7HopfLensMix'),
+  };
+}
+
+function locateAnalysisUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
+  return {
+    compositeTex: getUniform(gl, program, 'uCompositeTex'),
+    tracerPrevTex: getUniform(gl, program, 'uTracerPrevTex'),
+    resolution: getUniform(gl, program, 'uResolution'),
+    dogEnabled: getUniform(gl, program, 'uEarlyVisionDoGEnabled'),
+    orientationEnabled: getUniform(gl, program, 'uEarlyVisionOrientationEnabled'),
+    motionEnabled: getUniform(gl, program, 'uEarlyVisionMotionEnabled'),
+    dogSigma: getUniform(gl, program, 'uEarlyVisionDoGSigma'),
+    dogRatio: getUniform(gl, program, 'uEarlyVisionDoGRatio'),
+    dogGain: getUniform(gl, program, 'uEarlyVisionDoGGain'),
+    downsample: getUniform(gl, program, 'uEarlyVisionDownsample'),
+    orientationGain: getUniform(gl, program, 'uEarlyVisionOrientationGain'),
+    orientationSharpness: getUniform(gl, program, 'uEarlyVisionOrientationSharpness'),
+    motionGain: getUniform(gl, program, 'uEarlyVisionMotionGain'),
+    orientationCount: getUniform(gl, program, 'uEarlyVisionOrientationCount'),
+    orientationCos: getUniform(gl, program, 'uEarlyVisionOrientationCos'),
+    orientationSin: getUniform(gl, program, 'uEarlyVisionOrientationSin'),
+  };
+}
+
+function locateDisplayUniforms(gl: WebGL2RenderingContext, program: WebGLProgram) {
+  return {
+    compositeTex: getUniform(gl, program, 'uCompositeTex'),
+    overlayTex: getUniform(gl, program, 'uOverlayTex'),
+    overlayOpacity: getUniform(gl, program, 'uOverlayOpacity'),
+    overlayEnabled: getUniform(gl, program, 'uOverlayEnabled'),
+    overlayMode: getUniform(gl, program, 'uOverlayMode'),
   };
 }
 

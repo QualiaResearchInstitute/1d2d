@@ -74,6 +74,113 @@ export const IRRADIANCE_FRAME_SCHEMA_VERSION = 1;
  * amplitude updates run before phase gradients and that any flux phase masks execute first.
  */
 export const THIN_ELEMENT_OPERATOR_ORDER = ['flux', 'amplitude', 'phase'];
+const makeComplex = (re, im) => ({ re, im });
+const sanitizeComplex = (value) => {
+    const re = Number.isFinite(value.re) ? value.re : 0;
+    const im = Number.isFinite(value.im) ? value.im : 0;
+    return { re, im };
+};
+const complexAdd = (a, b) => ({
+    re: a.re + b.re,
+    im: a.im + b.im,
+});
+const complexScale = (a, scalar) => ({
+    re: a.re * scalar,
+    im: a.im * scalar,
+});
+const complexMul = (a, b) => ({
+    re: a.re * b.re - a.im * b.im,
+    im: a.re * b.im + a.im * b.re,
+});
+const complexFromPolar = (magnitude, phase) => ({
+    re: magnitude * Math.cos(phase),
+    im: magnitude * Math.sin(phase),
+});
+const sanitizeMatrix = (matrix) => ({
+    m00: sanitizeComplex(matrix.m00),
+    m01: sanitizeComplex(matrix.m01),
+    m10: sanitizeComplex(matrix.m10),
+    m11: sanitizeComplex(matrix.m11),
+});
+const computeRotationDiagRotation = (orientationRad, diag0, diag1) => {
+    const cos = Math.cos(orientationRad);
+    const sin = Math.sin(orientationRad);
+    const rot = [
+        cos,
+        sin,
+        -sin,
+        cos,
+    ];
+    const rotT = [
+        cos,
+        -sin,
+        sin,
+        cos,
+    ];
+    const dR00 = complexScale(diag0, rot[0]);
+    const dR01 = complexScale(diag0, rot[1]);
+    const dR10 = complexScale(diag1, rot[2]);
+    const dR11 = complexScale(diag1, rot[3]);
+    const m00 = complexAdd(complexScale(dR00, rotT[0]), complexScale(dR10, rotT[1]));
+    const m01 = complexAdd(complexScale(dR01, rotT[0]), complexScale(dR11, rotT[1]));
+    const m10 = complexAdd(complexScale(dR00, rotT[2]), complexScale(dR10, rotT[3]));
+    const m11 = complexAdd(complexScale(dR01, rotT[2]), complexScale(dR11, rotT[3]));
+    return sanitizeMatrix({ m00, m01, m10, m11 });
+};
+const resolvePolarizationMatrix = (spec) => {
+    switch (spec.type) {
+        case 'wavePlate': {
+            const half = 0.5 * spec.phaseDelayRad;
+            const diagFast = complexFromPolar(1, half);
+            const diagSlow = complexFromPolar(1, -half);
+            return computeRotationDiagRotation(spec.orientationRad, diagFast, diagSlow);
+        }
+        case 'polarizer': {
+            const extinction = clamp(spec.extinctionRatio ?? 0, 0, 1);
+            const diagFast = makeComplex(1, 0);
+            const diagSlow = makeComplex(extinction, 0);
+            return computeRotationDiagRotation(spec.orientationRad, diagFast, diagSlow);
+        }
+        case 'matrix':
+            return sanitizeMatrix(spec.matrix);
+        default:
+            return null;
+    }
+};
+const applyPolarizationTransform = (field, spec) => {
+    if (field.componentCount < 2) {
+        return;
+    }
+    const matrix = resolvePolarizationMatrix(spec);
+    if (!matrix) {
+        return;
+    }
+    const comp0 = field.components[0];
+    const comp1 = field.components[1];
+    const len = comp0.real.length;
+    const m00r = matrix.m00.re;
+    const m00i = matrix.m00.im;
+    const m01r = matrix.m01.re;
+    const m01i = matrix.m01.im;
+    const m10r = matrix.m10.re;
+    const m10i = matrix.m10.im;
+    const m11r = matrix.m11.re;
+    const m11i = matrix.m11.im;
+    for (let i = 0; i < len; i++) {
+        const a0r = comp0.real[i];
+        const a0i = comp0.imag[i];
+        const a1r = comp1.real[i];
+        const a1i = comp1.imag[i];
+        const o0r = m00r * a0r - m00i * a0i + m01r * a1r - m01i * a1i;
+        const o0i = m00r * a0i + m00i * a0r + m01r * a1i + m01i * a1r;
+        const o1r = m10r * a0r - m10i * a0i + m11r * a1r - m11i * a1i;
+        const o1i = m10r * a0i + m10i * a0r + m11r * a1i + m11i * a1r;
+        comp0.real[i] = o0r;
+        comp0.imag[i] = o0i;
+        comp1.real[i] = o1r;
+        comp1.imag[i] = o1i;
+    }
+};
 const COUPLING_KERNEL_CACHE = new Map();
 const clampRadius = (value) => Math.max(0, Math.floor(value));
 export const computeCouplingWeight = (distance, params) => {
@@ -162,6 +269,10 @@ const cloneOpticalMeta = (meta) => ({
     phaseOrigin: meta.phaseOrigin ? { ...meta.phaseOrigin } : undefined,
     userTags: meta.userTags ? { ...meta.userTags } : undefined,
 });
+const isOpticalFieldManager = (value) => typeof value === 'object' &&
+    value !== null &&
+    typeof value.acquireFrame === 'function' &&
+    typeof value.getResolution === 'function';
 export const createIrradianceFrameBuffer = (width, height, initialMeta) => {
     const resolution = makeResolution(width, height);
     const texels = resolution.texels;
@@ -235,32 +346,32 @@ const applyFluxPhaseMask = (field, params, gains) => {
     if (fluxX === 0 && fluxY === 0)
         return;
     const { width, height } = field.resolution;
-    const real = field.real;
-    const imag = field.imag;
     const normX = width > 1 ? 1 / (width - 1) : 0;
     const normY = height > 1 ? 1 / (height - 1) : 0;
     const fluxScale = gains.flux;
-    for (let y = 0; y < height; y++) {
-        const ny = height > 1 ? y * normY * 2 - 1 : 0;
-        for (let x = 0; x < width; x++) {
-            const nx = width > 1 ? x * normX * 2 - 1 : 0;
-            const idx = y * width + x;
-            const phaseShift = fluxScale * (fluxX * nx + fluxY * ny);
-            if (phaseShift === 0)
-                continue;
-            const cos = Math.cos(phaseShift);
-            const sin = Math.sin(phaseShift);
-            const zr = real[idx];
-            const zi = imag[idx];
-            real[idx] = zr * cos - zi * sin;
-            imag[idx] = zr * sin + zi * cos;
+    for (const { real, imag } of field.components) {
+        for (let y = 0; y < height; y++) {
+            const ny = height > 1 ? y * normY * 2 - 1 : 0;
+            for (let x = 0; x < width; x++) {
+                const nx = width > 1 ? x * normX * 2 - 1 : 0;
+                const idx = y * width + x;
+                const phaseShift = fluxScale * (fluxX * nx + fluxY * ny);
+                if (phaseShift === 0)
+                    continue;
+                const cos = Math.cos(phaseShift);
+                const sin = Math.sin(phaseShift);
+                const zr = real[idx];
+                const zi = imag[idx];
+                real[idx] = zr * cos - zi * sin;
+                imag[idx] = zr * sin + zi * cos;
+            }
         }
     }
 };
 const createFluxOperator = (field, params, kernel, gains) => {
     const { width, height } = field.resolution;
-    const real = field.real;
-    const imag = field.imag;
+    const components = field.components;
+    const componentCount = components.length;
     const { fluxX = 0, fluxY = 0 } = params;
     const hasFluxX = fluxX !== 0;
     const hasFluxY = fluxY !== 0;
@@ -292,86 +403,96 @@ const createFluxOperator = (field, params, kernel, gains) => {
     const anisBaseline = KERNEL_SPEC_DEFAULT.anisotropy;
     const anisBias = clamp(kernel.anisotropy - anisBaseline, -1, 1);
     const anisScale = 0.6;
+    const couplingScratch = components.map(() => ({ Hr: 0, Hi: 0 }));
     return {
+        componentCount,
         coupling(x, y, idx) {
-            const selfR = real[idx];
-            const selfI = imag[idx];
-            let sumR = selfWeight * selfR;
-            let sumI = selfWeight * selfI;
-            for (let i = 0; i < weights.length; i++) {
-                const baseWeight = weights[i];
-                const orientation = orientations[i];
-                const weight = anisBias === 0 ? baseWeight : baseWeight * (1 + anisScale * anisBias * orientation);
-                let nx = x + offsetsX[i];
-                let ny = y + offsetsY[i];
-                let phaseShift = 0;
-                let wraps = 0;
-                while (nx < 0) {
-                    nx += width;
-                    wraps -= 1;
+            for (let componentIndex = 0; componentIndex < componentCount; componentIndex++) {
+                const { real, imag } = components[componentIndex];
+                const selfR = real[idx];
+                const selfI = imag[idx];
+                let sumR = selfWeight * selfR;
+                let sumI = selfWeight * selfI;
+                for (let i = 0; i < weights.length; i++) {
+                    const baseWeight = weights[i];
+                    const orientation = orientations[i];
+                    const weight = anisBias === 0 ? baseWeight : baseWeight * (1 + anisScale * anisBias * orientation);
+                    let nx = x + offsetsX[i];
+                    let ny = y + offsetsY[i];
+                    let phaseShift = 0;
+                    let wraps = 0;
+                    while (nx < 0) {
+                        nx += width;
+                        wraps -= 1;
+                    }
+                    while (nx >= width) {
+                        nx -= width;
+                        wraps += 1;
+                    }
+                    if (wraps !== 0 && hasFluxX) {
+                        phaseShift += wraps * fluxX;
+                    }
+                    wraps = 0;
+                    while (ny < 0) {
+                        ny += height;
+                        wraps -= 1;
+                    }
+                    while (ny >= height) {
+                        ny -= height;
+                        wraps += 1;
+                    }
+                    if (wraps !== 0 && hasFluxY) {
+                        phaseShift += wraps * fluxY;
+                    }
+                    const neighborIdx = ny * width + nx;
+                    let nr = real[neighborIdx];
+                    let ni = imag[neighborIdx];
+                    if (phaseShift !== 0) {
+                        const cos = Math.cos(phaseShift);
+                        const sin = Math.sin(phaseShift);
+                        const rotR = nr * cos - ni * sin;
+                        const rotI = nr * sin + ni * cos;
+                        nr = rotR;
+                        ni = rotI;
+                    }
+                    sumR += weight * nr;
+                    sumI += weight * ni;
                 }
-                while (nx >= width) {
-                    nx -= width;
-                    wraps += 1;
+                if (smallWorldRewiring && smallWorldFactor !== 0) {
+                    const offset = idx * smallWorldRewiring.degree;
+                    let deltaR = 0;
+                    let deltaI = 0;
+                    for (let edge = 0; edge < smallWorldRewiring.degree; edge++) {
+                        const targetIdx = smallWorldRewiring.targets[offset + edge];
+                        const nr = real[targetIdx];
+                        const ni = imag[targetIdx];
+                        deltaR += nr - selfR;
+                        deltaI += ni - selfI;
+                    }
+                    sumR += smallWorldFactor * deltaR;
+                    sumI += smallWorldFactor * deltaI;
                 }
-                if (wraps !== 0 && hasFluxX) {
-                    phaseShift += wraps * fluxX;
-                }
-                wraps = 0;
-                while (ny < 0) {
-                    ny += height;
-                    wraps -= 1;
-                }
-                while (ny >= height) {
-                    ny -= height;
-                    wraps += 1;
-                }
-                if (wraps !== 0 && hasFluxY) {
-                    phaseShift += wraps * fluxY;
-                }
-                const neighborIdx = ny * width + nx;
-                let nr = real[neighborIdx];
-                let ni = imag[neighborIdx];
-                if (phaseShift !== 0) {
-                    const cos = Math.cos(phaseShift);
-                    const sin = Math.sin(phaseShift);
-                    const rotR = nr * cos - ni * sin;
-                    const rotI = nr * sin + ni * cos;
-                    nr = rotR;
-                    ni = rotI;
-                }
-                sumR += weight * nr;
-                sumI += weight * ni;
+                const coupling = couplingScratch[componentIndex];
+                coupling.Hr = fluxScale * sumR;
+                coupling.Hi = fluxScale * sumI;
             }
-            if (smallWorldRewiring && smallWorldFactor !== 0) {
-                // This executes only when small-world coupling is active. We accumulate the mean
-                // long-range delta to gently bias the oscillator toward (or away from) distant peers.
-                const offset = idx * smallWorldRewiring.degree;
-                let deltaR = 0;
-                let deltaI = 0;
-                for (let edge = 0; edge < smallWorldRewiring.degree; edge++) {
-                    const targetIdx = smallWorldRewiring.targets[offset + edge];
-                    const nr = real[targetIdx];
-                    const ni = imag[targetIdx];
-                    deltaR += nr - selfR;
-                    deltaI += ni - selfI;
-                }
-                sumR += smallWorldFactor * deltaR;
-                sumI += smallWorldFactor * deltaI;
-            }
-            return {
-                Hr: fluxScale * sumR,
-                Hi: fluxScale * sumI,
-            };
+            return couplingScratch;
         },
     };
 };
 const applyAmplitudeOperator = (field, phase, gains) => {
     const { amp, coh } = phase;
-    const { real, imag } = field;
+    const components = field.components;
     const transparencyScale = gains.transparency;
-    for (let i = 0; i < real.length; i++) {
-        const magnitude = Math.hypot(real[i], imag[i]) * gains.amplitude;
+    const texels = field.real.length;
+    for (let i = 0; i < texels; i++) {
+        let ampSq = 0;
+        for (const { real, imag } of components) {
+            const r = real[i];
+            const im = imag[i];
+            ampSq += r * r + im * im;
+        }
+        const magnitude = Math.sqrt(ampSq) * gains.amplitude;
         amp[i] = magnitude;
         coh[i] = clamp01(magnitude * transparencyScale);
     }
@@ -379,8 +500,11 @@ const applyAmplitudeOperator = (field, phase, gains) => {
 const applyPhaseOperator = (field, phase, gains, kernel, scratch) => {
     const { gradX, gradY, vort } = phase;
     const { width, height } = field.resolution;
-    const real = field.real;
-    const imag = field.imag;
+    const primary = field.components[0];
+    if (!primary)
+        return;
+    const real = primary.real;
+    const imag = primary.imag;
     const total = real.length;
     const theta = ensureThetaScratch(scratch, total);
     for (let i = 0; i < total; i++) {
@@ -439,17 +563,22 @@ const executeBeamSplitStep = (step, ctx) => {
         return;
     const resolution = field.resolution;
     const texels = resolution.texels;
-    const accumReal = new Float32Array(texels);
-    const accumImag = new Float32Array(texels);
+    const componentCount = field.componentCount;
+    const accumReal = Array.from({ length: componentCount }, () => new Float32Array(texels));
+    const accumImag = Array.from({ length: componentCount }, () => new Float32Array(texels));
     let weightSum = 0;
     let weightSqSum = 0;
     for (const branch of branches) {
         const weight = branch.weight ?? 1;
         weightSum += weight;
         weightSqSum += weight * weight;
-        const branchFrame = new OpticalFieldFrame(resolution);
-        branchFrame.real.set(field.real);
-        branchFrame.imag.set(field.imag);
+        const branchFrame = new OpticalFieldFrame(resolution, { componentCount });
+        for (let componentIndex = 0; componentIndex < componentCount; componentIndex++) {
+            const source = field.components[componentIndex];
+            const target = branchFrame.components[componentIndex];
+            target.real.set(source.real);
+            target.imag.set(source.imag);
+        }
         const branchCtx = {
             field: branchFrame,
             derived: undefined,
@@ -459,11 +588,15 @@ const executeBeamSplitStep = (step, ctx) => {
             scratch: {},
         };
         executeThinElementSchedule(branch.steps, branchCtx);
-        const branchReal = branchFrame.real;
-        const branchImag = branchFrame.imag;
-        for (let i = 0; i < texels; i++) {
-            accumReal[i] += branchReal[i] * weight;
-            accumImag[i] += branchImag[i] * weight;
+        for (let componentIndex = 0; componentIndex < componentCount; componentIndex++) {
+            const branchReal = branchFrame.components[componentIndex].real;
+            const branchImag = branchFrame.components[componentIndex].imag;
+            const accumR = accumReal[componentIndex];
+            const accumI = accumImag[componentIndex];
+            for (let i = 0; i < texels; i++) {
+                accumR[i] += branchReal[i] * weight;
+                accumI[i] += branchImag[i] * weight;
+            }
         }
     }
     let norm = 1;
@@ -476,25 +609,38 @@ const executeBeamSplitStep = (step, ctx) => {
             if (weightSqSum !== 0)
                 norm = 1 / Math.sqrt(weightSqSum);
             break;
+        case 'priority':
+        case 'max':
+        case 'phase':
         case 'sum':
         default:
             norm = 1;
             break;
     }
-    const real = field.real;
-    const imag = field.imag;
-    for (let i = 0; i < texels; i++) {
-        real[i] = accumReal[i] * norm;
-        imag[i] = accumImag[i] * norm;
+    for (let componentIndex = 0; componentIndex < componentCount; componentIndex++) {
+        const target = field.components[componentIndex];
+        const accumR = accumReal[componentIndex];
+        const accumI = accumImag[componentIndex];
+        for (let i = 0; i < texels; i++) {
+            target.real[i] = accumR[i] * norm;
+            target.imag[i] = accumI[i] * norm;
+        }
     }
 };
 const executeThinElementSchedule = (schedule, ctx) => {
     for (const step of schedule) {
-        if (step.kind === 'operator') {
-            applyOperatorKind(step.operator, ctx);
-        }
-        else if (step.kind === 'beamSplit') {
-            executeBeamSplitStep(step, ctx);
+        switch (step.kind) {
+            case 'operator':
+                applyOperatorKind(step.operator, ctx);
+                break;
+            case 'polarization':
+                applyPolarizationTransform(ctx.field, step.spec);
+                break;
+            case 'beamSplit':
+                executeBeamSplitStep(step, ctx);
+                break;
+            default:
+                break;
         }
     }
 };
@@ -502,23 +648,63 @@ const DEFAULT_PHASE_SCHEDULE = [
     { kind: 'operator', operator: 'amplitude' },
     { kind: 'operator', operator: 'phase' },
 ];
-export const createKuramotoState = (width, height, manager) => {
+export const createWavePlateStep = (phaseDelayRad, orientationRad, label) => ({
+    kind: 'polarization',
+    spec: {
+        type: 'wavePlate',
+        phaseDelayRad,
+        orientationRad,
+    },
+    label,
+});
+export const createPolarizerStep = (orientationRad, extinctionRatio = 0, label) => ({
+    kind: 'polarization',
+    spec: {
+        type: 'polarizer',
+        orientationRad,
+        extinctionRatio,
+    },
+    label,
+});
+export const createPolarizationMatrixStep = (matrix, label) => ({
+    kind: 'polarization',
+    spec: {
+        type: 'matrix',
+        matrix: sanitizeMatrix(matrix),
+    },
+    label,
+});
+export const createKuramotoState = (width, height, managerOrOptions, maybeOptions) => {
     const resolution = makeResolution(width, height);
+    let manager;
+    let options;
+    if (isOpticalFieldManager(managerOrOptions)) {
+        manager = managerOrOptions;
+        options = maybeOptions;
+    }
+    else {
+        options = managerOrOptions ?? maybeOptions;
+    }
+    const requestedComponents = Math.max(1, options?.componentCount ?? manager?.getComponentCount() ?? 1);
     const fieldManager = manager ??
         new OpticalFieldManager({
             solver: 'kuramoto',
             resolution,
             initialFrameId: 0,
+            componentCount: requestedComponents,
         });
-    const frame = fieldManager.acquireFrame();
+    const frame = fieldManager.acquireFrame({ componentCount: requestedComponents });
     const telemetry = createTelemetrySnapshot();
     const initialMeta = frame.getMeta();
     const irradiance = createIrradianceFrameBuffer(width, height, initialMeta);
+    const components = frame.components;
     return {
         width,
         height,
         manager: fieldManager,
         field: frame,
+        componentCount: components.length,
+        components,
         Zr: frame.real,
         Zi: frame.imag,
         telemetry,
@@ -546,13 +732,15 @@ export const createDerivedViews = (buffer, width, height) => {
     };
 };
 export const initKuramotoState = (state, q, phase) => {
-    const { width, height, Zr, Zi } = state;
-    for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-            const theta = (2 * Math.PI * q * x) / width;
-            const idx = y * width + x;
-            Zr[idx] = Math.cos(theta);
-            Zi[idx] = Math.sin(theta);
+    const { width, height, components } = state;
+    for (const { real, imag } of components) {
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const theta = (2 * Math.PI * q * x) / width;
+                const idx = y * width + x;
+                real[idx] = Math.cos(theta);
+                imag[idx] = Math.sin(theta);
+            }
         }
     }
     const meta = state.field.getMeta();
@@ -588,7 +776,7 @@ export const initKuramotoState = (state, q, phase) => {
     }
 };
 export const stepKuramotoState = (state, params, dt, randn, timestamp, options) => {
-    const { width, height, Zr, Zi } = state;
+    const { width, height, components, componentCount } = state;
     const { alphaKur, gammaKur, omega0, K0, epsKur } = params;
     const kernel = options?.kernel ?? KERNEL_SPEC_DEFAULT;
     const gains = computeOperatorGains(kernel, options?.controls);
@@ -626,41 +814,52 @@ export const stepKuramotoState = (state, params, dt, randn, timestamp, options) 
     for (let y = 0; y < height; y++) {
         for (let x = 0; x < width; x++) {
             const idx = y * width + x;
-            const { Hr, Hi } = fluxOperator.coupling(x, y, idx);
-            const Zre = Zr[idx];
-            const Zim = Zi[idx];
-            const Z2r = Zre * Zre - Zim * Zim;
-            const Z2i = 2 * Zre * Zim;
-            const H1r = ca * Hr + sa * Hi;
-            const H1i = -sa * Hr + ca * Hi;
-            const HrConj = Hr;
-            const HiConj = -Hi;
-            const Tr = Z2r * HrConj - Z2i * HiConj;
-            const Ti = Z2r * HiConj + Z2i * HrConj;
-            const H2r = ca * Tr - sa * Ti;
-            const H2i = sa * Tr + ca * Ti;
-            const dZr = -gammaKur * Zre - omega0 * Zim + couplingGain * (H1r - H2r);
-            const dZi = -gammaKur * Zim + omega0 * Zre + couplingGain * (H1i - H2i);
-            const nextR = Zre + dt * dZr + noiseScale * randn();
-            const nextI = Zim + dt * dZi + noiseScale * randn();
-            Zr[idx] = nextR;
-            Zi[idx] = nextI;
-            const ampSq = nextR * nextR + nextI * nextI;
-            energySum += ampSq;
-            energySumSq += ampSq * ampSq;
-            if (ampSq > energyMax)
-                energyMax = ampSq;
-            const amp = Math.sqrt(ampSq);
-            if (amp > 1e-12) {
-                const invAmp = 1 / amp;
-                orderSumR += nextR * invAmp;
-                orderSumI += nextI * invAmp;
-                orderSamples += 1;
+            const couplings = fluxOperator.coupling(x, y, idx);
+            let pixelEnergy = 0;
+            for (let componentIndex = 0; componentIndex < componentCount; componentIndex++) {
+                const view = components[componentIndex];
+                const coupling = couplings[componentIndex] ?? couplings[0];
+                const Hr = coupling.Hr;
+                const Hi = coupling.Hi;
+                const Zre = view.real[idx];
+                const Zim = view.imag[idx];
+                const Z2r = Zre * Zre - Zim * Zim;
+                const Z2i = 2 * Zre * Zim;
+                const H1r = ca * Hr + sa * Hi;
+                const H1i = -sa * Hr + ca * Hi;
+                const HrConj = Hr;
+                const HiConj = -Hi;
+                const Tr = Z2r * HrConj - Z2i * HiConj;
+                const Ti = Z2r * HiConj + Z2i * HrConj;
+                const H2r = ca * Tr - sa * Ti;
+                const H2i = sa * Tr + ca * Ti;
+                const dZr = -gammaKur * Zre - omega0 * Zim + couplingGain * (H1r - H2r);
+                const dZi = -gammaKur * Zim + omega0 * Zre + couplingGain * (H1i - H2i);
+                const noiseR = noiseScale !== 0 ? noiseScale * randn() : 0;
+                const noiseI = noiseScale !== 0 ? noiseScale * randn() : 0;
+                const nextR = Zre + dt * dZr + noiseR;
+                const nextI = Zim + dt * dZi + noiseI;
+                view.real[idx] = nextR;
+                view.imag[idx] = nextI;
+                const ampSq = nextR * nextR + nextI * nextI;
+                pixelEnergy += ampSq;
+                if (componentIndex === 0) {
+                    if (ampSq > 1e-12) {
+                        const invAmp = 1 / Math.sqrt(ampSq);
+                        orderSumR += nextR * invAmp;
+                        orderSumI += nextI * invAmp;
+                        orderSamples += 1;
+                    }
+                }
             }
+            energySum += pixelEnergy;
+            energySumSq += pixelEnergy * pixelEnergy;
+            if (pixelEnergy > energyMax)
+                energyMax = pixelEnergy;
             if (captureIrradiance) {
-                irrL[idx] = ampSq;
-                irrM[idx] = ampSq;
-                irrS[idx] = ampSq;
+                irrL[idx] = pixelEnergy;
+                irrM[idx] = pixelEnergy;
+                irrS[idx] = pixelEnergy;
             }
         }
     }
@@ -760,7 +959,7 @@ export const createNormalGenerator = (seed) => {
     };
 };
 export const snapshotVolumeField = (state) => {
-    const { width, height, Zr, Zi } = state;
+    const { width, height, components } = state;
     const total = width * height;
     const phase = new Float32Array(total);
     const depth = new Float32Array(total);
@@ -770,9 +969,16 @@ export const snapshotVolumeField = (state) => {
         for (let x = 0; x < width; x++) {
             const nx = width > 1 ? (x / (width - 1)) * 2 - 1 : 0;
             const idx = y * width + x;
-            const zr = Zr[idx];
-            const zi = Zi[idx];
-            const amp = Math.hypot(zr, zi);
+            const primary = components[0];
+            const zr = primary.real[idx];
+            const zi = primary.imag[idx];
+            let ampSq = 0;
+            for (const view of components) {
+                const r = view.real[idx];
+                const im = view.imag[idx];
+                ampSq += r * r + im * im;
+            }
+            const amp = Math.sqrt(ampSq);
             const phi = Math.atan2(zi, zr);
             phase[idx] = phi;
             intensity[idx] = amp;

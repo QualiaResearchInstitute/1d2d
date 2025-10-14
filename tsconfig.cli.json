@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist-cli",
+    "target": "ES2022",
+    "allowJs": false,
+    "declaration": false,
+    "sourceMap": false,
+    "noEmit": false,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true
+  },
+  "include": [
+    "src/manifest/**/*.ts",
+    "src/state/types.ts",
+    "src/cli/**/*.ts",
+    "src/runtime/**/*.ts"
+  ]
+}

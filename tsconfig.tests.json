@@ -12,6 +12,8 @@
   "include": [
     "src/fields/**/*.ts",
     "src/validation/**/*.ts",
+    "src/manifest/**/*.ts",
+    "src/state/types.ts",
     "src/timeline/**/*.ts",
     "tests/**/*.ts",
     "scripts/videoPipeline.ts",

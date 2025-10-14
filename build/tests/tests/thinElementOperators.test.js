@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createKuramotoState, createDerivedViews, createNormalGenerator, derivedBufferSize, deriveKuramotoFields, getThinElementOperatorGains, initKuramotoState, stepKuramotoState, } from '../src/kuramotoCore.js';
+import { createKuramotoState, createDerivedViews, createNormalGenerator, derivedBufferSize, deriveKuramotoFields, createPolarizationMatrixStep, getThinElementOperatorGains, initKuramotoState, stepKuramotoState, } from '../src/kuramotoCore.js';
 import { clampKernelSpec, KERNEL_SPEC_DEFAULT } from '../src/kernel/kernelSpec.js';
 const defaultParams = {
     alphaKur: 0.2,
@@ -118,4 +118,38 @@ test('DMT/arousal controls reshape derived amplitude deterministically', () => {
     }
     assert.ok(sumMod > sumBase, 'combined controls should raise average amplitude');
     assert.deepEqual(getThinElementOperatorGains(KERNEL_SPEC_DEFAULT, { dmt: 0.6, arousal: 0.4 }), getThinElementOperatorGains(KERNEL_SPEC_DEFAULT, { dmt: 0.6, arousal: 0.4 }), 'operator gains must stay deterministic across repeated queries');
+});
+test('polarization matrix step mixes polarization components', () => {
+    const state = createKuramotoState(1, 1, undefined, { componentCount: 2 });
+    const params = {
+        alphaKur: 0,
+        gammaKur: 0,
+        omega0: 0,
+        K0: 0,
+        epsKur: 0,
+        fluxX: 0,
+        fluxY: 0,
+        smallWorldWeight: 0,
+        p_sw: 0,
+        smallWorldEnabled: false,
+    };
+    const comp0 = state.components[0];
+    const comp1 = state.components[1];
+    comp0.real[0] = 1;
+    comp0.imag[0] = 0;
+    comp1.real[0] = 0;
+    comp1.imag[0] = 0;
+    const schedule = [
+        createPolarizationMatrixStep({
+            m00: { re: 0, im: 0 },
+            m01: { re: 1, im: 0 },
+            m10: { re: 1, im: 0 },
+            m11: { re: 0, im: 0 },
+        }),
+    ];
+    stepKuramotoState(state, params, 0, () => 0, 0, { schedule });
+    assert.ok(Math.abs(comp0.real[0]) < 1e-6, 'component 0 should be cleared');
+    assert.ok(Math.abs(comp0.imag[0]) < 1e-6, 'component 0 imag should be cleared');
+    assert.ok(Math.abs(comp1.real[0] - 1) < 1e-6, 'component 1 should receive original amplitude');
+    assert.ok(Math.abs(comp1.imag[0]) < 1e-6, 'component 1 imag remains zero');
 });

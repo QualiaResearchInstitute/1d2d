@@ -1,0 +1,990 @@
+{
+  "schemaVersion": "1.0.0",
+  "metadata": {
+    "name": "Phase Three Interactive Demo",
+    "description": "Demonstrates interactive parameter controls, presets, and beam-splitter metadata.",
+    "author": "Indra Lab",
+    "version": "0.3.0",
+    "createdAt": "2024-10-01",
+    "defaultPreset": "balanced-optics"
+  },
+  "nodes": [
+    {
+      "id": "opticalKernel",
+      "type": "OpticalKernel",
+      "label": "Optical Kernel",
+      "position": { "x": 160, "y": 80 },
+      "parameters": [
+        {
+          "id": "gain",
+          "label": "Gain",
+          "value": 1.8,
+          "description": "Global gain applied to the optical kernel transfer function.",
+          "control": { "kind": "slider", "min": 0, "max": 8, "step": 0.05, "unit": "×" },
+          "panel": "optics"
+        },
+        {
+          "id": "k0",
+          "label": "Base Frequency k₀",
+          "value": 0.22,
+          "description": "Carrier frequency of the kernel in cycles per pixel.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "optics"
+        },
+        {
+          "id": "anisotropy",
+          "label": "Anisotropy",
+          "value": 0.64,
+          "description": "Ellipticity of the kernel response; higher values elongate gradients.",
+          "control": { "kind": "slider", "min": 0, "max": 2, "step": 0.01 },
+          "panel": "optics"
+        },
+        {
+          "id": "chirality",
+          "label": "Chirality",
+          "value": 1.35,
+          "description": "Phase winding around kernel lobes; controls holographic twist.",
+          "control": { "kind": "slider", "min": 0, "max": 2.5, "step": 0.01 },
+          "panel": "optics"
+        },
+        {
+          "id": "transparency",
+          "label": "Transparency",
+          "value": 0.32,
+          "description": "Transmission of energy into the compositor from the kernel field.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "optics"
+        }
+      ]
+    },
+    {
+      "id": "beamSplitter",
+      "type": "BeamSplitter",
+      "label": "Beam Splitter",
+      "position": { "x": 360, "y": 96 },
+      "parameters": [
+        {
+          "id": "branchCount",
+          "label": "Branches",
+          "value": 3,
+          "description": "Number of branches spawned from the incoming field.",
+          "control": { "kind": "slider", "min": 1, "max": 6, "step": 1 },
+          "panel": "beamSplitter"
+        },
+        {
+          "id": "recombine",
+          "label": "Recombine Strategy",
+          "value": "energy",
+          "description": "Policy used to recombine branches back into the compositor.",
+          "control": {
+            "kind": "select",
+            "options": [
+              { "value": "sum", "label": "Summation" },
+              { "value": "average", "label": "Average" },
+              { "value": "energy", "label": "Energy weighted" }
+            ]
+          },
+          "panel": "beamSplitter"
+        }
+      ],
+      "metadata": {
+        "branches": [
+          {
+            "id": "branch-0",
+            "label": "Primary",
+            "symmetry": "identity",
+            "weight": 1,
+            "priority": 0,
+            "source": "source",
+            "transformStack": [{ "kind": "rotate", "degrees": 0 }]
+          },
+          {
+            "id": "branch-1",
+            "label": "Rotation +90°",
+            "symmetry": "rotation",
+            "weight": 0.8,
+            "priority": 1,
+            "source": "edge",
+            "transformStack": [{ "kind": "rotate", "degrees": 90 }]
+          },
+          {
+            "id": "branch-2",
+            "label": "Reflection X",
+            "symmetry": "mirrorX",
+            "weight": 0.75,
+            "priority": 2,
+            "source": "phase",
+            "transformStack": [{ "kind": "mirror", "axis": "x" }]
+          }
+        ]
+      }
+    },
+    {
+      "id": "kuramotoField",
+      "type": "KuramotoOscillatorField",
+      "label": "Kuramoto Field",
+      "position": { "x": 160, "y": 240 },
+      "parameters": [
+        {
+          "id": "K0",
+          "label": "Coupling Strength K₀",
+          "value": 0.62,
+          "description": "Global coupling strength for the oscillator lattice.",
+          "control": { "kind": "slider", "min": 0, "max": 1.5, "step": 0.01 },
+          "panel": "kuramoto"
+        },
+        {
+          "id": "alphaKur",
+          "label": "Drive α",
+          "value": 0.24,
+          "description": "Fraction of the lattice coupled to external forcing.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "kuramoto"
+        },
+        {
+          "id": "gammaKur",
+          "label": "Damping γ",
+          "value": 0.18,
+          "description": "Damping applied to oscillator phases per integration step.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "kuramoto"
+        },
+        {
+          "id": "epsKur",
+          "label": "Noise ε",
+          "value": 0.002,
+          "description": "Stochastic perturbation in the Kuramoto field.",
+          "control": { "kind": "slider", "min": 0, "max": 0.02, "step": 0.0005 },
+          "panel": "kuramoto"
+        },
+        {
+          "id": "fluxX",
+          "label": "Flux X",
+          "value": 0,
+          "description": "Phase gradient bias along the X axis.",
+          "control": { "kind": "slider", "min": -1, "max": 1, "step": 0.01 },
+          "panel": "kuramoto"
+        },
+        {
+          "id": "fluxY",
+          "label": "Flux Y",
+          "value": 0,
+          "description": "Phase gradient bias along the Y axis.",
+          "control": { "kind": "slider", "min": -1, "max": 1, "step": 0.01 },
+          "panel": "kuramoto"
+        },
+        {
+          "id": "smallWorldWeight",
+          "label": "Small-world Weight",
+          "value": 0.2,
+          "description": "Strength of long-range links in the oscillator lattice.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "kuramoto"
+        },
+        {
+          "id": "p_sw",
+          "label": "Rewire Probability",
+          "value": 0.04,
+          "description": "Probability of rewiring lattice edges to create shortcuts.",
+          "control": { "kind": "slider", "min": 0, "max": 0.3, "step": 0.01 },
+          "panel": "kuramoto"
+        }
+      ]
+    },
+    {
+      "id": "tracerDynamics",
+      "type": "EdgeTracer",
+      "label": "Tracer Dynamics",
+      "position": { "x": 360, "y": 240 },
+      "parameters": [
+        {
+          "id": "edgeThreshold",
+          "label": "Edge Threshold",
+          "value": 0.08,
+          "description": "Minimum gradient magnitude treated as an edge rim.",
+          "control": { "kind": "slider", "min": 0, "max": 0.5, "step": 0.005 },
+          "panel": "tracer"
+        },
+        {
+          "id": "jitter",
+          "label": "Jitter Depth",
+          "value": 1.12,
+          "description": "Amplitude of microsaccade jitter applied to tracer samples.",
+          "control": { "kind": "slider", "min": 0, "max": 2, "step": 0.01 },
+          "panel": "tracer"
+        },
+        {
+          "id": "microsaccade",
+          "label": "Microsaccade",
+          "value": true,
+          "description": "Enables slow microsaccade oscillation for tracer integrations.",
+          "control": { "kind": "toggle" },
+          "panel": "tracer"
+        },
+        {
+          "id": "phasePin",
+          "label": "Phase Pin",
+          "value": false,
+          "description": "Pins tracer phase to the Kuramoto orientation field.",
+          "control": { "kind": "toggle" },
+          "panel": "tracer"
+        },
+        {
+          "id": "thetaMode",
+          "label": "Theta Mode",
+          "value": "gradient",
+          "description": "Mode used to derive tracer orientation angles.",
+          "control": {
+            "kind": "select",
+            "options": [
+              { "value": "gradient", "label": "Gradient" },
+              { "value": "global", "label": "Global" }
+            ]
+          },
+          "panel": "tracer"
+        }
+      ]
+    },
+    {
+      "id": "compositor",
+      "type": "FieldCompositor",
+      "label": "Compositor",
+      "position": { "x": 560, "y": 176 },
+      "parameters": [
+        {
+          "id": "blend",
+          "label": "Base Blend",
+          "value": 0.58,
+          "description": "Blend ratio for rim vs. surface envelopes.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "compositor"
+        },
+        {
+          "id": "rimWeight",
+          "label": "Rim Weight",
+          "value": 0.68,
+          "description": "Contribution of rim energy into the compositor.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "compositor"
+        },
+        {
+          "id": "kurWeight",
+          "label": "Kuramoto Weight",
+          "value": 0.44,
+          "description": "Contribution of Kuramoto phase energy into the compositor.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "compositor"
+        },
+        {
+          "id": "volumeWeight",
+          "label": "Volume Weight",
+          "value": 0.76,
+          "description": "Contribution from volumetric overlays.",
+          "control": { "kind": "slider", "min": 0, "max": 1.5, "step": 0.01 },
+          "panel": "compositor"
+        }
+      ]
+    },
+    {
+      "id": "hyperbolicOverlay",
+      "type": "HyperbolicAtlas",
+      "label": "Hyperbolic Overlay",
+      "position": { "x": 560, "y": 296 },
+      "parameters": [
+        {
+          "id": "curvatureStrength",
+          "label": "Curvature Strength",
+          "value": 0.48,
+          "description": "Controls the strength of the hyperbolic warp.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "hyperbolic"
+        },
+        {
+          "id": "warpAmp",
+          "label": "Warp Amplitude",
+          "value": 0.34,
+          "description": "Amplitude of the hyperbolic warp overlay.",
+          "control": { "kind": "slider", "min": 0, "max": 1, "step": 0.01 },
+          "panel": "hyperbolic"
+        },
+        {
+          "id": "wallpaperGroup",
+          "label": "Wallpaper Group",
+          "value": "p4g",
+          "description": "Symmetry group used when tessellating the overlay.",
+          "control": {
+            "kind": "select",
+            "options": [
+              { "value": "off", "label": "Off" },
+              { "value": "p4", "label": "p4" },
+              { "value": "p4g", "label": "p4g" },
+              { "value": "p3m1", "label": "p3m1" },
+              { "value": "p6m", "label": "p6m" }
+            ]
+          },
+          "panel": "hyperbolic"
+        },
+        {
+          "id": "surfaceRegion",
+          "label": "Surface Region",
+          "value": "both",
+          "description": "Region of the frame receiving the hyperbolic overlay.",
+          "control": {
+            "kind": "select",
+            "options": [
+              { "value": "surfaces", "label": "Surfaces" },
+              { "value": "edges", "label": "Edges" },
+              { "value": "both", "label": "Both" }
+            ]
+          },
+          "panel": "hyperbolic"
+        }
+      ]
+    },
+    {
+      "id": "su7Projector",
+      "type": "SU7Projector",
+      "label": "SU(7) Projector",
+      "position": { "x": 760, "y": 176 },
+      "parameters": [
+        {
+          "id": "gain",
+          "label": "Projector Gain",
+          "value": 0.9,
+          "description": "Gain applied before projecting into SU(7) color space.",
+          "control": { "kind": "slider", "min": 0, "max": 2, "step": 0.01 },
+          "panel": "su7"
+        },
+        {
+          "id": "projectorMode",
+          "label": "Projector Mode",
+          "value": "overlaySplit",
+          "description": "Projector strategy for composing overlays.",
+          "control": {
+            "kind": "select",
+            "options": [
+              { "value": "identity", "label": "Identity" },
+              { "value": "directRgb", "label": "Direct RGB" },
+              { "value": "overlaySplit", "label": "Overlay Split" },
+              { "value": "hopfLens", "label": "Hopf Lens" }
+            ]
+          },
+          "panel": "su7"
+        },
+        {
+          "id": "decimationMode",
+          "label": "Decimation Mode",
+          "value": "hybrid",
+          "description": "Selects which overlays participate in SU(7) projector packing.",
+          "control": {
+            "kind": "select",
+            "options": [
+              { "value": "hybrid", "label": "Hybrid" },
+              { "value": "stride", "label": "Stride" },
+              { "value": "edges", "label": "Edge-biased" }
+            ]
+          },
+          "panel": "su7"
+        }
+      ]
+    }
+  ],
+  "links": [
+    {
+      "id": "optics-to-splitter",
+      "from": { "nodeId": "opticalKernel", "port": "output" },
+      "to": { "nodeId": "beamSplitter", "port": "input" }
+    },
+    {
+      "id": "splitter-to-compositor",
+      "from": { "nodeId": "beamSplitter", "port": "output" },
+      "to": { "nodeId": "compositor", "port": "inputA" }
+    },
+    {
+      "id": "kuramoto-to-compositor",
+      "from": { "nodeId": "kuramotoField", "port": "output" },
+      "to": { "nodeId": "compositor", "port": "inputB" }
+    },
+    {
+      "id": "tracer-to-compositor",
+      "from": { "nodeId": "tracerDynamics", "port": "output" },
+      "to": { "nodeId": "compositor", "port": "rim" }
+    },
+    {
+      "id": "hyperbolic-to-compositor",
+      "from": { "nodeId": "hyperbolicOverlay", "port": "overlay" },
+      "to": { "nodeId": "compositor", "port": "overlay" }
+    },
+    {
+      "id": "compositor-to-su7",
+      "from": { "nodeId": "compositor", "port": "output" },
+      "to": { "nodeId": "su7Projector", "port": "input" }
+    }
+  ],
+  "timeline": {
+    "duration": 18,
+    "fps": 60,
+    "clips": [
+      {
+        "id": "clip-optical-gain",
+        "nodeId": "opticalKernel",
+        "parameterId": "gain",
+        "interpolation": "spline",
+        "keyframes": [
+          { "time": 0, "value": 1.4 },
+          { "time": 8, "value": 1.8 },
+          { "time": 18, "value": 2.4 }
+        ]
+      },
+      {
+        "id": "clip-compositor-blend",
+        "nodeId": "compositor",
+        "parameterId": "blend",
+        "interpolation": "linear",
+        "keyframes": [
+          { "time": 0, "value": 0.45 },
+          { "time": 12, "value": 0.7 },
+          { "time": 18, "value": 0.5 }
+        ]
+      }
+    ]
+  },
+  "controls": {
+    "panels": [
+      {
+        "id": "optics",
+        "label": "Optical Kernel",
+        "description": "Tune coherent kernel transport before the beam-splitter.",
+        "category": "Optics",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "gain": {
+              "type": "number",
+              "title": "Gain",
+              "minimum": 0,
+              "maximum": 8,
+              "default": 1.8
+            },
+            "k0": {
+              "type": "number",
+              "title": "Base Frequency k₀",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.22
+            },
+            "anisotropy": {
+              "type": "number",
+              "title": "Anisotropy",
+              "minimum": 0,
+              "maximum": 2,
+              "default": 0.64
+            },
+            "chirality": {
+              "type": "number",
+              "title": "Chirality",
+              "minimum": 0,
+              "maximum": 2.5,
+              "default": 1.35
+            },
+            "transparency": {
+              "type": "number",
+              "title": "Transparency",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.32
+            }
+          },
+          "required": ["gain", "k0", "anisotropy", "chirality", "transparency"]
+        },
+        "uiSchema": {
+          "gain": { "ui:widget": "range" },
+          "k0": { "ui:widget": "range" },
+          "anisotropy": { "ui:widget": "range" },
+          "chirality": { "ui:widget": "range" },
+          "transparency": { "ui:widget": "range" }
+        },
+        "bindings": {
+          "/gain": { "kind": "nodeParameter", "nodeId": "opticalKernel", "parameterId": "gain" },
+          "/k0": { "kind": "nodeParameter", "nodeId": "opticalKernel", "parameterId": "k0" },
+          "/anisotropy": {
+            "kind": "nodeParameter",
+            "nodeId": "opticalKernel",
+            "parameterId": "anisotropy"
+          },
+          "/chirality": {
+            "kind": "nodeParameter",
+            "nodeId": "opticalKernel",
+            "parameterId": "chirality"
+          },
+          "/transparency": {
+            "kind": "nodeParameter",
+            "nodeId": "opticalKernel",
+            "parameterId": "transparency"
+          }
+        }
+      },
+      {
+        "id": "beamSplitterPanel",
+        "label": "Beam-Splitter",
+        "description": "Configure symmetry and recombination policies.",
+        "category": "Symmetry",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "branchCount": {
+              "type": "integer",
+              "title": "Branches",
+              "minimum": 1,
+              "maximum": 6,
+              "default": 3
+            },
+            "recombine": {
+              "type": "string",
+              "title": "Recombine Strategy",
+              "enum": ["sum", "average", "energy"],
+              "enumNames": ["Summation", "Average", "Energy weighted"],
+              "default": "energy"
+            }
+          },
+          "required": ["branchCount", "recombine"]
+        },
+        "uiSchema": {
+          "branchCount": { "ui:widget": "range" }
+        },
+        "bindings": {
+          "/branchCount": {
+            "kind": "nodeParameter",
+            "nodeId": "beamSplitter",
+            "parameterId": "branchCount"
+          },
+          "/recombine": {
+            "kind": "nodeParameter",
+            "nodeId": "beamSplitter",
+            "parameterId": "recombine"
+          }
+        }
+      },
+      {
+        "id": "kuramoto",
+        "label": "Kuramoto Field",
+        "description": "Adjust oscillator coupling and noise.",
+        "category": "Dynamics",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "K0": {
+              "type": "number",
+              "title": "Coupling Strength K₀",
+              "minimum": 0,
+              "maximum": 1.5,
+              "default": 0.62
+            },
+            "alphaKur": {
+              "type": "number",
+              "title": "Drive α",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.24
+            },
+            "gammaKur": {
+              "type": "number",
+              "title": "Damping γ",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.18
+            },
+            "epsKur": {
+              "type": "number",
+              "title": "Noise ε",
+              "minimum": 0,
+              "maximum": 0.02,
+              "default": 0.002
+            },
+            "fluxX": {
+              "type": "number",
+              "title": "Flux X",
+              "minimum": -1,
+              "maximum": 1,
+              "default": 0
+            },
+            "fluxY": {
+              "type": "number",
+              "title": "Flux Y",
+              "minimum": -1,
+              "maximum": 1,
+              "default": 0
+            },
+            "smallWorldWeight": {
+              "type": "number",
+              "title": "Small-world Weight",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.2
+            },
+            "p_sw": {
+              "type": "number",
+              "title": "Rewire Probability",
+              "minimum": 0,
+              "maximum": 0.3,
+              "default": 0.04
+            }
+          }
+        },
+        "uiSchema": {
+          "K0": { "ui:widget": "range" },
+          "alphaKur": { "ui:widget": "range" },
+          "gammaKur": { "ui:widget": "range" },
+          "epsKur": { "ui:widget": "range" },
+          "fluxX": { "ui:widget": "range" },
+          "fluxY": { "ui:widget": "range" },
+          "smallWorldWeight": { "ui:widget": "range" },
+          "p_sw": { "ui:widget": "range" }
+        },
+        "bindings": {
+          "/K0": { "kind": "nodeParameter", "nodeId": "kuramotoField", "parameterId": "K0" },
+          "/alphaKur": {
+            "kind": "nodeParameter",
+            "nodeId": "kuramotoField",
+            "parameterId": "alphaKur"
+          },
+          "/gammaKur": {
+            "kind": "nodeParameter",
+            "nodeId": "kuramotoField",
+            "parameterId": "gammaKur"
+          },
+          "/epsKur": {
+            "kind": "nodeParameter",
+            "nodeId": "kuramotoField",
+            "parameterId": "epsKur"
+          },
+          "/fluxX": { "kind": "nodeParameter", "nodeId": "kuramotoField", "parameterId": "fluxX" },
+          "/fluxY": { "kind": "nodeParameter", "nodeId": "kuramotoField", "parameterId": "fluxY" },
+          "/smallWorldWeight": {
+            "kind": "nodeParameter",
+            "nodeId": "kuramotoField",
+            "parameterId": "smallWorldWeight"
+          },
+          "/p_sw": { "kind": "nodeParameter", "nodeId": "kuramotoField", "parameterId": "p_sw" }
+        }
+      },
+      {
+        "id": "tracer",
+        "label": "Tracer Dynamics",
+        "description": "Control rim detection and tracer coupling.",
+        "category": "Dynamics",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "edgeThreshold": {
+              "type": "number",
+              "title": "Edge Threshold",
+              "minimum": 0,
+              "maximum": 0.5,
+              "default": 0.08
+            },
+            "jitter": {
+              "type": "number",
+              "title": "Jitter Depth",
+              "minimum": 0,
+              "maximum": 2,
+              "default": 1.12
+            },
+            "microsaccade": { "type": "boolean", "title": "Microsaccade", "default": true },
+            "phasePin": { "type": "boolean", "title": "Phase Pin", "default": false },
+            "thetaMode": {
+              "type": "string",
+              "title": "Theta Mode",
+              "enum": ["gradient", "global"],
+              "enumNames": ["Gradient", "Global"],
+              "default": "gradient"
+            }
+          }
+        },
+        "bindings": {
+          "/edgeThreshold": {
+            "kind": "nodeParameter",
+            "nodeId": "tracerDynamics",
+            "parameterId": "edgeThreshold"
+          },
+          "/jitter": {
+            "kind": "nodeParameter",
+            "nodeId": "tracerDynamics",
+            "parameterId": "jitter"
+          },
+          "/microsaccade": {
+            "kind": "nodeParameter",
+            "nodeId": "tracerDynamics",
+            "parameterId": "microsaccade"
+          },
+          "/phasePin": {
+            "kind": "nodeParameter",
+            "nodeId": "tracerDynamics",
+            "parameterId": "phasePin"
+          },
+          "/thetaMode": {
+            "kind": "nodeParameter",
+            "nodeId": "tracerDynamics",
+            "parameterId": "thetaMode"
+          }
+        }
+      },
+      {
+        "id": "compositor",
+        "label": "Compositor",
+        "description": "Balance field contributions post recombination.",
+        "category": "Compositor",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "blend": {
+              "type": "number",
+              "title": "Base Blend",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.58
+            },
+            "rimWeight": {
+              "type": "number",
+              "title": "Rim Weight",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.68
+            },
+            "kurWeight": {
+              "type": "number",
+              "title": "Kuramoto Weight",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.44
+            },
+            "volumeWeight": {
+              "type": "number",
+              "title": "Volume Weight",
+              "minimum": 0,
+              "maximum": 1.5,
+              "default": 0.76
+            }
+          }
+        },
+        "uiSchema": {
+          "blend": { "ui:widget": "range" },
+          "rimWeight": { "ui:widget": "range" },
+          "kurWeight": { "ui:widget": "range" },
+          "volumeWeight": { "ui:widget": "range" }
+        },
+        "bindings": {
+          "/blend": { "kind": "nodeParameter", "nodeId": "compositor", "parameterId": "blend" },
+          "/rimWeight": {
+            "kind": "nodeParameter",
+            "nodeId": "compositor",
+            "parameterId": "rimWeight"
+          },
+          "/kurWeight": {
+            "kind": "nodeParameter",
+            "nodeId": "compositor",
+            "parameterId": "kurWeight"
+          },
+          "/volumeWeight": {
+            "kind": "nodeParameter",
+            "nodeId": "compositor",
+            "parameterId": "volumeWeight"
+          }
+        }
+      },
+      {
+        "id": "hyperbolic",
+        "label": "Hyperbolic Overlay",
+        "description": "Configure hyperbolic tessellations and overlay routing.",
+        "category": "Overlays",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "curvatureStrength": {
+              "type": "number",
+              "title": "Curvature Strength",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.48
+            },
+            "warpAmp": {
+              "type": "number",
+              "title": "Warp Amplitude",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.34
+            },
+            "wallpaperGroup": {
+              "type": "string",
+              "title": "Wallpaper Group",
+              "enum": ["off", "p4", "p4g", "p3m1", "p6m"],
+              "enumNames": ["Off", "p4", "p4g", "p3m1", "p6m"],
+              "default": "p4g"
+            },
+            "surfaceRegion": {
+              "type": "string",
+              "title": "Surface Region",
+              "enum": ["surfaces", "edges", "both"],
+              "enumNames": ["Surfaces", "Edges", "Both"],
+              "default": "both"
+            }
+          }
+        },
+        "bindings": {
+          "/curvatureStrength": {
+            "kind": "nodeParameter",
+            "nodeId": "hyperbolicOverlay",
+            "parameterId": "curvatureStrength"
+          },
+          "/warpAmp": {
+            "kind": "nodeParameter",
+            "nodeId": "hyperbolicOverlay",
+            "parameterId": "warpAmp"
+          },
+          "/wallpaperGroup": {
+            "kind": "nodeParameter",
+            "nodeId": "hyperbolicOverlay",
+            "parameterId": "wallpaperGroup"
+          },
+          "/surfaceRegion": {
+            "kind": "nodeParameter",
+            "nodeId": "hyperbolicOverlay",
+            "parameterId": "surfaceRegion"
+          }
+        }
+      },
+      {
+        "id": "su7",
+        "label": "SU(7) Projector",
+        "description": "Manage SU(7) gate projection for final outputs.",
+        "category": "Colour",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "gain": {
+              "type": "number",
+              "title": "Projector Gain",
+              "minimum": 0,
+              "maximum": 2,
+              "default": 0.9
+            },
+            "projectorMode": {
+              "type": "string",
+              "title": "Projector Mode",
+              "enum": ["identity", "directRgb", "overlaySplit", "hopfLens"],
+              "enumNames": ["Identity", "Direct RGB", "Overlay Split", "Hopf Lens"],
+              "default": "overlaySplit"
+            },
+            "decimationMode": {
+              "type": "string",
+              "title": "Decimation Mode",
+              "enum": ["hybrid", "stride", "edges"],
+              "enumNames": ["Hybrid", "Stride", "Edge-biased"],
+              "default": "hybrid"
+            }
+          }
+        },
+        "bindings": {
+          "/gain": { "kind": "nodeParameter", "nodeId": "su7Projector", "parameterId": "gain" },
+          "/projectorMode": {
+            "kind": "nodeParameter",
+            "nodeId": "su7Projector",
+            "parameterId": "projectorMode"
+          },
+          "/decimationMode": {
+            "kind": "nodeParameter",
+            "nodeId": "su7Projector",
+            "parameterId": "decimationMode"
+          }
+        }
+      }
+    ],
+    "presets": [
+      {
+        "id": "balanced-optics",
+        "label": "Balanced Optics",
+        "description": "Even blend between rim and Kuramoto energy.",
+        "panels": {
+          "optics": {
+            "gain": 1.8,
+            "k0": 0.22,
+            "anisotropy": 0.64,
+            "chirality": 1.35,
+            "transparency": 0.32
+          },
+          "beamSplitterPanel": { "branchCount": 3, "recombine": "energy" },
+          "kuramoto": {
+            "K0": 0.62,
+            "alphaKur": 0.24,
+            "gammaKur": 0.18,
+            "epsKur": 0.002,
+            "fluxX": 0,
+            "fluxY": 0,
+            "smallWorldWeight": 0.2,
+            "p_sw": 0.04
+          },
+          "tracer": {
+            "edgeThreshold": 0.08,
+            "jitter": 1.12,
+            "microsaccade": true,
+            "phasePin": false,
+            "thetaMode": "gradient"
+          },
+          "compositor": {
+            "blend": 0.58,
+            "rimWeight": 0.68,
+            "kurWeight": 0.44,
+            "volumeWeight": 0.76
+          },
+          "hyperbolic": {
+            "curvatureStrength": 0.48,
+            "warpAmp": 0.34,
+            "wallpaperGroup": "p4g",
+            "surfaceRegion": "both"
+          },
+          "su7": { "gain": 0.9, "projectorMode": "overlaySplit", "decimationMode": "hybrid" }
+        }
+      },
+      {
+        "id": "hyperbolic-focus",
+        "label": "Hyperbolic Focus",
+        "description": "Emphasises hyperbolic overlays with reduced kernel gain.",
+        "panels": {
+          "optics": {
+            "gain": 1.2,
+            "k0": 0.18,
+            "anisotropy": 0.72,
+            "chirality": 1.1,
+            "transparency": 0.28
+          },
+          "beamSplitterPanel": { "branchCount": 4, "recombine": "average" },
+          "kuramoto": {
+            "K0": 0.52,
+            "alphaKur": 0.18,
+            "gammaKur": 0.16,
+            "epsKur": 0.003,
+            "fluxX": 0.12,
+            "fluxY": -0.08,
+            "smallWorldWeight": 0.28,
+            "p_sw": 0.06
+          },
+          "tracer": {
+            "edgeThreshold": 0.06,
+            "jitter": 1.35,
+            "microsaccade": true,
+            "phasePin": true,
+            "thetaMode": "gradient"
+          },
+          "compositor": { "blend": 0.64, "rimWeight": 0.6, "kurWeight": 0.52, "volumeWeight": 0.9 },
+          "hyperbolic": {
+            "curvatureStrength": 0.72,
+            "warpAmp": 0.52,
+            "wallpaperGroup": "p6m",
+            "surfaceRegion": "surfaces"
+          },
+          "su7": { "gain": 1.05, "projectorMode": "hopfLens", "decimationMode": "edges" }
+        }
+      }
+    ]
+  }
+}

@@ -93,10 +93,8 @@ Acceptance requires:
 
 - Preset(s) reviewed:
 - Hardware / browser:
-- Key phenomenological observations:
-  -
-- Hyperbolic overlay notes:
-  -
+- ## Key phenomenological observations:
+- ## Hyperbolic overlay notes:
 - Must-fix items:
   - [ ]
 - Attachments:

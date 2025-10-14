@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4d6bff" />
+      <stop offset="100%" stop-color="#6dd5f7" />
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="720" fill="url(#g)" />
+  <g fill="#ffffff" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="80" y="160" font-size="56" font-weight="600">1d2d Perceptual Synthesis Studio</text>
+    <text x="80" y="240" font-size="32" font-weight="500">Phase 12 Launch Walkthrough</text>
+    <text x="80" y="320" font-size="22" opacity="0.85">
+      Explore the launch preset, tweak Kuramoto dynamics, and export the optical stack.
+    </text>
+  </g>
+  <path
+    d="M640 300 L720 360 L640 420 Z"
+    fill="#ffffff"
+    opacity="0.88"
+  />
+</svg>

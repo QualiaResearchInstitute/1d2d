@@ -1,0 +1,22 @@
+{
+  "name": "@indra/sdk",
+  "version": "1.0.0",
+  "description": "TypeScript client for the Indra Studio local API",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "keywords": [
+    "indra",
+    "sdk",
+    "holographic",
+    "cli"
+  ],
+  "author": "Indra Lab",
+  "license": "MIT",
+  "private": true,
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}

@@ -26,7 +26,11 @@ const gaussian = (distance: number, sigma: number): number => {
   return Math.exp(-(distance * distance) / scale);
 };
 
-const sanitizeFluxSource = (source: FluxSource, width: number, height: number): FluxSource => {
+const sanitizeFluxSource = (
+  source: FluxSource,
+  width: number,
+  height: number,
+): FluxSource & { strength: number } => {
   const safeX = Number.isFinite(source.x) ? clamp(source.x, 0, width - 1) : width * 0.5;
   const safeY = Number.isFinite(source.y) ? clamp(source.y, 0, height - 1) : height * 0.5;
   const rawCharge = Number.isFinite(source.charge) ? source.charge : 1;
@@ -179,7 +183,7 @@ const accumulatePairEnergy = (
 };
 
 const accumulateSourceEnergy = (
-  source: FluxSource,
+  source: FluxSource & { strength: number },
   energy: Float32Array,
   width: number,
   height: number,

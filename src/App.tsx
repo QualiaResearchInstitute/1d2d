@@ -697,9 +697,9 @@ const RECORDING_PRESETS: Record<
   RecordingPresetId,
   { label: string; bitsPerPixel: number; maxBitrate: number }
 > = {
-  balanced: { label: 'Balanced · ≈2.4 bpp', bitsPerPixel: 2.4, maxBitrate: 160_000_000 },
-  high: { label: 'High · ≈3.2 bpp', bitsPerPixel: 3.2, maxBitrate: 220_000_000 },
-  extreme: { label: 'Extreme · ≈4.5 bpp', bitsPerPixel: 4.5, maxBitrate: 320_000_000 },
+  balanced: { label: 'Balanced · ≈2.4 bpp', bitsPerPixel: 2.4, maxBitrate: 160_000_000 },
+  high: { label: 'High · ≈3.2 bpp', bitsPerPixel: 3.2, maxBitrate: 220_000_000 },
+  extreme: { label: 'Extreme · ≈4.5 bpp', bitsPerPixel: 4.5, maxBitrate: 320_000_000 },
 };
 const RECORDING_PRESET_ORDER: RecordingPresetId[] = ['balanced', 'high', 'extreme'];
 const RECORDING_DEFAULT_PRESET: RecordingPresetId = 'balanced';
@@ -10566,7 +10566,7 @@ export default function App() {
               >
                 <span>Unitary ε {guardrailConsole.unitaryError.toExponential(2)}</span>
                 <span>Det drift {guardrailConsole.determinantDrift.toExponential(2)}</span>
-                <span>Frame {guardrailConsole.frameTimeMs.toFixed(2)} ms</span>
+                <span>Frame {guardrailConsole.frameTimeMs.toFixed(2)} ms</span>
                 <span>Energy EMA {guardrailConsole.energyEma.toFixed(3)}</span>
               </div>
               <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
@@ -13826,13 +13826,13 @@ function TelemetryOverlayContents({
             <span>samples {su7Gpu.sampleCount}</span>
           </div>
           <div>
-            Median {su7Gpu.medianMs.toFixed(3)} ms · Mean {su7Gpu.meanMs.toFixed(3)} ms
+            Median {su7Gpu.medianMs.toFixed(3)} ms · Mean {su7Gpu.meanMs.toFixed(3)} ms
           </div>
-          {su7Gpu.baselineMs != null && <div>Baseline {su7Gpu.baselineMs.toFixed(3)} ms</div>}
+          {su7Gpu.baselineMs != null && <div>Baseline {su7Gpu.baselineMs.toFixed(3)} ms</div>}
           {su7Gpu.drift != null && <div>Drift {(su7Gpu.drift * 100).toFixed(1)}%</div>}
           {su7Gpu.lastProfile && (
             <div>
-              Last dispatch {su7Gpu.lastProfile.timeMs.toFixed(3)} ms ·{' '}
+              Last dispatch {su7Gpu.lastProfile.timeMs.toFixed(3)} ms ·{' '}
               {su7Gpu.lastProfile.vectorCount.toLocaleString()} vectors
             </div>
           )}
@@ -13845,7 +13845,7 @@ function TelemetryOverlayContents({
                   ? ` ${(su7Gpu.drift * 100).toFixed(1)}%`
                   : ''}
               {su7Gpu.warningEvent
-                ? ` · baseline ${su7Gpu.warningEvent.baselineMs.toFixed(3)} ms`
+                ? ` · baseline ${su7Gpu.warningEvent.baselineMs.toFixed(3)} ms`
                 : ''}
             </div>
           )}
@@ -14554,8 +14554,8 @@ function TimelineEditorPanel({
     <div className="timeline-editor">
       <div className="timeline-editor__status">
         <span>
-          {playing ? 'Playing' : 'Paused'} • {currentTime.toFixed(2)} s / {safeDuration.toFixed(2)}
-           s • {Math.round(fps)} fps
+          {playing ? 'Playing' : 'Paused'} • {currentTime.toFixed(2)} s / {safeDuration.toFixed(2)}s
+          • {Math.round(fps)} fps
         </span>
         {!active ? <span className="timeline-editor__badge">Timeline inactive</span> : null}
       </div>
@@ -14623,7 +14623,7 @@ function TimelineEditorPanel({
             value={Math.max(0, Math.min(currentTime, sliderMax))}
             onChange={(event) => handleTimeInput(Number(event.target.value))}
           />
-          <span>{currentTime.toFixed(3)} s</span>
+          <span>{currentTime.toFixed(3)} s</span>
         </label>
         <div className="timeline-editor__settings">
           <label>
@@ -14739,7 +14739,7 @@ function TimelineEditorPanel({
                     className="timeline-editor__button"
                     onClick={() => onAddKeyframe(lane.id)}
                   >
-                    Keyframe @ {currentTime.toFixed(2)} s
+                    Keyframe @ {currentTime.toFixed(2)} s
                   </button>
                   <button
                     type="button"
